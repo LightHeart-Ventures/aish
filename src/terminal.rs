@@ -1184,6 +1184,80 @@ pub fn resume_region_seq_with_cursor(rows: u16, cursor_row: Option<u16>) -> Stri
     format!("{scroll}{}", resume_region_seq(rows))
 }
 
+/// Body rows a GROWING footer is about to STEAL, when the pinned escalation
+/// block goes from wanting `prev_want_rows` to `next_want_rows` on a
+/// `rows`-tall window.
+///
+/// Pinning an escalation lifts `body_bottom` UP by two rows per banner. Pure —
+/// both layouts come from [`FooterLayout::solve`], so this never disagrees with
+/// the region arithmetic or the paint. Zero when the growth was shed by a short
+/// window (the solver refused the extra banner) or nothing grew.
+pub fn banner_growth_rows(rows: u16, prev_want_rows: u16, next_want_rows: u16) -> u16 {
+    let before = FooterLayout::solve(rows, prev_want_rows).body_bottom;
+    let after = FooterLayout::solve(rows, next_want_rows).body_bottom;
+    before.saturating_sub(after)
+}
+
+/// The choreography that lifts the body OUT of the `grow` rows a growing footer
+/// is about to claim — the mid-turn twin of [`resume_region_seq_with_cursor`].
+///
+/// THE BUG: when a banner pins mid-turn the footer grows and `body_bottom`
+/// moves up two rows, but nothing moves the CURSOR, which was sitting on (or
+/// near) the old last body row. It is now INSIDE the escalation tray's rows, and
+/// every body write that follows — most visibly the in-place animated
+/// `thinking…` row, which rewrites its own line on a cadence — paints straight
+/// onto the banner rows. The footer repaint and the spinner then fight over the
+/// same cells, so "thinking" bleeds into the escalations tray.
+///
+/// THE FIX: `grow` line feeds, issued while the OLD (taller) region is still
+/// installed, scroll the body up by exactly the rows the footer is taking —
+/// the lifted rows land in native scrollback — and `CUU grow` (`ESC[nA`) puts
+/// the cursor back on the content line it started on, which is now
+/// `new body_bottom` or above. LF (no CR) keeps the column, so a half-written
+/// line is not broken. When the cursor is far above the footer no scroll
+/// happens: the line feeds just open blank rows below it that the footer paints
+/// over, and the CUU restores the position either way — so this needs no DSR
+/// round trip to stay position-preserving.
+///
+/// Pure, so the sequence is unit-testable byte-for-byte. Empty string when
+/// `grow == 0` (write nothing at all).
+pub fn banner_growth_seq(grow: u16) -> String {
+    if grow == 0 {
+        return String::new();
+    }
+    format!("{}\x1b[{grow}A", "\n".repeat(grow as usize))
+}
+
+/// Runtime entry point for [`banner_growth_seq`]: absorb the body rows the
+/// footer takes when the escalation block grows from `prev_want_rows` to
+/// `next_want_rows`. Called by [`crate::escalation::pin`] the moment a banner
+/// lands, BEFORE the next footer paint installs the shorter region.
+///
+/// No-op unless a footer region is actually installed, and skipped while a
+/// worker view owns the terminal (`ATTACH_ACTIVE`) or the operator is mid-edit
+/// on a non-empty prompt line (`INPUT_DIRTY`) — in those states the line feeds
+/// would disturb a cursor this module doesn't own, and the next full repaint
+/// heals the layout anyway. Same gating shape as [`resync_after_wake`].
+pub fn absorb_banner_growth(prev_want_rows: u16, next_want_rows: u16) {
+    if !ACTIVE.load(Ordering::Relaxed)
+        || ATTACH_ACTIVE.load(Ordering::Relaxed)
+        || INPUT_DIRTY.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    let Some((rows, _cols)) = term_size() else {
+        return;
+    };
+    let seq = banner_growth_seq(banner_growth_rows(rows, prev_want_rows, next_want_rows));
+    if seq.is_empty() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{seq}");
+    let _ = out.flush();
+}
+
+
 /// Parse a DSR cursor-position reply — `ESC [ row ; col R` — out of a raw read
 /// buffer, returning the 1-based `(row, col)`.
 ///
@@ -1647,6 +1721,55 @@ mod tests {
         // hidden — not FOOTER_ROWS' worth.
         assert_eq!(FooterLayout::solve(3, 0).height, 1);
         assert_eq!(FooterLayout::solve(3, 0).overflow_rows(3), 1);
+    }
+
+    #[test]
+    fn banner_growth_equals_the_body_rows_the_footer_takes() {
+        // 24-row window: no banner → body ends at 21; one banner → 19. The two
+        // rows the tray claims are exactly what the body must give up.
+        assert_eq!(FooterLayout::solve(24, 0).body_bottom, 21);
+        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 19);
+        assert_eq!(banner_growth_rows(24, 0, 2), 2);
+        // Second banner takes two more; the first→second step is still 2.
+        assert_eq!(banner_growth_rows(24, 2, 4), 2);
+        assert_eq!(banner_growth_rows(24, 0, 4), 4);
+        // Shrink (a banner retired) is NOT growth — the body gains rows, which
+        // leaves a harmless gap, so nothing is scrolled.
+        assert_eq!(banner_growth_rows(24, 4, 0), 0);
+        assert_eq!(banner_growth_rows(24, 2, 2), 0);
+    }
+
+    #[test]
+    fn banner_growth_tracks_what_the_solver_actually_granted() {
+        // THE invariant that keeps the scroll honest on every window size: the
+        // rows we lift the body by must equal the banner rows the layout
+        // granted — so on a short window where the solver SHEDS the banner, the
+        // body is not scrolled for a tray that was never painted.
+        for rows in 1..=60u16 {
+            let granted = FooterLayout::solve(rows, 2).banner_rows;
+            assert_eq!(
+                banner_growth_rows(rows, 0, 2),
+                granted,
+                "growth disagrees with the granted banner rows at {rows} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn banner_growth_seq_scrolls_then_walks_the_cursor_back_up() {
+        // Order is load-bearing: the line feeds scroll the body up while the
+        // OLD (taller) region is still installed, then CUU returns the cursor
+        // to the same CONTENT line — now inside the shrunken body. LF with no
+        // CR, so a half-written line keeps its column.
+        assert_eq!(banner_growth_seq(2), "\n\n\x1b[2A");
+        assert_eq!(banner_growth_seq(1), "\n\x1b[1A");
+        assert_eq!(banner_growth_seq(4), "\n\n\n\n\x1b[4A");
+        // Nothing grew → write NOTHING (never nudge the body for a no-op).
+        assert_eq!(banner_growth_seq(0), "");
+        // The feeds always precede the cursor-up, and the counts match.
+        let seq = banner_growth_seq(3);
+        assert!(seq.find('\n').unwrap() < seq.find('\x1b').unwrap());
+        assert_eq!(seq.matches('\n').count(), 3);
     }
 
     #[test]

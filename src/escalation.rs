@@ -214,7 +214,22 @@ static BANNERS: Mutex<Vec<Banner>> = Mutex::new(Vec::new());
 /// escalation but the newest). Re-pinning an id that is already tracked
 /// REFRESHES that banner in place — same task hint, clocks reset, verdict
 /// cleared — so a retry can't stack a duplicate row for one coordinator.
+/// A pinned banner steals two body rows from the scrolling region. The STORE
+/// mutation is [`push_banner`]; this wrapper measures the growth around it and
+/// hands it to [`crate::terminal::absorb_banner_growth`], which scrolls the body
+/// out of the rows the footer is about to claim and walks the cursor back up
+/// with it. Without that, the cursor is left sitting INSIDE the new tray rows
+/// and the next body write — the animated `thinking…` row above all — paints
+/// over the banner, so "thinking" bleeds into the tray. Measured outside the
+/// `BANNERS` lock (both `row_count` calls take it themselves) so the terminal
+/// write never happens while the stack is held.
 pub fn pin(id: &str, task: &str) {
+    let before = row_count();
+    push_banner(id, task);
+    crate::terminal::absorb_banner_growth(before, row_count());
+}
+
+fn push_banner(id: &str, task: &str) {
     let Ok(mut banners) = BANNERS.lock() else {
         return;
     };
