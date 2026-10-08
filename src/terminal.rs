@@ -2180,7 +2180,7 @@ mod tests {
         let squeezed = FooterLayout::solve(MIN_FOOTER_ROWS + per, per * 4);
         assert_eq!(squeezed.banner_rows, per);
         assert!(squeezed.sep_row.is_some());
-        assert!(squeezed.banner_rows % per == 0);
+        assert!(squeezed.banner_rows.is_multiple_of(per));
 
         // No room for any banner → chrome is still fully intact.
         let full_only = FooterLayout::solve(MIN_FOOTER_ROWS, per * 4);
