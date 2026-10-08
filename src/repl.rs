@@ -9324,6 +9324,9 @@ async fn handle_colon(
                     // never stack a second top border. Every streamed coordinator
                     // line renders as a bordered row under this frame (worker::pane_row).
                     if !was_on {
+                        // Fresh pane → forget the last speaker so the first burst
+                        // re-announces which worker it belongs to.
+                        crate::worker::reset_pane_speaker();
                         println!("{}", crate::worker::pane_open());
                     }
                 }
@@ -9333,6 +9336,7 @@ async fn handle_colon(
                     session.set_worker_output_mode(WorkerOutputMode::Off);
                     // Close the contained pane (only if it was open), then report.
                     if was_on {
+                        crate::worker::reset_pane_speaker();
                         println!("{}", crate::worker::pane_close());
                     }
                     println!(
