@@ -5350,8 +5350,8 @@ fn backfill_attached_live(
         // Off a TTY (no animation), or for an already-finished worker (nothing
         // left to stop the spinner), fall back to the one-shot static notice.
         let running = job.status() == "running";
-        let animated = running
-            && job.start_backfill_thinking(show_worker_output.clone(), attached.clone());
+        let animated =
+            running && job.start_backfill_thinking(show_worker_output.clone(), attached.clone());
         if !animated {
             println!(
                 "{}",
