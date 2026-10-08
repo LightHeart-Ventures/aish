@@ -659,6 +659,22 @@ impl CoordinatorStore {
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
+    /// Every `worktree_id` the ledger has EVER recorded, open or closed.
+    ///
+    /// This is the durable run_id -> worktree_id linkage the salvage pass needs.
+    /// `coordinator_runs` rows are TRIMMED by bounded retention (`reap_done_runs`
+    /// / `reap_failed_runs` / `clear_finished`), so "no live run row" does NOT
+    /// mean "no run ever existed" — whereas a ledger row is written once at
+    /// `git worktree add` time and never deleted. A work-bearing tree present
+    /// here was therefore owned by a real run that got as far as materialising
+    /// its worktree, so it is a CLEANUP concern, not a lost-run failure.
+    pub fn ledger_worktree_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT worktree_id FROM worktree_lifecycle")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
     /// Advance the run's phase marker (and bump the heartbeat, since a phase
     /// transition is itself proof of liveness).
     pub fn set_phase(&self, run_id: &str, phase: &str) -> Result<()> {
