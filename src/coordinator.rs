@@ -1647,15 +1647,18 @@ pub fn rehydrate(session: &mut Session) {
     }
     // Bound the now-retained `failed` rows: keep a recent, age-limited window so
     // the forensic trail survives a restart without the table growing unbounded.
-    // Runs BEFORE salvage and BEFORE the post-sweep id snapshot, so a work-bearing
-    // worktree whose row we trim here is simply re-derived by salvage below (the
-    // worktree is the durable source of truth; the store row is a derived view).
+    // Runs BEFORE salvage and BEFORE the post-sweep id snapshot, so the id set
+    // below is deliberately POST-reap and cannot distinguish a row lost to early
+    // termination from one that merely aged out. Salvage therefore also consults
+    // the never-trimmed `worktree_lifecycle` ledger — without that second gate a
+    // finished run's leftover dirty tree is re-minted as a phantom `failed` row
+    // on every startup (coordinator-lifecycle bug: salvage false positives).
     let reaped_failed = reap_failed_runs(&store);
     // Salvage runs whose durable row was lost on early termination. Run AFTER the
     // terminal-row purge + failed-row reap and key off a FRESH post-sweep id set,
-    // so the `failed` salvage rows we write this pass survive the boot (they're
-    // re-derived from the surviving worktree — not duplicated — on the next
-    // startup).
+    // so the `failed` salvage rows we write this pass survive the boot. Gated by
+    // the lifecycle ledger inside `salvage_orphaned_worktrees` so only genuinely
+    // unowned trees are salvaged.
     let known_after: HashSet<String> = store
         .load_all()
         .map(|rows| rows.into_iter().map(|r| r.run_id).collect())
@@ -1934,30 +1937,70 @@ fn detect_and_reap_stalled_runs(store: &CoordinatorStore, digest: bool) -> usize
     stalled_reaped
 }
 
-/// Pure salvage decision: a worktree that still holds work but has NO surviving
-/// `coordinator_runs` row was lost to an early termination — recover it. When a
-/// row already exists (terminal or not), the normal lifecycle owns it, so don't
-/// double-report. Unit-tested.
-fn is_salvageable(has_row: bool, has_work: bool) -> bool {
-    has_work && !has_row
+/// Pure salvage decision — a TRUE BACKSTOP, not a second opinion on completed
+/// runs. A work-bearing worktree is salvaged only when NOTHING durable says a
+/// real run ever owned it:
+///
+/// * `has_row` — a surviving `coordinator_runs` row in ANY phase (`done`,
+///   `failed`, `coordinating`, `checkpoint`, …). The normal lifecycle owns it,
+///   so don't double-report.
+/// * `ledger_known` — a `worktree_lifecycle` row for this tree. The run row is
+///   written at SPAWN (see `insert_with_parent` in `run_coordinator`) but is
+///   later TRIMMED by bounded retention, so `!has_row` alone cannot distinguish
+///   "row lost to early termination" from "row aged out after the run finished".
+///   The ledger is written once at `git worktree add` and never deleted, so its
+///   presence is durable proof the tree belonged to a real run. A finished run's
+///   leftover tree is a CLEANUP problem (see `report_leaked_worktrees`), not a
+///   failure, and minting a `failed` row for it is a phantom.
+/// * `has_work` — the leaf is dirty or ahead; nothing to recover otherwise.
+///
+/// Unit-tested. (coordinator-lifecycle bug: salvage false positives.)
+fn is_salvageable(has_row: bool, ledger_known: bool, has_work: bool) -> bool {
+    has_work && !has_row && !ledger_known
 }
 
 /// Recover runs whose durable row was lost on early termination: scan the managed
 /// worktree root for work-bearing leaves (uncommitted changes or commits ahead),
-/// and for any with no surviving store row, insert a `failed` salvage row and
-/// announce the recoverable branch/path — so the otherwise-invisible work shows
-/// up in `:workers` again and an operator can review/merge it. Best-effort: a
-/// store write that fails is skipped, never sinking startup. Returns the count
-/// salvaged. (coordinator-lifecycle bug: rows lost on early termination.)
+/// and for any with no surviving store row AND no lifecycle-ledger row, insert a
+/// `failed` salvage row and announce the recoverable branch/path — so the
+/// otherwise-invisible work shows up in `:workers` again and an operator can
+/// review/merge it. Best-effort: a store write that fails is skipped, never
+/// sinking startup. Returns the count salvaged.
+///
+/// The ledger set is read here (not passed in) because the caller's `known`
+/// snapshot is deliberately taken AFTER the retention reapers, so it cannot tell
+/// a lost row from a trimmed one — see [`is_salvageable`]. A ledger read error
+/// yields an EMPTY set, which falls back to the old (row-only) behaviour rather
+/// than silently disabling the backstop.
 fn salvage_orphaned_worktrees(
     cwd: &std::path::Path,
     store: &CoordinatorStore,
     known: &HashSet<String>,
     announce: bool,
 ) -> usize {
+    let ledger = store.ledger_worktree_ids().unwrap_or_default();
+    salvage_work_bearing(
+        crate::worker::work_bearing_worktrees(cwd),
+        store,
+        known,
+        &ledger,
+        announce,
+    )
+}
+
+/// The gating + insert half of [`salvage_orphaned_worktrees`], split from the
+/// filesystem scan so the contract can be unit-tested against a real store
+/// without materialising git worktrees.
+fn salvage_work_bearing(
+    candidates: Vec<crate::worker::OrphanWork>,
+    store: &CoordinatorStore,
+    known: &HashSet<String>,
+    ledger: &HashSet<String>,
+    announce: bool,
+) -> usize {
     let mut salvaged = 0usize;
-    for w in crate::worker::work_bearing_worktrees(cwd) {
-        if !is_salvageable(known.contains(&w.id), true) {
+    for w in candidates {
+        if !is_salvageable(known.contains(&w.id), ledger.contains(&w.id), true) {
             continue;
         }
         let error = format!(
@@ -3208,14 +3251,113 @@ mod tests {
     }
 
     #[test]
-    fn is_salvageable_only_when_work_exists_and_no_row() {
-        // Work-bearing worktree with no surviving store row → salvage it.
-        assert!(is_salvageable(false, true));
+    fn is_salvageable_only_when_work_exists_and_nothing_owns_the_tree() {
+        // Work-bearing worktree, no store row AND no ledger row → genuinely
+        // orphaned, salvage it. This is the case the backstop exists for.
+        assert!(is_salvageable(false, false, true));
         // A surviving row (terminal or live) means the lifecycle owns it — skip.
-        assert!(!is_salvageable(true, true));
+        assert!(!is_salvageable(true, false, true));
+        // No row but a LEDGER row: a real run created this tree and its row was
+        // simply trimmed by retention. A cleanup concern, never a failure.
+        assert!(!is_salvageable(false, true, true));
+        assert!(!is_salvageable(true, true, true));
         // No work in the leaf → nothing to recover, regardless of row state.
-        assert!(!is_salvageable(false, false));
-        assert!(!is_salvageable(true, false));
+        assert!(!is_salvageable(false, false, false));
+        assert!(!is_salvageable(true, false, false));
+        assert!(!is_salvageable(false, true, false));
+    }
+
+    /// The salvage backstop must fire for GENUINELY lost work and for nothing
+    /// else. Before this gate, `coordinator_runs` was dominated by phantom
+    /// `failed` rows: the run row IS written at spawn, but bounded retention
+    /// trims terminal rows, so a finished run's leftover dirty tree looked
+    /// row-less on the next startup and was re-minted as a failure (with
+    /// `turns=0`, poisoning aggregate stats) on every boot thereafter.
+    #[test]
+    fn salvage_recovers_only_trees_no_run_ever_owned() {
+        let path =
+            std::env::temp_dir().join(format!("aish_salvage_gate_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        let ow = |id: &str| crate::worker::OrphanWork {
+            id: id.to_string(),
+            branch: format!("aish/{id}"),
+            path: std::path::PathBuf::from(format!("/tmp/{id}")),
+        };
+        let ledger_row = |id: &str| {
+            store
+                .record_worktree_created(id, std::path::Path::new("/tmp/x"), id)
+                .unwrap();
+        };
+
+        // (a) Completed run, row still present.
+        store.insert("w_done", "shipped it", "sess", None).unwrap();
+        store.set_done("w_done", "ok").unwrap();
+        ledger_row("w_done");
+        // (b) Completed run whose row was TRIMMED by retention — only the
+        // never-reaped ledger row survives. The phantom-failure case.
+        ledger_row("w_reaped");
+        // (c) In-flight run (`coordinating`) and (d) a genuine failure: both have
+        // live rows, so the normal lifecycle owns them.
+        store.insert("w_live", "in flight", "sess", None).unwrap();
+        ledger_row("w_live");
+        store.insert("w_failed", "it broke", "sess", None).unwrap();
+        store.set_failed("w_failed", "boom").unwrap();
+        ledger_row("w_failed");
+        // (e) Genuinely orphaned: no row, no ledger entry, work on disk.
+
+        let snapshot = |s: &CoordinatorStore| -> (HashSet<String>, HashSet<String>) {
+            let known = s
+                .load_all()
+                .map(|rows| rows.into_iter().map(|r| r.run_id).collect())
+                .unwrap_or_default();
+            (known, s.ledger_worktree_ids().unwrap())
+        };
+        let candidates = || {
+            vec![
+                ow("w_done"),
+                ow("w_reaped"),
+                ow("w_live"),
+                ow("w_failed"),
+                ow("w_orphan"),
+            ]
+        };
+
+        let (known, ledger) = snapshot(&store);
+        let n = salvage_work_bearing(candidates(), &store, &known, &ledger, false);
+        assert_eq!(n, 1, "only the truly unowned tree is salvaged");
+
+        let rows = store.load_all().unwrap();
+        let salvaged: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind.as_deref() == Some(crate::coordinator_store::SALVAGE_KIND))
+            .map(|r| (r.run_id.as_str(), r.phase.as_str()))
+            .collect();
+        assert_eq!(
+            salvaged,
+            vec![("w_orphan", "failed")],
+            "a done/reaped/live/failed run's leftover tree is a cleanup concern, not a failure"
+        );
+        assert_eq!(
+            Phase::parse(&rows.iter().find(|r| r.run_id == "w_done").unwrap().phase),
+            Phase::Done,
+            "the completed run's own row is untouched"
+        );
+
+        // Repeat sweeps are idempotent: the salvage row written above now counts
+        // as a surviving row, so a second boot neither duplicates nor re-mints.
+        let (known, ledger) = snapshot(&store);
+        assert_eq!(
+            salvage_work_bearing(candidates(), &store, &known, &ledger, false),
+            0,
+            "a second sweep over the same trees salvages nothing"
+        );
+        assert_eq!(
+            store.load_all().unwrap().len(),
+            rows.len(),
+            "no duplicate rows across sweeps"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
