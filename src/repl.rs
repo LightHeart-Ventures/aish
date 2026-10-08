@@ -103,18 +103,25 @@ fn surface_mcp_skips(session: &Session, skips: &[String]) {
 
 /// Blocking y/N/a prompt on the controlling TTY. `a` ("always") allows this
 /// call and persists the tool/command so it never prompts again.
+///
+/// A prompt flagged sensitive by [`crate::sensitive`] (SEC-2.3) renders **only**
+/// `y/N`: `'a'`/`'d'` can never be honoured for a credential path, and an option
+/// that cannot be honoured must not be displayed. Any answer other than `y` —
+/// including a typed `a`/`d` — is clamped to a refusal.
 pub fn confirm_tty(prompt: &str) -> tools::Decision {
     use tools::Decision;
     // If a mid-turn key watcher is active it holds stdin in cbreak (ECHO off);
     // pause it for the length of this prompt so the answer echoes + line-edits.
     let _pause = crate::keywatch::pause_for_prompt();
-    print!("\x1b[33mrun?\x1b[0m {prompt} \x1b[33m[y/N/a/d]\x1b[0m ");
+    let (body, sensitive) = crate::sensitive::split_prompt(prompt);
+    let opts = crate::sensitive::prompt_options(sensitive);
+    print!("\x1b[33mrun?\x1b[0m {body} \x1b[33m{opts}\x1b[0m ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
         return Decision::Deny;
     }
-    match line.trim() {
+    let d = match line.trim() {
         "y" | "Y" | "yes" => Decision::AllowOnce,
         "a" | "A" | "always" => Decision::AlwaysAllow,
         // 'd' = allow this permission for the whole directory, recursively. Only
@@ -122,7 +129,8 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
         // elsewhere the gate treats it as a one-time allow.
         "d" | "D" | "dir" => Decision::AllowDir,
         _ => Decision::Deny,
-    }
+    };
+    crate::sensitive::clamp_decision(sensitive, d)
 }
 
 /// Emit an OSC 0 (icon name & window title) sequence to set the terminal window title.
@@ -9530,7 +9538,9 @@ async fn handle_colon(
                                                      ~/.aish/credentials as [profile:<plugin-id>], reusable via\n\
                                                      ${{profile:<plugin-id>}} in the plugin's .mcp.json\n\
                  :mode <paranoid|careful|normal|yolo> confirmation level (paranoid asks for everything,\n\
-                                                     normal only for write/create/delete, yolo never)\n\
+                                                     normal only for write/create/delete, yolo never —\n\
+                                                     EXCEPT sensitive paths (credentials, SSH/cloud keys,\n\
+                                                     .env), which confirm in every mode incl. yolo)\n\
                  :model <opus|sonnet|haiku|full-id>  switch model\n\
                  :model-detect                       re-detect + select the best local model for this machine\n\
                  :backend <claude|grok|openai|openrouter|local>  switch backend\n\
@@ -11283,7 +11293,10 @@ fn describe_mode(m: crate::session::Mode) -> String {
         Mode::Paranoid => "paranoid — confirm every tool call".into(),
         Mode::Careful => "careful — confirm anything not provably read-only".into(),
         Mode::Normal => "normal — confirm write/create/delete".into(),
-        Mode::Yolo => "\x1b[31myolo — nothing is confirmed\x1b[0m".into(),
+        Mode::Yolo => "\x1b[31myolo — nothing is confirmed, EXCEPT sensitive paths \
+(credentials, SSH/GPG/cloud keys, .env): those still ask, and 'a'/'d' are never offered for \
+them\x1b[0m"
+            .into(),
     }
 }
 
