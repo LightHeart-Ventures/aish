@@ -3241,6 +3241,12 @@ pub async fn run_on_tty(
 ) -> Result<std::process::ExitStatus> {
     use std::os::unix::process::CommandExt;
 
+    // The child is about to own the whole terminal: erase the activity window
+    // before handing it over. Otherwise the ticker's cursor-up anchor points
+    // into rows the child has since overwritten, and the next teardown eats
+    // part of the child's output. The next tool row opens a fresh window after
+    // the child exits.
+    crate::ticker::teardown();
     let _guard = TtyGuard::engage();
     // Suspend aish's bottom-anchored footer scroll region so the child inherits
     // a full-screen terminal with no reserved rows. Without this, a foreground

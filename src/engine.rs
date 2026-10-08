@@ -178,6 +178,11 @@ pub async fn run_turn(
     input: String,
     confirm: &mut Confirm<'_>,
 ) -> Result<String> {
+    // Activity-ticker lifetime: the bounded window of transient tool rows lives
+    // for exactly this logical turn. The RAII guard erases it on EVERY exit path
+    // — clean answer, `?` error, panic unwind — so the final answer is never
+    // printed below a stale window. See crate::ticker's invariant 1.
+    let _ticker = crate::ticker::TurnGuard::new();
     let result = run_turn_inner(backend, session, input, confirm).await;
     // Observe hooks at the turn boundary: TurnEnd on a final answer (carrying its
     // length), TurnEndFailure on a backend/loop error. Fires once per LOGICAL
@@ -949,7 +954,11 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
                     .evaluate(crate::hooks::HookEvent::PreToolUse, p)
                     .await
                 {
-                    eprintln!("\x1b[2m  ⛔ {} — hook denied: {reason}\x1b[0m", desc);
+                    // Per-tool outcome row (this call's ✓/✗ equivalent) → ticker.
+                    crate::ticker::push(&format!(
+                        "\x1b[2m  ⛔ {} — hook denied: {reason}\x1b[0m",
+                        desc
+                    ));
                     let result = ToolResult::text(
                         call.id.clone(),
                         format!("Blocked by a PreToolUse hook: {reason}"),
@@ -1003,7 +1012,8 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
                     // Resumed turn: surface a dim replay marker (no spinner, no
                     // re-execution) and reuse the journaled result.
                     let (output, is_error) = (output.clone(), *is_error);
-                    eprintln!("\x1b[2m  \u{21ba} replayed {desc}\x1b[0m");
+                    // Stands in for this call's ✓/✗ row → same ticker window.
+                    crate::ticker::push(&format!("\x1b[2m  \u{21ba} replayed {desc}\x1b[0m"));
                     ToolResult::text(call.id.clone(), output, is_error)
                 } else {
                     // Live turn. Tool-execution phase: this call gets its own animated
@@ -1020,6 +1030,12 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
                     let stopper = tool_spin.stopper();
                     let mut gated = |p: &str| {
                         pause_spinner(&stopper);
+                        // A permission prompt is a conversation with the user: it
+                        // must persist on screen while they read and answer, and
+                        // it writes below the activity window. Both reasons say
+                        // tear the window down first; the next tool row opens a
+                        // fresh one beneath the answered prompt.
+                        crate::ticker::teardown();
                         let decision = confirm(p);
                         resume_spinner(&stopper);
                         decision
@@ -1103,7 +1119,16 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
             session.record_turn_tool(desc, result.clone());
             results.push(result);
         }
-        eprintln!(); // breathing room between tool activity and what follows
+        // End of this round's tool batch. Erasing the activity window HERE is
+        // what makes the mid-turn write-discipline tractable: every writer that
+        // follows in this round (loopguard banner, compaction notice, the next
+        // round's narration, the final answer) prints onto an anchor-free
+        // screen, and the next round's first tool row opens a fresh window.
+        // No-op when the ticker is off or nothing is painted.
+        crate::ticker::teardown();
+        if !crate::ticker::active() || session.raw_tool_output {
+            eprintln!(); // breathing room between tool activity and what follows
+        }
         session.history.push(Msg::tool_results(results));
 
         // Confirmed loop this round → stop the turn with a tagged partial answer,
@@ -1516,7 +1541,12 @@ fn emit_narration(session: &mut Session, text: &str) {
         for line in rendered.lines() {
             eprintln!("🗨 {line}");
         }
-    } else {
+    } else if !crate::ticker::push_block(&rendered) {
+        // Interactive. A short aside ("Let me check the other file") is activity,
+        // not content — it goes through the ticker and scrolls away with the tool
+        // rows it introduces. A block TALLER than the window would be shredded
+        // down to its last K rows, so `push_block` declines it, tears the window
+        // down, and we print it permanently here.
         eprintln!("{rendered}");
     }
     // S9.3: persist the model’s interim reasoning to the per-worker
@@ -1563,8 +1593,12 @@ fn emit_activity_stream(session: &Session, result: &ToolResult) {
     // expanded view agree (raw_body substitutes a placeholder / pretty JSON for
     // an empty `content`).
     let line_count = raw_body(result).lines().count();
+    // Through the ticker: the summary belongs to the tool row above it, so it
+    // scrolls out of the bounded window with it instead of becoming permanent
+    // scrollback. Ctrl-O is unaffected — `reveal_last_turn` reads
+    // `session.last_turn_tools` (state), never the screen.
     for line in activity_stream_lines(line_count) {
-        eprintln!("\x1b[2m{}\x1b[0m", truncate_to_cols(&line, cols));
+        crate::ticker::push(&format!("\x1b[2m{}\x1b[0m", truncate_to_cols(&line, cols)));
     }
 }
 
@@ -1651,7 +1685,7 @@ fn seed_context(history_empty: bool, prev: Option<String>, input: String) -> Str
 /// here. Mirrors `md::render_stdout`'s isatty(1) check, but on fd 2 since all
 /// transient activity goes to stderr. In `aish -c` piped mode this is false,
 /// so no spinner/animation escape codes ever reach the output.
-fn stderr_is_tty() -> bool {
+pub(crate) fn stderr_is_tty() -> bool {
     // SAFETY: plain isatty query.
     unsafe { libc::isatty(2) == 1 }
 }
@@ -1663,7 +1697,7 @@ fn stderr_is_tty() -> bool {
 /// redraw clears just the last of them, and the rest stay on screen — so each
 /// frame scrolls a fresh copy instead of animating in place. Queried via
 /// TIOCGWINSZ on fd 2; falls back to `$COLUMNS`, then a conservative 80.
-fn stderr_cols() -> usize {
+pub(crate) fn stderr_cols() -> usize {
     // SAFETY: a read-only TIOCGWINSZ ioctl on fd 2.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -1675,6 +1709,25 @@ fn stderr_cols() -> usize {
         .ok()
         .and_then(|c| c.parse().ok())
         .unwrap_or(80)
+}
+
+/// Height in rows of the stderr terminal. Sizes the activity ticker's window:
+/// [`crate::ticker::rows_cap`] clamps the window to `rows - 2` so its cursor-up
+/// erase can never reach above the viewport into already-scrolled conversation.
+/// Queried via TIOCGWINSZ on fd 2; falls back to `$LINES`, then a conservative
+/// 24 (the DEC VT100 default, which yields a full-size window).
+pub(crate) fn stderr_rows() -> usize {
+    // SAFETY: a read-only TIOCGWINSZ ioctl on fd 2.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 {
+            return ws.ws_row as usize;
+        }
+    }
+    std::env::var("LINES")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(24)
 }
 
 /// Truncate `s` to at most `max` terminal columns (Unicode *display* width, so a
@@ -1821,6 +1874,13 @@ impl ToolSpinner {
         if !animate || !stderr_is_tty() {
             // Piped/headless or non-animating tool: emit the plain static line
             // once, no animation. The glyph is already part of `desc`.
+            //
+            // `run_interactive` lands here on a TTY: it hands the terminal to a
+            // child that scrolls freely, so tear the activity window down FIRST.
+            // Leaving it painted would let the child's output accumulate beneath
+            // a window whose erase anchor it has already invalidated — the torn
+            // -window failure mode in crate::ticker invariant 1.
+            crate::ticker::teardown();
             eprintln!("\x1b[2m  {desc}\x1b[0m");
             return Self {
                 state: Arc::new(Mutex::new(Spin::Stopped)),
@@ -1892,10 +1952,18 @@ impl ToolSpinner {
             t.abort();
         }
         if self.animated {
-            eprintln!(
-                "\r\x1b[2K\x1b[2m  {}\x1b[0m",
+            // Erase the spinner's row — the cursor's OWN row, directly below the
+            // activity window — then hand the result line to the ticker, which
+            // repaints the bounded window above it. `\r\x1b[2K` leaves the cursor
+            // at column 1 of that row, which is exactly the anchor the ticker's
+            // cursor-up erase assumes (see crate::ticker invariant 1). When the
+            // ticker is off/inactive `push` prints permanently, reproducing the
+            // pre-ticker behavior byte for byte.
+            eprint!("\r\x1b[2K");
+            crate::ticker::push(&format!(
+                "\x1b[2m  {}\x1b[0m",
                 tool_result_line(desc, is_error)
-            );
+            ));
         } else {
             // Non-animated (piped / background coordinator): the dim start line
             // was already printed at `start`; emit the static ✓/✗ result line too
@@ -2119,6 +2187,11 @@ fn raw_body(result: &ToolResult) -> String {
 /// Echo one tool result's raw content dim, nested under its 🔧 line. Printed
 /// verbatim and never truncated — squelching (Ctrl-O) is the size control.
 fn print_raw_result(result: &ToolResult) {
+    // `:raw` is an explicit request for verbose PERMANENT output, and this dump
+    // is unbounded — it cannot live in a K-row window. Tear the window down
+    // first so these rows don't land under a stale anchor (crate::ticker
+    // invariant 1); the next tool row opens a fresh window below the dump.
+    crate::ticker::teardown();
     for line in raw_body(result).lines() {
         eprintln!("\x1b[2m     {line}\x1b[0m");
     }
@@ -2192,7 +2265,7 @@ fn ansi_stripped_width(s: &str) -> usize {
 /// How many physical terminal rows a single logical (newline-free) line
 /// occupies once the terminal soft-wraps it at `cols`. A blank/zero-width line
 /// still occupies one row. `cols == 0` (unknown width) degrades to 1 row.
-fn physical_rows(formatted_line: &str, cols: usize) -> usize {
+pub(crate) fn physical_rows(formatted_line: &str, cols: usize) -> usize {
     if cols == 0 {
         return 1;
     }
@@ -2258,6 +2331,11 @@ fn build_turns_audit_from_history(history: &[Msg]) -> Vec<(usize, Vec<String>, V
 /// non-Ctrl-O outcome. Non-TTY (piped / background coordinator) just prints the
 /// header + body with no cursor games.
 pub fn render_raw_toggle(session: &mut Session, now_on: bool) {
+    // Two cursor-anchored writers must never be live at once. Ctrl-O normally
+    // lands at the prompt (window already torn down), but it is also bindable
+    // mid-turn, and this block's own anchor (`raw_view_rows`) would otherwise
+    // overlap the activity window's. Idempotent no-op in the common case.
+    crate::ticker::teardown();
     let header = if now_on {
         "\x1b[2mraw tool output on\x1b[0m".to_string()
     } else {
@@ -2333,7 +2411,10 @@ fn validate_output_schema_in(plugins_dir: &std::path::Path, result: &mut ToolRes
         // Fail-open: log the violation and annotate for the model, but let the
         // payload flow through unchanged.
         let note = format!("payload violates schema `{plugin_id}/{schema_name}`: {e}");
-        eprintln!("\x1b[2m  \u{26a0} schema-validation: {note}\x1b[0m");
+        // Per-tool annotation, same class as the ✓/✗ row it follows → ticker.
+        crate::ticker::push(&format!(
+            "\x1b[2m  \u{26a0} schema-validation: {note}\x1b[0m"
+        ));
         result.note_schema_violation(note);
     }
 }
