@@ -528,24 +528,40 @@ pub fn heartbeat_heart(beat_age_secs: Option<i64>, color_on: bool) -> String {
 // Statusline — a left/right-justified info bar printed above the REPL prompt
 // ---------------------------------------------------------------------------
 
-/// Stdout terminal width in columns, floored at 80. A tty is queried via
-/// TIOCGWINSZ; off a tty we honor `$COLUMNS`, else fall back to 80. The floor
-/// keeps the statusline from collapsing on a narrow or unknown terminal.
+/// Narrowest width the statusline zone solver will lay out against. Below this
+/// even a shed-to-the-bone bar (`aish vX` + clock) can't both fit, so the solver
+/// clips rather than shedding further — there is nothing left worth dropping.
+pub const MIN_STATUSLINE_COLS: usize = 20;
+
+/// Width assumed when the real terminal width is UNKNOWN (not a tty, no
+/// `$COLUMNS`) — the classic 80-column default.
+const ASSUMED_STATUSLINE_COLS: usize = 80;
+
+/// Stdout terminal width in columns. A tty is queried via TIOCGWINSZ; off a tty
+/// we honor `$COLUMNS`; when both are unknown we assume 80.
+///
+/// This used to floor the ANSWER at 80 even on a 60-column terminal — the bar
+/// was then laid out 80 wide and the footer painter clipped the overhang off the
+/// RIGHT edge, which is exactly where the clock and session stats live. The
+/// highest-value zone was the one silently destroyed. We now report the REAL
+/// width and let [`statusline_at`] shed low-value chrome to fit it, so the clock
+/// survives every terminal size.
 fn statusline_width() -> usize {
     // SAFETY: isatty + a read-only TIOCGWINSZ ioctl on stdout (fd 1).
     unsafe {
         if libc::isatty(1) == 1 {
             let mut ws: libc::winsize = std::mem::zeroed();
             if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-                return (ws.ws_col as usize).max(80);
+                return (ws.ws_col as usize).max(MIN_STATUSLINE_COLS);
             }
         }
     }
     std::env::var("COLUMNS")
         .ok()
         .and_then(|c| c.parse::<usize>().ok())
-        .map(|w| w.max(80))
-        .unwrap_or(80)
+        .filter(|w| *w > 0)
+        .map(|w| w.max(MIN_STATUSLINE_COLS))
+        .unwrap_or(ASSUMED_STATUSLINE_COLS)
 }
 
 /// Civil date `(year, month, day)` from days-since-Unix-epoch. Inverse of
@@ -677,12 +693,20 @@ pub fn second_statusline_at(
         Some(n) if !n.is_empty() => n,
         _ => return left.to_string(),
     };
-    let width = width.max(80);
-    let lw = visible_cols(left);
+    let width = width.max(MIN_STATUSLINE_COLS);
     // `visible_cols` (not chars) so emoji status badges appended to the name —
     // 🤖 workers / ⏰ alert / 🎯 goal, each 2 display cols — don't push the
     // right edge past the terminal width.
     let rw = visible_cols(name);
+    // The RIGHT zone (session name + live badges) is the row's anchored signal:
+    // an armed ⏰ alert or a 🤖 working coordinator must stay visible. So the
+    // LEFT (coordinator hint + plugin segments) is what yields when the two
+    // collide — clipped escape-aware with `…` — instead of letting the overflow
+    // run off the edge and take the badges with it.
+    let left_budget = width.saturating_sub(rw + 1);
+    let clipped = clip_cols_styled(left, left_budget);
+    let left = clipped.as_str();
+    let lw = visible_cols(left);
     let gap = width.saturating_sub(lw + rw).max(1);
     let spaces = " ".repeat(gap);
     if color_on {
@@ -694,8 +718,216 @@ pub fn second_statusline_at(
     }
 }
 
+/// Clip a PLAIN (escape-free) string to at most `max` display columns, marking
+/// a cut with a trailing `…`. Measured by unicode display width, so a CJK or
+/// emoji glyph counts its true 2 columns and a clip never lands mid-glyph.
+pub fn clip_cols(s: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if visible_cols(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    // Reserve one column for the ellipsis so the result still fits `max`.
+    let budget = max - 1;
+    let mut out = String::with_capacity(s.len());
+    let mut width = 0usize;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if width + w > budget {
+            break;
+        }
+        width += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// Clip a possibly-ANSI-styled string to at most `max` display columns, marking
+/// a cut with a trailing `…`. Escape-aware (delegates the hard part to
+/// [`crate::terminal::clip_visible`], which never splits an escape and resets
+/// SGR on a cut), so a colorized plugin segment stays well-formed when clipped.
+pub fn clip_cols_styled(s: &str, max: usize) -> String {
+    if visible_cols(s) <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    format!("{}…", crate::terminal::clip_visible(s, max - 1))
+}
+
+/// Separator between statusline segments: a middle dot with flanking double
+/// spaces. 5 display columns.
+const SEG_SEP: &str = "  \u{b7}  ";
+const SEG_SEP_COLS: usize = 5;
+
+/// Join statusline segments into `budget` columns by giving every segment an
+/// EQUAL share rather than letting the first ones eat the row.
+///
+/// The old behavior clipped the already-joined run at a hard ceiling, so a
+/// chatty first segment pushed every later segment off the row entirely — the
+/// quota was global, which means it was really "first come, first served". Each
+/// segment now gets `budget / n` columns (after accounting for separators) and
+/// is individually clipped with `…`, so a verbose plugin degrades itself instead
+/// of silencing its neighbors. Segments that fit whole donate their slack back
+/// to the ones that don't, in a single redistribution pass.
+///
+/// Pure: `budget` is supplied, nothing is read from the environment.
+pub fn segments_with_quota(segs: &[String], budget: usize) -> String {
+    let segs: Vec<&String> = segs.iter().filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() || budget == 0 {
+        return String::new();
+    }
+    let joined = segs
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(SEG_SEP);
+    if visible_cols(&joined) <= budget {
+        return joined;
+    }
+    // Columns left for segment TEXT once the separators are paid for. When the
+    // separators alone would blow the budget there's no honest multi-segment
+    // render — fall back to clipping the first segment into what we have.
+    let sep_cols = SEG_SEP_COLS * segs.len().saturating_sub(1);
+    let text_budget = match budget.checked_sub(sep_cols) {
+        Some(b) if b >= segs.len() => b,
+        _ => return clip_cols_styled(segs[0], budget),
+    };
+    let n = segs.len();
+    let fair = text_budget / n;
+    // Segments under their fair share free up columns; hand that slack to the
+    // over-budget ones so a short badge next to a long one isn't padded while
+    // its neighbor gets truncated.
+    let widths: Vec<usize> = segs.iter().map(|s| visible_cols(s)).collect();
+    let slack: usize = widths.iter().filter(|w| **w < fair).map(|w| fair - w).sum();
+    let over = widths.iter().filter(|w| **w > fair).count().max(1);
+    let bonus = slack / over;
+    let parts: Vec<String> = segs
+        .iter()
+        .zip(&widths)
+        .map(|(s, w)| {
+            if *w <= fair {
+                s.to_string()
+            } else {
+                clip_cols_styled(s, fair + bonus)
+            }
+        })
+        .collect();
+    parts.join(SEG_SEP)
+}
+
+/// A solved statusline: the LEFT zone split into its `badge` (`aish vX`, the one
+/// never-shed token) and `frame` (tagline/model chrome), the RIGHT zone, and the
+/// `gap` of spaces that right-justifies it. Returned by [`solve_statusline`] so
+/// both the plain and colored renders lay out from one identical solution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatuslineZones {
+    pub badge: String,
+    pub frame: String,
+    pub right: String,
+    pub gap: usize,
+}
+
+impl StatuslineZones {
+    /// Plain (escape-free) render — what a piped/`NO_COLOR` session prints, and
+    /// the exact visible text the colored render reproduces.
+    pub fn plain(&self) -> String {
+        format!(
+            "{}{}{}{}",
+            self.badge,
+            self.frame,
+            " ".repeat(self.gap),
+            self.right
+        )
+    }
+}
+
+/// Lay the statusline out as THREE zones that shed by priority instead of one
+/// left/right pair that overflows.
+///
+/// The bar carries four things, and they are NOT equally valuable:
+///
+/// | Zone | Content | Shed order |
+/// |---|---|---|
+/// | tagline | `— AI-native shell` | 1st — pure branding chrome, zero session info |
+/// | stats | tokens / tool calls / turns | 2nd — transient, also on `:stats` |
+/// | model | `· claude (sonnet)` | 3rd — slow-changing, also on `:model` |
+/// | badge + clock | `aish vX` … `YYYY-MM-DD HH:MM` | never — clipped only as a last resort |
+///
+/// Previously every zone was always composed and the overflow was cut off the
+/// RIGHT edge by the footer painter, which destroyed the clock first and the
+/// branding never. This sheds from the cheap end until the row fits, so a narrow
+/// terminal loses `— AI-native shell` and keeps the information.
+///
+/// Pure — width and the clock instant are supplied, so every degradation step is
+/// unit-testable without a TTY.
+pub fn solve_statusline(
+    version: &str,
+    model: &str,
+    stats: &str,
+    time: &str,
+    width: usize,
+) -> StatuslineZones {
+    let width = width.max(MIN_STATUSLINE_COLS);
+    let badge = format!("aish v{version}");
+    let mut tagline = true;
+    let mut show_model = !model.is_empty();
+    let mut show_stats = !stats.is_empty();
+    loop {
+        let mut frame = String::new();
+        if tagline {
+            frame.push_str(" — AI-native shell");
+        }
+        if show_model {
+            frame.push_str(&format!(" · {model}"));
+        }
+        let right = if show_stats {
+            format!("{stats} · {time}")
+        } else {
+            time.to_string()
+        };
+        // At least one space between the zones when they'd otherwise collide.
+        let need = visible_cols(&badge) + visible_cols(&frame) + visible_cols(&right) + 1;
+        if need <= width {
+            let gap = width - (visible_cols(&badge) + visible_cols(&frame) + visible_cols(&right));
+            return StatuslineZones {
+                badge,
+                frame,
+                right,
+                gap,
+            };
+        }
+        // Shed the cheapest surviving zone and re-solve.
+        if tagline {
+            tagline = false;
+        } else if show_stats {
+            show_stats = false;
+        } else if show_model {
+            show_model = false;
+        } else {
+            // Bone dry: `aish vX` + clock alone still overflow. Keep the clock
+            // whole (it's the live signal) and clip the badge into what's left.
+            let rw = visible_cols(&right);
+            let badge = clip_cols(&badge, width.saturating_sub(rw + 1));
+            let gap = width.saturating_sub(visible_cols(&badge) + rw).max(1);
+            return StatuslineZones {
+                badge,
+                frame: String::new(),
+                right,
+                gap,
+            };
+        }
+    }
+}
+
 /// Pure form of [`statusline`]: the caller supplies the instant, width, and
 /// color decision, so alignment + padding are unit-testable without a TTY.
+/// Layout is delegated to [`solve_statusline`] — the plain and colored renders
+/// are two paints of ONE solved zone plan, so they can never disagree on width.
 pub fn statusline_at(
     version: &str,
     model: &str,
@@ -704,35 +936,24 @@ pub fn statusline_at(
     width: usize,
     color_on: bool,
 ) -> String {
-    let left = format!("aish v{version} — AI-native shell · {model}");
     let time = fmt_datetime_utc(epoch);
-    // The running session stats (tokens in/out, tool calls, turns) sit on the
-    // RIGHT, immediately to the LEFT of the clock — a middle-dot separator (with
-    // flanking spaces) between them. An empty `stats` (a fresh session, nothing
-    // run yet) collapses to just the clock.
-    let right = if stats.is_empty() {
-        time.clone()
-    } else {
-        format!("{stats} · {time}")
-    };
-    let width = width.max(80);
-    // Char counts, not byte lengths — the em-dash and middle-dot are multi-byte
-    // but single-column, so counting chars keeps the right edge aligned.
-    let (lw, rw) = (left.chars().count(), right.chars().count());
-    // At least one space between the two halves when they'd otherwise collide.
-    let gap = width.saturating_sub(lw + rw).max(1);
-    let spaces = " ".repeat(gap);
+    let zones = solve_statusline(version, model, stats, &time, width);
     if color_on {
         // Subtle accents rather than one flat dim wash: a cyan version badge,
         // a dim tagline/model frame, and a dim right-justified stats+clock. The
-        // gap above is computed from the PLAIN char widths, so coloring the
-        // halves never disturbs the alignment.
-        let badge = format!("\x1b[36maish v{version}{RESET}");
-        let frame = format!("\x1b[2m — AI-native shell · {model}{RESET}");
-        let right_dim = format!("\x1b[2m{right}{RESET}");
+        // gap comes from the PLAIN zone widths, so coloring never disturbs the
+        // alignment.
+        let spaces = " ".repeat(zones.gap);
+        let badge = format!("\x1b[36m{}{RESET}", zones.badge);
+        let frame = if zones.frame.is_empty() {
+            String::new()
+        } else {
+            format!("\x1b[2m{}{RESET}", zones.frame)
+        };
+        let right_dim = format!("\x1b[2m{}{RESET}", zones.right);
         format!("{badge}{frame}{spaces}{right_dim}")
     } else {
-        format!("{left}{spaces}{right}")
+        zones.plain()
     }
 }
 
@@ -939,10 +1160,131 @@ mod tests {
     }
 
     #[test]
-    fn statusline_narrow_width_floors_at_80() {
-        let s = statusline_at("0.21.1", "x", "", 0, 10, false);
-        assert!(s.chars().count() >= 80);
-        assert!(s.contains("  ")); // separating gap present
+    fn statusline_narrow_width_sheds_chrome_and_keeps_the_clock() {
+        // 50 cols: the branding tagline is the first thing to go, and the clock
+        // — the zone the OLD right-edge clip destroyed first — survives whole.
+        let s = statusline_at("0.21.1", "claude (sonnet)", "", 0, 50, false);
+        assert!(!s.contains("AI-native shell"), "tagline sheds first: {s}");
+        assert!(s.starts_with("aish v0.21.1"));
+        assert!(s.ends_with("1970-01-01 00:00"));
+        assert_eq!(visible_cols(&s), 50, "exactly fills the real width: {s}");
+    }
+
+    #[test]
+    fn statusline_shed_order_is_tagline_then_stats_then_model() {
+        let stats = "tokens: 1200 in / 340 out, tool calls: 17, turns: 9";
+        let clock = "1970-01-01 00:00";
+        // Wide: everything fits.
+        let z = solve_statusline("0.21.1", "claude (sonnet)", stats, clock, 160);
+        assert!(z.frame.contains("AI-native shell") && z.frame.contains("claude (sonnet)"));
+        assert!(z.right.starts_with(stats));
+        // Narrower: tagline goes, stats + model stay.
+        let z = solve_statusline("0.21.1", "claude (sonnet)", stats, clock, 110);
+        assert!(!z.frame.contains("AI-native shell"));
+        assert!(z.frame.contains("claude (sonnet)"));
+        assert!(z.right.starts_with(stats));
+        // Narrower still: stats go, model stays.
+        let z = solve_statusline("0.21.1", "claude (sonnet)", stats, clock, 60);
+        assert!(z.frame.contains("claude (sonnet)"));
+        assert_eq!(z.right, clock);
+        // Bone dry: model goes too — badge + clock are what's left.
+        let z = solve_statusline("0.21.1", "claude (sonnet)", stats, clock, 32);
+        assert_eq!(z.frame, "");
+        assert_eq!(z.badge, "aish v0.21.1");
+        assert_eq!(z.right, clock);
+    }
+
+    #[test]
+    fn statusline_zones_never_exceed_the_width_at_any_size() {
+        // The whole point of the solver: no size overflows, so the footer painter
+        // never has to amputate the right edge. Sweep every plausible width.
+        let stats = "tokens: 1200 in / 340 out, tool calls: 17, turns: 9";
+        for width in 1..=200usize {
+            let z = solve_statusline(
+                "0.21.1",
+                "claude (sonnet)",
+                stats,
+                "1970-01-01 00:00",
+                width,
+            );
+            let rendered = visible_cols(&z.plain());
+            assert!(
+                rendered <= width.max(MIN_STATUSLINE_COLS),
+                "width {width} overflowed to {rendered}: {}",
+                z.plain()
+            );
+            // The clock is never sacrificed, and `aish v` always survives.
+            assert!(
+                z.right.ends_with("1970-01-01 00:00"),
+                "lost clock at {width}"
+            );
+            assert!(!z.badge.is_empty(), "lost badge at {width}");
+        }
+    }
+
+    #[test]
+    fn plain_and_colored_renders_agree_on_visible_width() {
+        for width in [40usize, 60, 80, 120] {
+            let plain = statusline_at("0.21.1", "claude (sonnet)", "turns: 3", 0, width, false);
+            let color = statusline_at("0.21.1", "claude (sonnet)", "turns: 3", 0, width, true);
+            assert_eq!(
+                visible_cols(&plain),
+                visible_cols(&color),
+                "color changed the layout at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn segments_share_the_budget_instead_of_first_come_first_served() {
+        let chatty = "a".repeat(60);
+        let segs = vec![
+            chatty.clone(),
+            "ccquota 42%".to_string(),
+            "♥ 3m".to_string(),
+        ];
+        let out = segments_with_quota(&segs, 60);
+        assert!(visible_cols(&out) <= 60, "over budget: {out}");
+        // Every segment still shows — the verbose one degrades ITSELF.
+        assert!(out.contains("ccquota 42%"), "later segment silenced: {out}");
+        assert!(out.contains("♥ 3m"), "last segment silenced: {out}");
+        assert!(out.contains('…'), "clip marker missing: {out}");
+        // Fits whole → returned verbatim, no ellipsis, no reflow.
+        let small = vec!["ccquota 42%".to_string(), "♥ 3m".to_string()];
+        assert_eq!(segments_with_quota(&small, 60), "ccquota 42%  ·  ♥ 3m");
+        assert_eq!(segments_with_quota(&[], 60), "");
+    }
+
+    #[test]
+    fn segments_quota_keeps_ansi_wellformed() {
+        let styled = format!("\x1b[36m{}\x1b[0m", "x".repeat(40));
+        let out = segments_with_quota(&[styled, "\x1b[33mwarn\x1b[0m".to_string()], 30);
+        assert!(visible_cols(&out) <= 30, "over budget: {out}");
+        assert!(out.contains("\x1b[0m"), "SGR left unreset: {out:?}");
+        assert!(out.contains("warn"));
+    }
+
+    #[test]
+    fn clip_cols_marks_the_cut_and_respects_width() {
+        assert_eq!(clip_cols("abcdef", 10), "abcdef");
+        assert_eq!(clip_cols("abcdef", 4), "abc…");
+        assert_eq!(clip_cols("abcdef", 0), "");
+        // Wide glyphs count 2 columns, so a clip never lands mid-glyph.
+        assert!(visible_cols(&clip_cols("日本語テキスト", 5)) <= 5);
+    }
+
+    #[test]
+    fn second_statusline_clips_left_before_dropping_the_name_badges() {
+        let long = "x".repeat(200);
+        let s = second_statusline_at(&long, Some("sprint-42 ⏰"), 80, false);
+        assert!(
+            visible_cols(&s) <= 80,
+            "row overflowed: {}",
+            visible_cols(&s)
+        );
+        // The anchored right zone survives — an armed alert badge must stay visible.
+        assert!(s.ends_with("sprint-42 ⏰"), "lost the name/badges: {s}");
+        assert!(s.contains('…'), "left zone should be clipped: {s}");
     }
 
     #[test]
