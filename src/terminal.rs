@@ -1,17 +1,24 @@
 //! Bottom-anchored statusline via a DECSTBM scroll region.
 //!
-//! The REPL pins a three-row footer to the very bottom of the terminal:
+//! The REPL pins a four-row footer to the very bottom of the terminal:
 //!
 //! ```text
-//! rows 1..H-3   scrolling REPL area (command output, history, the prompt)
-//! row  H-2      ────────────────────────────────────────────────  (solid rule)
+//! rows 1..H-4   scrolling REPL area (command output, history)
+//! row  H-3      ────────────────────────────────────────────────  (solid rule)
+//! row  H-2      ❯ git stat                                       (INPUT — always here)
 //! row  H-1      ⇄ attached to w_YM7YyIHV (2/2 · Shift-Tab to cycle, :detach)  (status msg)
 //! row  H        aish v0.23.0 · claude (sonnet)              2026-07-01 21:15   (statusline)
 //! ```
 //!
+//! The INPUT row is the invariant: row `H-2` — one line below the rule, third
+//! from the bottom — is where the operator types, in EVERY state of the shell
+//! (idle at the prompt, mid-turn type-ahead, attached to a worker, goal mode).
+//! It is the last zone the degradation solver will ever shed, so the prompt
+//! never moves out from under the operator's fingers. See [`FooterLayout`].
+//!
 //! The footer is held fixed with a DECSTBM scroll region (`ESC[top;bottomr`):
-//! the region covers rows `1..=H-3`, so everything the shell prints scrolls
-//! *above* the footer while rows `H-2..=H` stay put. Each [`Terminal::draw_footer`]
+//! the region covers rows `1..=H-4`, so everything the shell prints scrolls
+//! *above* the footer while rows `H-3..=H` stay put. Each [`Terminal::draw_footer`]
 //! re-asserts the region before painting, which makes a terminal *resize*
 //! between prompts self-healing (the bottom margin tracks the new height) even
 //! without catching SIGWINCH.
@@ -26,13 +33,13 @@
 //! margins — DECSC/DECRC is the portable pair.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Rows reserved at the bottom for the footer: separator + status message +
-/// statusline.
-pub const FOOTER_ROWS: u16 = 3;
+/// Rows reserved at the bottom for the footer: separator + input + status
+/// message + statusline.
+pub const FOOTER_ROWS: u16 = 4;
 
 /// Scrolling rows the body keeps no matter how hard the footer is squeezed. The
 /// footer is chrome; command output is the product — footer zones are shed to
@@ -44,9 +51,10 @@ pub const MIN_BODY_ROWS: u16 = 2;
 pub const MIN_FOOTER_ROWS: u16 = MIN_BODY_ROWS + FOOTER_ROWS;
 
 /// Smallest terminal height that still gets SOME footer: [`MIN_BODY_ROWS`] of
-/// body plus the one un-sheddable statusline row. Between this and
+/// body plus the one un-sheddable INPUT row. Between this and
 /// [`MIN_FOOTER_ROWS`] the footer DEGRADES — it drops the rule, then the status
-/// message — instead of vanishing outright. See [`FooterLayout`].
+/// message, then the statusline — instead of vanishing outright, and what
+/// survives longest is the row the operator types into. See [`FooterLayout`].
 pub const MIN_FOOTER_ROWS_DEGRADED: u16 = MIN_BODY_ROWS + 1;
 
 /// The footer's resolved row plan for one terminal size — the SINGLE source of
@@ -80,7 +88,13 @@ pub const MIN_FOOTER_ROWS_DEGRADED: u16 = MIN_BODY_ROWS + 1;
 /// | escalation banners | 2 each | notifications; shed WHOLE, oldest-first |
 /// | separator rule | 1 | pure chrome — carries no information at all |
 /// | status message | 1 | transient, and the same text also prints inline |
-/// | statusline | 1 | version/model/stats/clock — never shed while a footer exists |
+/// | statusline | 1 | version/model/stats/clock — informational, re-derivable |
+/// | input | 1 | NEVER shed while a footer exists — the operator's typing surface |
+///
+/// The input row sheds LAST on purpose: a shell whose prompt relocates (or
+/// disappears) under a resize is unusable, while a shell that loses its clock
+/// is merely plainer. At the extreme — a 3-row window — the only chrome left is
+/// the input row itself.
 ///
 /// A plan with `height == 0` means "no footer fits"; the caller falls back to
 /// inline printing exactly as it did below the old threshold.
@@ -97,8 +111,12 @@ pub struct FooterLayout {
     pub sep_row: Option<u16>,
     /// Screen row of the status message, or `None` when it was shed.
     pub msg_row: Option<u16>,
-    /// Screen row of the statusline, or `None` only when no footer fits at all.
+    /// Screen row of the statusline, or `None` when it was shed.
     pub bar_row: Option<u16>,
+    /// Screen row of the INPUT line — where the line editor parks its prompt and
+    /// where mid-turn type-ahead paints. `None` only when no footer fits at all,
+    /// because this is the last zone the solver sheds.
+    pub input_row: Option<u16>,
     /// Last scrolling row — the DECSTBM bottom margin AND the body-home target.
     pub body_bottom: u16,
 }
@@ -113,15 +131,16 @@ impl FooterLayout {
         // 2-row unit (the escalation message + that worker's latest status), so
         // half a banner must never become reservable.
         let mut banner_rows = want_banner_rows - (want_banner_rows % per);
-        let (mut sep, mut msg, mut bar) = (true, true, true);
+        let (mut sep, mut msg, mut bar, mut input) = (true, true, true, true);
         // Budget = every row except the body rows we refuse to give up.
         let budget = rows.saturating_sub(MIN_BODY_ROWS);
         let height = loop {
-            let h = banner_rows + u16::from(sep) + u16::from(msg) + u16::from(bar);
+            let h =
+                banner_rows + u16::from(sep) + u16::from(msg) + u16::from(bar) + u16::from(input);
             if h <= budget {
                 break h;
             }
-            // Shed strictly in priority order. `bar` is last, and shedding it
+            // Shed strictly in priority order. `input` is last, and shedding it
             // yields h == 0, which fits any budget — so the loop terminates.
             if banner_rows > 0 {
                 banner_rows -= per;
@@ -129,8 +148,10 @@ impl FooterLayout {
                 sep = false;
             } else if msg {
                 msg = false;
-            } else {
+            } else if bar {
                 bar = false;
+            } else {
+                input = false;
             }
         };
         // The two documented thresholds are DERIVED facts about this solver, not
@@ -142,9 +163,17 @@ impl FooterLayout {
             "degraded-footer threshold drifted from the solver at {rows} rows"
         );
         debug_assert_eq!(
-            sep && msg && bar,
+            sep && msg && bar && input,
             rows >= MIN_FOOTER_ROWS,
             "full-footer threshold drifted from the solver at {rows} rows"
+        );
+        // The input row outlives every other zone: whenever ANY footer fits, the
+        // operator has a place to type. This is the invariant the whole feature
+        // rests on, so assert it rather than trusting the shed order to stay put.
+        debug_assert_eq!(
+            input,
+            height > 0,
+            "input row must survive exactly as long as the footer does ({rows} rows)"
         );
         // Pack the survivors contiguously upward from the last row, so a shed
         // zone closes the gap instead of leaving a hole the body can't use.
@@ -159,6 +188,7 @@ impl FooterLayout {
         };
         let bar_row = take(bar);
         let msg_row = take(msg);
+        let input_row = take(input);
         let sep_row = take(sep);
         Self {
             rows,
@@ -167,6 +197,7 @@ impl FooterLayout {
             sep_row,
             msg_row,
             bar_row,
+            input_row,
             body_bottom: rows.saturating_sub(height).max(1),
         }
     }
@@ -270,22 +301,43 @@ static ALT_SCROLL_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 /// threading the strings back through.
 static LAST_FOOTER: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
 
-/// Mid-turn type-ahead override for the footer's status-message row (row H-1).
-/// When `Some`, the footer paints THIS string in the message row instead of the
-/// cached coordinator status message — so the operator sees the line they are
-/// typing WHILE a model turn runs (thinking / mid tool-call). Set/cleared by the
-/// keywatch reader thread via [`set_midturn_input`] / [`clear_midturn_input`].
+/// Mid-turn type-ahead content for the footer's INPUT row (row H-2). When
+/// `Some`, the footer paints THIS string in the input row — so the operator sees
+/// the line they are typing WHILE a model turn runs (thinking / mid tool-call).
+/// Set/cleared by the keywatch reader thread via [`set_midturn_input`] /
+/// [`clear_midturn_input`].
 static MIDTURN_INPUT: Mutex<Option<String>> = Mutex::new(None);
 
-/// The status-message row to actually paint: the mid-turn type-ahead line when
-/// one is active, otherwise the caller's cached coordinator status message. The
-/// raw status message is always what gets cached in `LAST_FOOTER`; the override
-/// is applied only at paint time so a resize/idle repaint reflects live typing.
-fn effective_status_msg(cached: &str) -> String {
-    match MIDTURN_INPUT.lock().unwrap().as_ref() {
-        Some(s) => s.clone(),
-        None => cached.to_string(),
+/// The last prompt string the line editor parked on the input row (see
+/// [`park_input_row`]). Cached so every footer repaint — idle heartbeat, resize,
+/// post-clear restore, mid-turn status update — can re-draw the prompt affordance
+/// on row H-2 even when nothing is being typed. THIS is what makes the input row
+/// unconditional: the row always has content, in every state of the shell.
+static LAST_PROMPT: Mutex<String> = Mutex::new(String::new());
+
+/// What to paint on the INPUT row, or `None` to LEAVE THE ROW ALONE.
+///
+/// Precedence:
+/// 1. `None` while the line editor is actively reading — rustyline owns the row
+///    and is drawing the live buffer + cursor there; a footer repaint that
+///    rewrote it would fight the editor and strand the cursor.
+/// 2. The mid-turn type-ahead line, when a turn is running and the keywatch
+///    thread has installed one (always at least the bare prompt sigil).
+/// 3. Otherwise the cached prompt — the resting affordance, so the row is never
+///    blank between turns.
+fn effective_input_line() -> Option<String> {
+    if READING_LINE.load(Ordering::Relaxed) {
+        return None;
     }
+    if let Some(s) = MIDTURN_INPUT.lock().ok().and_then(|g| g.clone()) {
+        return Some(s);
+    }
+    Some(
+        LAST_PROMPT
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_else(|e| e.into_inner().clone()),
+    )
 }
 
 /// Paint the operator's mid-turn prompt + type-ahead line into the footer's
@@ -771,8 +823,9 @@ fn paint_cached_footer(home_body: bool) {
     // resize and refresh the footer to the new canvas dimensions on sight.
     LAST_PAINTED_SIZE.store(pack_size(rows, cols), Ordering::Relaxed);
     let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
-    // Mid-turn type-ahead, when active, takes over the message row.
-    let msg = effective_status_msg(&msg);
+    // The INPUT row is resolved inside `footer_seq` (type-ahead → cached prompt
+    // → leave-alone-while-reading), so the status message row stays the status
+    // message in every state.
     let utf8 = utf8_locale();
     let sep = separator_line(cols, utf8, crate::style::colors_enabled());
     // footer_seq re-asserts the scroll region internally (inside its DECSC/DECRC
@@ -867,9 +920,13 @@ pub fn separator_line(cols: u16, utf8: bool, color_on: bool) -> String {
 }
 
 /// Build the full footer paint: save cursor, position + clear + draw each of the
-/// three footer rows, restore cursor. `separator`, `status_msg`, and `statusline`
+/// footer rows, restore cursor. `separator`, `status_msg`, and `statusline`
 /// are painted verbatim (already styled by the caller) after clipping each to
 /// `cols` visible columns so nothing wraps and corrupts the region.
+///
+/// The INPUT row (H-2) is resolved from process state by [`effective_input_line`]
+/// — live type-ahead, resting prompt, or "leave it alone" while the line editor
+/// owns it.
 pub fn footer_seq(
     rows: u16,
     cols: u16,
@@ -883,12 +940,24 @@ pub fn footer_seq(
     let keep = escalation_rows_that_fit(rows, crate::escalation::row_count())
         / crate::escalation::ROWS_PER_BANNER;
     let banners = crate::escalation::rows(crate::style::colors_enabled(), keep as usize);
-    footer_seq_with(rows, cols, separator, status_msg, statusline, banners)
+    footer_seq_with(
+        rows,
+        cols,
+        separator,
+        status_msg,
+        statusline,
+        banners,
+        effective_input_line().as_deref(),
+    )
 }
 
-/// [`footer_seq`] with the escalation banners passed in instead of read from the
-/// process-global stack — the whole row plan is a pure function of `(rows, cols,
-/// banners)`, so the geometry is unit-testable without mutating shared state.
+/// [`footer_seq`] with the escalation banners AND the input-row content passed in
+/// instead of read from process-global state — the whole row plan is a pure
+/// function of `(rows, cols, banners, input)`, so the geometry is unit-testable
+/// without mutating shared state.
+///
+/// `input == None` means "do not touch the input row": the line editor is
+/// drawing there and owns the cursor. `Some(text)` paints `text` on row H-2.
 pub fn footer_seq_with(
     rows: u16,
     cols: u16,
@@ -896,6 +965,7 @@ pub fn footer_seq_with(
     status_msg: &str,
     statusline: &str,
     banners: Vec<(String, String)>,
+    input: Option<&str>,
 ) -> String {
     // ONE row plan, solved from `(rows, banners.len())`, drives both the
     // reserved region and every painted row — see [`FooterLayout`] for why the
@@ -953,10 +1023,20 @@ pub fn footer_seq_with(
         ));
     }
     // Each zone paints ONLY if the plan granted it a row. A degraded footer
-    // (short window) silently drops the rule, then the message, and keeps the
-    // statusline — rather than dropping the whole footer off a cliff.
+    // (short window) silently drops the rule, then the message, then the
+    // statusline — and keeps the INPUT row — rather than dropping the whole
+    // footer off a cliff.
     if let Some(sep_row) = layout.sep_row {
         s.push_str(&format!("\x1b[{sep_row};1H\x1b[2K{sep}"));
+    }
+    // The input row: ONE row below the rule, third from the bottom. Painted only
+    // when the caller passed content — `None` means the line editor is live on
+    // that row and rewriting it would fight the editor's own redraw.
+    if let (Some(input_row), Some(text)) = (layout.input_row, input) {
+        s.push_str(&format!(
+            "\x1b[{input_row};1H\x1b[2K{}",
+            clip_visible(text, max)
+        ));
     }
     if let Some(msg_row) = layout.msg_row {
         s.push_str(&format!("\x1b[{msg_row};1H\x1b[2K{msg}"));
@@ -1128,11 +1208,7 @@ impl Terminal {
         // DECSC/DECRC save-restore, so the DECSTBM cursor-home side effect never
         // leaks out and strands the next prompt at the top of the screen.
         buf.push_str(&footer_seq(
-            self.rows,
-            self.cols,
-            &sep,
-            &effective_status_msg(status_msg),
-            statusline,
+            self.rows, self.cols, &sep, status_msg, statusline,
         ));
         let mut out = std::io::stdout();
         let _ = write!(out, "{buf}");
@@ -1710,6 +1786,137 @@ pub fn footer_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Whether the REPL is parked in a blocking line read — i.e. the line editor
+/// owns the INPUT row and the real cursor sits there, OUTSIDE the scroll region.
+/// Callers that want to print transcript text consult this to route the write
+/// into the body ([`print_in_body`]) instead of emitting it at the cursor.
+pub fn reading_line() -> bool {
+    READING_LINE.load(Ordering::Relaxed)
+}
+
+/// Last body row the cursor was known to occupy (1-based; `0` = unknown).
+///
+/// The INPUT row lives in the footer, OUTSIDE the DECSTBM region, so parking the
+/// line editor there takes the cursor out of the transcript — and something has
+/// to remember where the transcript left off. This is that memory: refreshed by
+/// a bounded DSR probe on each [`park_input_row`], advanced by every
+/// [`print_in_body`] write, and clamped into the live body on read (a resize can
+/// shrink the body under a stale value).
+static BODY_ROW: AtomicU16 = AtomicU16::new(0);
+
+/// The footer plan for the LIVE terminal, or `None` when no footer region is
+/// installed or the size is unknown — in which case every input-row helper
+/// no-ops and the editor keeps its classic inline behavior.
+fn live_layout() -> Option<FooterLayout> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    term_size().map(|(rows, _)| FooterLayout::for_rows(rows))
+}
+
+/// The remembered body row, clamped into `layout`'s body. Unknown (or a row the
+/// current geometry can't hold) resolves to the LAST body row — where an
+/// append-only transcript ends up anyway, so the fallback degrades to "keep
+/// writing at the bottom" rather than to corruption.
+fn body_cursor_row(layout: &FooterLayout) -> u16 {
+    let row = BODY_ROW.load(Ordering::Relaxed);
+    if row == 0 {
+        layout.body_bottom
+    } else {
+        row.clamp(1, layout.body_bottom)
+    }
+}
+
+/// Park the line editor on the footer's INPUT row (`H-2`) and cache `prompt` so
+/// every later repaint can redraw the resting affordance there.
+///
+/// Called immediately before the editor blocks on a read. Two effects:
+/// 1. the prompt string is cached in `LAST_PROMPT`, which is what makes the input
+///    row unconditional — the footer can repaint it in ANY state;
+/// 2. the transcript cursor is remembered (one bounded DSR probe, same mechanism
+///    and the same opt-out as [`query_cursor_row`]'s other caller) and the cursor
+///    is moved to the cleared input row, so rustyline renders the live buffer
+///    there.
+///
+/// No-ops when no footer is installed: off-tty, in a short window, or before the
+/// region is enabled the editor prints inline exactly as it always did.
+///
+/// Known limitation: an input line that wraps past the bottom row scrolls the
+/// screen, because the editor is drawing outside the scroll region. Two columns'
+/// worth of typing is the practical ceiling, and the next heartbeat repaint heals
+/// the footer rows.
+pub fn park_input_row(prompt: &str) {
+    match LAST_PROMPT.lock() {
+        Ok(mut slot) => *slot = prompt.to_string(),
+        Err(e) => *e.into_inner() = prompt.to_string(),
+    }
+    let Some(layout) = live_layout() else { return };
+    let Some(row) = layout.input_row else { return };
+    if let Some(body) = query_cursor_row() {
+        BODY_ROW.store(body.clamp(1, layout.body_bottom), Ordering::Relaxed);
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b[{row};1H\x1b[2K");
+    let _ = out.flush();
+}
+
+/// Release the INPUT row after a read and return the cursor to the transcript,
+/// optionally echoing the submitted line into the body first.
+///
+/// The echo is what keeps the scrollback honest: with the editor parked in the
+/// footer, the submitted command would otherwise be overwritten by the next
+/// prompt and vanish from the transcript. `echo` should be the prompt + the
+/// line, exactly as it appeared; `None` (Ctrl-C, EOF, an empty submit) echoes
+/// nothing. Either way the cursor lands back in the body, so the command's own
+/// output scrolls inside the region as usual.
+pub fn unpark_input_row(echo: Option<&str>) {
+    let Some(layout) = live_layout() else { return };
+    let Some(input_row) = layout.input_row else {
+        return;
+    };
+    let row = body_cursor_row(&layout);
+    let mut out = std::io::stdout();
+    // Wipe the editor's leftovers so the resting-prompt repaint starts clean.
+    let _ = write!(out, "\x1b[{input_row};1H\x1b[2K\x1b[{row};1H");
+    if let Some(line) = echo {
+        // At the last body row this `\r\n` scrolls the region (correct); above it
+        // it just steps down a row.
+        let _ = write!(out, "{line}\r\n");
+        BODY_ROW.store((row + 1).min(layout.body_bottom), Ordering::Relaxed);
+    } else {
+        BODY_ROW.store(row, Ordering::Relaxed);
+    }
+    let _ = out.flush();
+}
+
+/// Write already-CRLF `text` into the BODY while the line editor is parked on the
+/// input row, leaving the editor's cursor untouched (DECSC/DECRC around the
+/// write). Returns `false` when no footer is installed, so the caller can fall
+/// back to its ordinary print path.
+///
+/// This is the counterpart to parking: because the input row is a DIFFERENT row
+/// from the transcript, a body write needs no erase-and-redraw of the prompt at
+/// all — the editor's line simply stays where it is. `text` must carry its own
+/// trailing newline and use CRLF (the tty is in raw mode while the editor reads).
+pub fn print_in_body(text: &str) -> bool {
+    let Some(layout) = live_layout() else {
+        return false;
+    };
+    if layout.input_row.is_none() {
+        return false;
+    }
+    let row = body_cursor_row(&layout);
+    let consumed = text.matches('\n').count() as u16;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b7\x1b[{row};1H{text}\x1b8");
+    let _ = out.flush();
+    BODY_ROW.store(
+        row.saturating_add(consumed).min(layout.body_bottom),
+        Ordering::Relaxed,
+    );
+    true
+}
+
 /// Cursor-home sequence to the bottom row, column 1 (`ESC[<rows>;1H`). Used by
 /// the inline-mode attach clear to anchor the view to the bottom of the screen
 /// (mirroring footer mode, where [`restore_after_clear`] homes to the bottom
@@ -1818,9 +2025,10 @@ mod tests {
     }
 
     #[test]
-    fn scroll_region_reserves_three_bottom_rows() {
-        // 24-row terminal → region rows 1..=21, footer at 22/23/24.
-        assert_eq!(scroll_region_seq(24), "\x1b[1;21r");
+    fn scroll_region_reserves_four_bottom_rows() {
+        // 24-row terminal → region rows 1..=20, footer at 21 (rule), 22 (input),
+        // 23 (status message), 24 (statusline).
+        assert_eq!(scroll_region_seq(24), "\x1b[1;20r");
     }
 
     #[test]
@@ -1856,7 +2064,7 @@ mod tests {
 
     #[test]
     fn footer_overflow_is_zero_above_the_body_floor() {
-        // 24-row terminal → body is rows 1..=21. A cursor at or above the last
+        // 24-row terminal → body is rows 1..=20. A cursor at or above the last
         // body row needs no scroll: nothing of the output is sitting in the
         // rows the footer is about to reclaim. This is the alt-screen case —
         // vim/less restore the pre-launch cursor, so leaving them never jerks
@@ -1865,7 +2073,7 @@ mod tests {
         // reads the LIVE escalation stack: banner rows shrink the body, and a
         // sibling test pinning a banner would otherwise flip these numbers.
         let plan = FooterLayout::solve(24, 0);
-        assert_eq!(plan.overflow_rows(21), 0);
+        assert_eq!(plan.overflow_rows(20), 0);
         assert_eq!(plan.overflow_rows(10), 0);
         assert_eq!(plan.overflow_rows(1), 0);
     }
@@ -1873,12 +2081,13 @@ mod tests {
     #[test]
     fn footer_overflow_measures_rows_spilled_into_the_footer() {
         // THE BUG, in numbers: `ls -al` on a 24-row terminal left the cursor at
-        // row 24 while the region was suspended, so 3 rows of output sat under
+        // row 24 while the region was suspended, so 4 rows of output sat under
         // the footer and got painted over. Lift exactly that many.
         let plan = FooterLayout::solve(24, 0);
-        assert_eq!(plan.overflow_rows(22), 1);
-        assert_eq!(plan.overflow_rows(23), 2);
-        assert_eq!(plan.overflow_rows(24), 3);
+        assert_eq!(plan.overflow_rows(21), 1);
+        assert_eq!(plan.overflow_rows(22), 2);
+        assert_eq!(plan.overflow_rows(23), 3);
+        assert_eq!(plan.overflow_rows(24), 4);
         // Never more than the footer's own height — that is all it can hide.
         assert_eq!(plan.overflow_rows(99), FOOTER_ROWS);
         // Tiny terminals read the SAME solved plan as scroll_region_seq, so the
@@ -1891,10 +2100,10 @@ mod tests {
 
     #[test]
     fn banner_growth_equals_the_body_rows_the_footer_takes() {
-        // 24-row window: no banner → body ends at 21; one banner → 19. The two
+        // 24-row window: no banner → body ends at 20; one banner → 18. The two
         // rows the tray claims are exactly what the body must give up.
-        assert_eq!(FooterLayout::solve(24, 0).body_bottom, 21);
-        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 19);
+        assert_eq!(FooterLayout::solve(24, 0).body_bottom, 20);
+        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 18);
         assert_eq!(banner_growth_rows(24, 0, 2), 2);
         // Second banner takes two more; the first→second step is still 2.
         assert_eq!(banner_growth_rows(24, 2, 4), 2);
@@ -1989,13 +2198,13 @@ mod tests {
         // re-assert, while the region is still full-screen, so the whole
         // viewport scrolls and the lifted rows reach native scrollback.
         let seq = resume_region_seq_with_cursor(24, Some(24));
-        assert_eq!(seq, "\x1b[3S\x1b[1;21r\x1b[21;1H");
-        assert!(seq.find("\x1b[3S").unwrap() < seq.find("\x1b[1;21r").unwrap());
+        assert_eq!(seq, "\x1b[4S\x1b[1;20r\x1b[20;1H");
+        assert!(seq.find("\x1b[4S").unwrap() < seq.find("\x1b[1;20r").unwrap());
 
         // One spilled row scrolls one row.
         assert_eq!(
-            resume_region_seq_with_cursor(24, Some(22)),
-            "\x1b[1S\x1b[1;21r\x1b[21;1H"
+            resume_region_seq_with_cursor(24, Some(21)),
+            "\x1b[1S\x1b[1;20r\x1b[20;1H"
         );
     }
 
@@ -2010,11 +2219,11 @@ mod tests {
         );
         assert_eq!(
             resume_region_seq_with_cursor(24, None),
-            "\x1b[1;21r\x1b[21;1H"
+            "\x1b[1;20r\x1b[20;1H"
         );
         // Cursor already clear of the footer zone → also no scroll emitted.
         assert_eq!(
-            resume_region_seq_with_cursor(24, Some(21)),
+            resume_region_seq_with_cursor(24, Some(20)),
             resume_region_seq(24)
         );
     }
@@ -2053,9 +2262,9 @@ mod tests {
 
     #[test]
     fn resume_region_reasserts_then_homes_last_body_row() {
-        // 24-row terminal: re-assert region 1..=21 then home into row 21 (the
+        // 24-row terminal: re-assert region 1..=20 then home into row 20 (the
         // last body row) so the next prompt grows up from just above the footer.
-        assert_eq!(resume_region_seq(24), "\x1b[1;21r\x1b[21;1H");
+        assert_eq!(resume_region_seq(24), "\x1b[1;20r\x1b[20;1H");
     }
 
     #[test]
@@ -2088,9 +2297,9 @@ mod tests {
     }
 
     #[test]
-    fn footer_positions_three_rows_bottom_up() {
-        // No banner → 3-row footer.
-        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", vec![]);
+    fn footer_positions_four_rows_bottom_up() {
+        // No banner → 4-row footer: rule, input, status message, statusline.
+        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", vec![], Some("❯ "));
         assert!(seq.starts_with("\x1b7")); // DECSC
         assert!(seq.ends_with("\x1b8")); // DECRC
         // The scroll-region re-assert (DECSTBM) must be saved-then-emitted: it
@@ -2098,13 +2307,21 @@ mod tests {
         // first absolute row paint, or DECRC would restore the homed position
         // and strand the next prompt at the top of the screen.
         let decsc = seq.find("\x1b7").unwrap();
-        let region = seq.find("\x1b[1;21r").expect("region re-asserted"); // 24 - 3 = 21
-        let first_paint = seq.find("\x1b[22;1H").unwrap();
+        let region = seq.find("\x1b[1;20r").expect("region re-asserted"); // 24 - 4 = 20
+        let first_paint = seq.find("\x1b[21;1H").unwrap();
         assert!(decsc < region && region < first_paint);
-        assert!(seq.contains("\x1b[22;1H")); // separator row = H-2
+        assert!(seq.contains("\x1b[21;1H")); // separator row = H-3
+        assert!(seq.contains("\x1b[22;1H")); // input row = H-2
         assert!(seq.contains("\x1b[23;1H")); // status message row = H-1
         assert!(seq.contains("\x1b[24;1H")); // statusline row = H
         assert!(seq.contains("\x1b[2K")); // each row cleared first
+        // The input row is the third row up from the bottom, directly BELOW the
+        // rule — the fixed home of the prompt in every aish state.
+        let rule = seq.find("\x1b[21;1H").unwrap();
+        let input = seq.find("\x1b[22;1H").unwrap();
+        let msg = seq.find("\x1b[23;1H").unwrap();
+        assert!(seq[rule..input].contains("----------"));
+        assert!(seq[input..msg].contains("❯ "));
     }
 
     #[test]
@@ -2117,33 +2334,35 @@ mod tests {
             "   ↳ coordinating · 1m12s".to_string(),
         )];
 
-        // 24-row window, 5-row footer: banner 20-21, rule 22, msg 23, bar 24.
-        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner);
-        let esc = seq.find("\x1b[20;1H").expect("escalation row = H-4");
-        let worker = seq.find("\x1b[21;1H").expect("worker status row = H-3");
-        let rule = seq.find("\x1b[22;1H").expect("separator row = H-2");
+        // 24-row window, 6-row footer: banner 19-20, rule 21, input 22, msg 23,
+        // bar 24.
+        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner, Some("❯ "));
+        let esc = seq.find("\x1b[19;1H").expect("escalation row = H-5");
+        let worker = seq.find("\x1b[20;1H").expect("worker status row = H-4");
+        let rule = seq.find("\x1b[21;1H").expect("separator row = H-3");
+        let input = seq.find("\x1b[22;1H").expect("input row = H-2");
         let msg = seq.find("\x1b[23;1H").expect("status message row = H-1");
         let bar = seq.find("\x1b[24;1H").expect("statusline row = H");
         assert!(
-            esc < worker && worker < rule && rule < msg && msg < bar,
-            "footer must paint escalation → worker → rule → message → statusline"
+            esc < worker && worker < rule && rule < input && input < msg && msg < bar,
+            "footer must paint escalation → worker → rule → input → message → statusline"
         );
-        // The rule really is the lid: row H-2 carries the separator, and the
+        // The rule really is the lid: row H-3 carries the separator, and the
         // escalation text lands two rows ABOVE it.
         assert!(
-            seq[rule..msg].contains("----------"),
-            "row H-2 must carry the separator, got {:?}",
-            &seq[rule..msg]
+            seq[rule..input].contains("----------"),
+            "row H-3 must carry the separator, got {:?}",
+            &seq[rule..input]
         );
         assert!(
             seq[esc..worker].contains("escalated"),
-            "row H-4 must carry the escalation message, got {:?}",
+            "row H-5 must carry the escalation message, got {:?}",
             &seq[esc..worker]
         );
-        // The reserved region grew with the taller footer (24 - 5 = 19), so the
+        // The reserved region grew with the taller footer (24 - 6 = 18), so the
         // banner can never be scrolled away by body output.
         assert!(
-            seq.contains("\x1b[1;19r"),
+            seq.contains("\x1b[1;18r"),
             "DECSTBM must reserve the banner rows too"
         );
     }
@@ -2366,28 +2585,38 @@ mod tests {
         // Locks in the ISS fix for "no visible prompt while the turn runs".
         let prompt = "\x1b[2m❯\x1b[0m ";
 
+        // Cache a resting prompt the way the line editor does on every read. No
+        // footer region is installed under `cargo test`, so `park_input_row`
+        // stops right after the cache write and never touches a real terminal.
+        park_input_row(prompt);
+        set_reading_line(false);
+
         // Baseline: no override → cached status shows through.
         clear_midturn_input();
-        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+        assert_eq!(effective_input_line().as_deref(), Some(prompt));
 
         // Turn start, nothing typed yet → bare prompt is surfaced.
         set_midturn_input(prompt, "");
-        assert_eq!(effective_status_msg("coordinating…"), prompt);
+        assert_eq!(effective_input_line().as_deref(), Some(prompt));
 
         // Operator types → prompt + live line replaces the status row.
         set_midturn_input(prompt, "ls -la");
-        assert_eq!(
-            effective_status_msg("coordinating…"),
-            format!("{prompt}ls -la")
-        );
+        assert_eq!(effective_input_line(), Some(format!("{prompt}ls -la")));
 
         // Turn teardown → cached status message restored.
         clear_midturn_input();
-        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+        assert_eq!(effective_input_line().as_deref(), Some(prompt));
 
         // Idempotent: a second clear is a no-op (no panic, stays cleared).
         clear_midturn_input();
-        assert_eq!(effective_status_msg("idle"), "idle");
+        assert_eq!(effective_input_line().as_deref(), Some(prompt));
+
+        // While the editor is actively reading it OWNS the row (it draws the
+        // live buffer AND the real cursor there), so a footer repaint must leave
+        // the row alone rather than fight the editor for it.
+        set_reading_line(true);
+        assert_eq!(effective_input_line(), None);
+        set_reading_line(false);
     }
 
     #[test]
@@ -2401,6 +2630,12 @@ mod tests {
         // carriage-return to col 0, erase the row, then paint the prompt sigil.
         let prompt = "\x1b[2m❯\x1b[0m ";
 
+        // Cache a resting prompt the way the line editor does on every read. No
+        // footer region is installed under `cargo test`, so `park_input_row`
+        // stops right after the cache write and never touches a real terminal.
+        park_input_row(prompt);
+        set_reading_line(false);
+
         // Turn start, nothing typed → CR + erase-line + bare prompt.
         assert_eq!(midturn_inline_seq(prompt, ""), format!("\r\x1b[2K{prompt}"));
 
@@ -2413,7 +2648,7 @@ mod tests {
         // The inline path never touches the footer's MIDTURN_INPUT slot, so the
         // cached status message keeps showing through the footer effective view.
         clear_midturn_input();
-        assert_eq!(effective_status_msg("coordinating…"), "coordinating…");
+        assert_eq!(effective_input_line().as_deref(), Some(prompt));
     }
 
     #[test]
@@ -2557,37 +2792,51 @@ mod tests {
     #[test]
     fn footer_degrades_by_priority_instead_of_vanishing() {
         // The shed order is load-bearing, so pin it row by row.
-        // 24 rows: everything fits — rule, message, statusline, in that order
-        // upward from the bottom.
+        // 24 rows: everything fits — rule, input, message, statusline, in that
+        // order upward from the bottom.
         let full = FooterLayout::solve(24, 0);
         assert_eq!(full.height, FOOTER_ROWS);
         assert_eq!(
-            (full.sep_row, full.msg_row, full.bar_row),
-            (Some(22), Some(23), Some(24))
+            (full.sep_row, full.input_row, full.msg_row, full.bar_row),
+            (Some(21), Some(22), Some(23), Some(24))
         );
-        assert_eq!(full.body_bottom, 21);
+        assert_eq!(full.body_bottom, 20);
 
-        // 4 rows: the separator — pure chrome, zero information — sheds FIRST,
+        // 5 rows: the separator — pure chrome, zero information — sheds FIRST,
         // and the survivors pack contiguously upward so no hole is left behind.
-        let tight = FooterLayout::solve(4, 0);
-        assert_eq!(tight.height, 2);
+        let tight = FooterLayout::solve(5, 0);
+        assert_eq!(tight.height, 3);
         assert_eq!(tight.sep_row, None);
-        assert_eq!((tight.msg_row, tight.bar_row), (Some(3), Some(4)));
+        assert_eq!(
+            (tight.input_row, tight.msg_row, tight.bar_row),
+            (Some(3), Some(4), Some(5))
+        );
         assert_eq!(tight.body_bottom, MIN_BODY_ROWS);
 
-        // 3 rows: the transient status message sheds next (it also prints
-        // inline, so nothing is actually lost), leaving the statusline.
+        // 4 rows: the transient status message sheds next (it also prints
+        // inline, so nothing is actually lost), leaving statusline + input.
+        let tighter = FooterLayout::solve(4, 0);
+        assert_eq!(tighter.height, 2);
+        assert_eq!((tighter.sep_row, tighter.msg_row), (None, None));
+        assert_eq!((tighter.input_row, tighter.bar_row), (Some(3), Some(4)));
+        assert_eq!(tighter.body_bottom, MIN_BODY_ROWS);
+
+        // 3 rows: the statusline goes too — informational and re-derivable —
+        // and what survives is the one row the operator types into.
         let bare = FooterLayout::solve(3, 0);
         assert_eq!(bare.height, 1);
-        assert_eq!((bare.sep_row, bare.msg_row), (None, None));
-        assert_eq!(bare.bar_row, Some(3));
+        assert_eq!(
+            (bare.sep_row, bare.msg_row, bare.bar_row),
+            (None, None, None)
+        );
+        assert_eq!(bare.input_row, Some(3));
         assert_eq!(bare.body_bottom, MIN_BODY_ROWS);
 
-        // 2 rows and below: the statusline itself goes, footer height hits 0,
-        // and the caller falls back to inline printing.
+        // 2 rows and below: even the input row goes, footer height hits 0, and
+        // the caller falls back to inline printing (readline at the body cursor).
         let none = FooterLayout::solve(2, 0);
         assert_eq!(none.height, 0);
-        assert_eq!(none.bar_row, None);
+        assert_eq!((none.bar_row, none.input_row), (None, None));
         assert!(!none.enabled());
 
         // MIN_BODY_ROWS is never traded away, at ANY size, and the plan always
@@ -2640,7 +2889,10 @@ mod tests {
             for want in [0u16, 2, 4, 8, 20] {
                 let l = FooterLayout::solve(rows, want);
                 assert_eq!(l.region_bottom(), l.body_bottom);
-                for row in [l.sep_row, l.msg_row, l.bar_row].into_iter().flatten() {
+                for row in [l.sep_row, l.input_row, l.msg_row, l.bar_row]
+                    .into_iter()
+                    .flatten()
+                {
                     assert!(
                         row > l.body_bottom,
                         "rows={rows} want={want}: painted row {row} is inside the body (bottom {})",
@@ -2649,14 +2901,18 @@ mod tests {
                     assert!(row <= rows, "rows={rows}: painted row {row} is off-screen");
                 }
                 // Survivors are contiguous and strictly ordered upward.
-                if let (Some(s), Some(m)) = (l.sep_row, l.msg_row) {
-                    assert_eq!(s + 1, m);
+                if let (Some(s), Some(i)) = (l.sep_row, l.input_row) {
+                    assert_eq!(s + 1, i);
+                }
+                if let (Some(i), Some(m)) = (l.input_row, l.msg_row) {
+                    assert_eq!(i + 1, m);
                 }
                 if let (Some(m), Some(b)) = (l.msg_row, l.bar_row) {
                     assert_eq!(m + 1, b);
                 }
-                // A footer that exists ALWAYS keeps the statusline.
-                assert_eq!(l.enabled(), l.bar_row.is_some());
+                // A footer that exists ALWAYS keeps the INPUT row — it is the
+                // last zone shed, so the operator never loses their prompt.
+                assert_eq!(l.enabled(), l.input_row.is_some());
             }
         }
     }
@@ -2686,22 +2942,22 @@ mod tests {
             ("🚀 middle".to_string(), "   ⠙ middle status".to_string()),
             ("🚀 oldest".to_string(), "   ⠹ oldest status".to_string()),
         ];
-        // 24-row window, 3 banners → 9-row footer: rows 16..21 banners, 22 rule,
-        // 23 msg, 24 bar.
-        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banners);
-        let newest = seq.find("\x1b[16;1H").expect("newest escalation row");
-        let newest_status = seq.find("\x1b[17;1H").expect("newest status row");
-        let middle = seq.find("\x1b[18;1H").expect("middle escalation row");
-        let oldest = seq.find("\x1b[20;1H").expect("oldest escalation row");
-        let rule = seq.find("\x1b[22;1H").expect("separator row = H-2");
+        // 24-row window, 3 banners → 10-row footer: rows 15..20 banners, 21
+        // rule, 22 input, 23 msg, 24 bar.
+        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banners, Some("❯ "));
+        let newest = seq.find("\x1b[15;1H").expect("newest escalation row");
+        let newest_status = seq.find("\x1b[16;1H").expect("newest status row");
+        let middle = seq.find("\x1b[17;1H").expect("middle escalation row");
+        let oldest = seq.find("\x1b[19;1H").expect("oldest escalation row");
+        let rule = seq.find("\x1b[21;1H").expect("separator row = H-3");
         assert!(newest < newest_status && newest_status < middle && middle < oldest);
         assert!(oldest < rule, "banners must all sit above the rule");
         assert!(seq[newest..newest_status].contains("newest"));
         assert!(seq[newest_status..middle].contains("newest status"));
         assert!(seq[rule..].contains("----------"));
-        // DECSTBM must reserve all nine footer rows (24 - 9 = 15).
+        // DECSTBM must reserve all ten footer rows (24 - 10 = 14).
         assert!(
-            seq.contains("\x1b[1;15r"),
+            seq.contains("\x1b[1;14r"),
             "region must cover every banner row"
         );
     }
@@ -2724,11 +2980,12 @@ mod tests {
             }
         }
         // Concretely: a 24-row window holds 3 banners; a 10-row window holds 2;
-        // a 7-row window holds 1; a 5-row window holds none.
+        // an 8-row window holds 1; a 7-row window holds none (the 4-row footer
+        // plus one banner needs 8).
         assert_eq!(escalation_rows_that_fit(24, 6), 6);
         assert_eq!(escalation_rows_that_fit(10, 6), 4);
-        assert_eq!(escalation_rows_that_fit(7, 6), 2);
-        assert_eq!(escalation_rows_that_fit(5, 6), 0);
+        assert_eq!(escalation_rows_that_fit(8, 6), 2);
+        assert_eq!(escalation_rows_that_fit(7, 6), 0);
     }
 
     #[test]
