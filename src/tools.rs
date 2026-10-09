@@ -2849,6 +2849,18 @@ pub fn install_external_printer(printer: Box<dyn crate::editor::LinePrinter>) {
 /// [`announce`] / [`announce_raw`] and directly by the background-result
 /// presenter so every above-the-prompt write shares the one serialised printer.
 pub fn print_above_prompt(text: String) -> bool {
+    // With the footer's fixed INPUT row live, the line editor is parked OUTSIDE
+    // the scroll region, so rustyline's ExternalPrinter would erase and redraw
+    // the prompt at the bottom of the screen and walk the cursor through the
+    // footer rows. Write straight into the body instead: the input row is a
+    // DIFFERENT row, so there is no prompt to erase or redraw — the typed line
+    // just stays put while output scrolls above it.
+    if crate::terminal::footer_active()
+        && crate::terminal::reading_line()
+        && crate::terminal::print_in_body(&to_crlf(&text))
+    {
+        return true;
+    }
     if let Ok(mut slot) = printer_slot().lock()
         && let Some(printer) = slot.as_mut()
     {

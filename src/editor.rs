@@ -364,6 +364,20 @@ impl RustylineEditor {
     }
 }
 
+/// The transcript echo for a finished read, or `None` when there is nothing to
+/// record. With the editor parked on the footer's INPUT row, the submitted line
+/// lives OUTSIDE the scrolling body — the next prompt would overwrite it in
+/// place and it would never appear in scrollback. So on submit we echo
+/// `prompt + line` into the body ourselves, exactly as an inline prompt would
+/// have left it. Ctrl-C / EOF / an empty submit echo nothing: there is no
+/// command to record.
+fn echo_for(prompt: &str, outcome: &ReadOutcome) -> Option<String> {
+    match outcome {
+        ReadOutcome::Line(line) if !line.trim().is_empty() => Some(format!("{prompt}{line}")),
+        _ => None,
+    }
+}
+
 impl LineEditor for RustylineEditor {
     fn toggle_voice_mode(&mut self) -> bool {
         self.voice_mode.toggle()
@@ -388,8 +402,13 @@ impl LineEditor for RustylineEditor {
         // scrolled-away footer while we block here (cleared the moment a line
         // returns).
         crate::terminal::set_reading_line(true);
+        // Park the editor on the footer's fixed INPUT row (third from the
+        // bottom) so the operator types in the SAME place in every state of the
+        // shell. No-ops when no footer region is installed.
+        crate::terminal::park_input_row(prompt);
         let outcome = self.blocking_read(prompt);
         crate::terminal::set_reading_line(false);
+        crate::terminal::unpark_input_row(echo_for(prompt, &outcome).as_deref());
         outcome
     }
 
@@ -404,9 +423,12 @@ impl LineEditor for RustylineEditor {
         // coordinator that finishes mid-edit defers its nudge rather than
         // submitting the restored draft truncated (GH#734, prefill path).
         let _edit = LineEditGuard::enter();
+        crate::terminal::park_input_row(prompt);
         let res = self.rl.readline_with_initial(prompt, (initial, ""));
         crate::terminal::set_reading_line(false);
-        self.outcome(res)
+        let outcome = self.outcome(res);
+        crate::terminal::unpark_input_row(echo_for(prompt, &outcome).as_deref());
+        outcome
     }
 
     fn add_history(&mut self, line: &str) {
