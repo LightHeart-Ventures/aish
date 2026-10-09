@@ -912,8 +912,27 @@ pub async fn run(
                             .lock()
                             .map(|a| a.is_some())
                             .unwrap_or(false);
+                        // Gate #3 (durable attach): an off-process coordinator run
+                        // we're tailing streams rows above the prompt from
+                        // pump_durable_attach and raises the same resume wake +
+                        // TIOCSTI nudge when it finishes. It is NOT counted by
+                        // `outstanding_workers` (not an in-session worker) and
+                        // does not set `session.attached` (that slot is for
+                        // in-session workers), so without this term the operator
+                        // gets the plain blocking read — no poll window, clobbered
+                        // prompt, and the finish nudge landing on a half-typed
+                        // line. Same window the in-session gates already close.
+                        let attached_to_durable = session
+                            .attached_durable
+                            .lock()
+                            .map(|a| a.is_some())
+                            .unwrap_or(false);
                         crate::editor::set_background_pending(
-                            outstanding_workers > 0 || attached_to_worker,
+                            crate::editor::should_poll_idle_read(
+                                outstanding_workers,
+                                attached_to_worker,
+                                attached_to_durable,
+                            ),
                         );
                         // Pre-fill with any mid-turn text the operator had typed but
                         // not submitted when the last turn ended, so their in-progress
