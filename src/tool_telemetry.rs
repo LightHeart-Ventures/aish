@@ -363,6 +363,14 @@ pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
         session_id: session.session_id.clone(),
     };
 
+    persist(session, ev);
+}
+
+/// Buffer (or immediately insert) one already-built row — the shared tail of
+/// every telemetry writer. Factored out of [`record`] so [`record_gate`] goes
+/// through the SAME batching, unbuffered-override and flush-timer path rather
+/// than opening a second way for rows to reach the table.
+fn persist(session: &mut Session, ev: ToolEvent) {
     // Legacy per-call insert path: persist immediately, bypassing the buffer, so
     // behaviour is byte-for-byte the pre-batching one.
     if session.tool_telemetry_unbuffered {
@@ -383,6 +391,47 @@ pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
     if full || timed {
         flush(session);
     }
+}
+
+/// `error_class` for a gate that stopped the call outright.
+pub const CLASS_GATE_REFUSE: &str = "gate-refuse";
+/// `error_class` for a gate that stopped to ask first.
+pub const CLASS_GATE_CONFIRM: &str = "gate-confirm";
+
+/// Record one GATE decision (TASK-943 / SEC-2.1). The table stores no argv —
+/// deliberately, it never should — which is also why there was previously no
+/// way to answer "which rule refuses what, and how often?". That question has
+/// to be answerable before a seed allowlist can be tuned against real traffic
+/// (ISS-410409), so the two things that are safe to keep are recorded instead:
+/// the name of the RULE that fired and the normalised `bin[:subcommand]` — both
+/// bounded, low-cardinality tokens, never a path or a flag value (see
+/// `bin_subcommand` in `tools.rs`).
+///
+/// `tool` is written as `gate:<rule>:<bin[:subcommand]>` so the existing
+/// per-tool aggregates bucket it without a schema change. A refusal sets
+/// `is_error` (the call was stopped); a confirm does not (the call goes on to
+/// ask), and both are findable by `error_class`.
+pub fn record_gate(session: &mut Session, class: &str, rule: &str, bin_sub: &str) {
+    // Keep the `:telemetry` aggregate honest, exactly as `record` does.
+    session.tool_telemetry_cache = None;
+
+    // No store ⇒ nothing to persist or buffer.
+    if session.db.is_none() {
+        return;
+    }
+
+    persist(
+        session,
+        ToolEvent {
+            tool: format!("gate:{rule}:{bin_sub}"),
+            is_error: class == CLASS_GATE_REFUSE,
+            error_class: Some(class.to_string()),
+            is_retry: false,
+            recovered: false,
+            prev_class: None,
+            session_id: session.session_id.clone(),
+        },
+    );
 }
 
 /// Drain the session's tool-telemetry ring buffer to SQLite as ONE transaction.
