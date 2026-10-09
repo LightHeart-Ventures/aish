@@ -274,6 +274,16 @@ impl RustylineEditor {
             }
             // Raw-mode setup failed — fall through to the plain read.
         }
+        // Plain blocking read (non-tty, no background work pending, or raw-mode
+        // setup failed). This path has NO poll window, so it can never observe
+        // the resume wake — and it cannot tell "idle at an empty prompt" from
+        // "operator is mid-keystroke". Hold the mid-edit guard for its whole
+        // duration so a coordinator finishing here defers its TIOCSTI nudge
+        // instead of submitting a half-typed line (GH#734, second path). Cost is
+        // nil: with nothing outstanding there is no resume to drain, and when
+        // something IS outstanding the resume still drains on the next submit —
+        // the documented TIOCSTI-gated fallback.
+        let _edit = LineEditGuard::enter();
         let res = self.rl.readline(prompt);
         self.outcome(res)
     }
@@ -388,6 +398,12 @@ impl LineEditor for RustylineEditor {
         // the cursor; we want the whole candidate to the LEFT so the cursor
         // lands at end-of-line, ready to edit or Enter.
         crate::terminal::set_reading_line(true);
+        // A pre-filled buffer is a line in flight from the FIRST instant — this
+        // is the restored draft the operator was typing when the previous turn
+        // took the prompt. Hold the mid-edit guard across the whole read so a
+        // coordinator that finishes mid-edit defers its nudge rather than
+        // submitting the restored draft truncated (GH#734, prefill path).
+        let _edit = LineEditGuard::enter();
         let res = self.rl.readline_with_initial(prompt, (initial, ""));
         crate::terminal::set_reading_line(false);
         self.outcome(res)
@@ -557,6 +573,29 @@ pub fn set_background_pending(pending: bool) {
 
 fn background_pending() -> bool {
     BACKGROUND_PENDING.load(Ordering::Relaxed)
+}
+
+/// Pure gate decision for the interruptible idle read, factored out for
+/// testability (same pattern as [`interrupt_outcome`] / [`should_nudge`]).
+///
+/// The poll path is required whenever ANY background producer can write above
+/// the prompt or raise the resume wake while the operator sits at an idle
+/// prompt, because the plain blocking rustyline read has no poll window (it
+/// cannot observe the wake) and no dirty-repaint (its prompt gets clobbered by
+/// those writes). Three independent producers qualify:
+///
+/// * `outstanding_workers > 0` — in-session fanned-out coordinators still running.
+/// * `attached_to_worker` — attached to an in-session worker, INCLUDING a
+///   finished one under review (outstanding is 0 there, but rows still stream).
+/// * `attached_to_durable` — tailing an OFF-process durable coordinator run,
+///   which is counted by neither of the above yet streams rows and fires the
+///   same finish wake + nudge.
+pub fn should_poll_idle_read(
+    outstanding_workers: usize,
+    attached_to_worker: bool,
+    attached_to_durable: bool,
+) -> bool {
+    outstanding_workers > 0 || attached_to_worker || attached_to_durable
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1037,37 @@ mod tests {
         assert!(
             !line_edit_active(),
             "the guard must clear the flag on drop so the nudge re-arms"
+        );
+    }
+
+    /// The idle-read gate must turn the poll path ON for EVERY background
+    /// producer that can write above the prompt or arm the resume wake — not
+    /// just in-session workers. The durable-attach term is the leak this pins:
+    /// an off-process coordinator run we're tailing is counted by neither
+    /// `outstanding_workers` nor `attached_to_worker`, so before it was added an
+    /// operator tailing one got the plain blocking read (no poll window, prompt
+    /// clobbered by streamed rows, finish nudge landing on a half-typed line).
+    #[test]
+    fn idle_read_gate_covers_every_background_producer() {
+        assert!(
+            !should_poll_idle_read(0, false, false),
+            "a truly idle session keeps the plain blocking read — common path unchanged"
+        );
+        assert!(
+            should_poll_idle_read(1, false, false),
+            "outstanding in-session workers must gate the poll path on"
+        );
+        assert!(
+            should_poll_idle_read(0, true, false),
+            "an attached worker under review still streams rows (outstanding is 0 there)"
+        );
+        assert!(
+            should_poll_idle_read(0, false, true),
+            "a tailed DURABLE run streams rows + fires the finish wake, so it must poll too"
+        );
+        assert!(
+            should_poll_idle_read(2, true, true),
+            "the terms are an OR, not mutually exclusive"
         );
     }
 
