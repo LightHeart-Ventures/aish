@@ -85,6 +85,7 @@ pub const MIN_FOOTER_ROWS_DEGRADED: u16 = MIN_BODY_ROWS + 1;
 /// ## Shed order (first shed → last)
 /// | Zone | Rows | Why it sheds where it does |
 /// |---|---|---|
+/// | `:`-command hint tray | 1 each | regenerated on the NEXT keystroke; trims one row at a time |
 /// | escalation banners | 2 each | notifications; shed WHOLE, oldest-first |
 /// | separator rule | 1 | pure chrome — carries no information at all |
 /// | status message | 1 | transient, and the same text also prints inline |
@@ -107,6 +108,11 @@ pub struct FooterLayout {
     /// Rows granted to the pinned escalation block — always a whole multiple of
     /// [`crate::escalation::ROWS_PER_BANNER`].
     pub banner_rows: u16,
+    /// Rows granted to the `:`-command HINT TRAY, which stacks directly above
+    /// the rule and directly BELOW the escalation block. `0` whenever no
+    /// `:`-palette is open (the overwhelmingly common case) or a short window
+    /// shed it. See [`set_hint_tray`].
+    pub hint_rows: u16,
     /// Screen row of the horizontal rule, or `None` when it was shed.
     pub sep_row: Option<u16>,
     /// Screen row of the status message, or `None` when it was shed.
@@ -126,7 +132,26 @@ impl FooterLayout {
     /// of pinned escalation. Pure — no globals, no I/O — so every window size is
     /// unit-testable without touching a real terminal.
     pub fn solve(rows: u16, want_banner_rows: u16) -> Self {
+        Self::solve_with(rows, want_banner_rows, 0)
+    }
+
+    /// [`Self::solve`] for a window that ALSO wants a `want_hint_rows`-tall
+    /// `:`-command hint tray.
+    ///
+    /// The tray lands between the escalation block and the rule, and it sheds
+    /// FIRST — before even a banner — for two reasons: it is the only zone the
+    /// shell rebuilds from scratch on the very next keystroke, and the palette
+    /// itself already degrades gracefully (its last row collapses into a
+    /// `… and N more` summary), so trimming it costs the operator the least.
+    /// Unlike banners, it trims ONE ROW AT A TIME: a menu is a list, and half a
+    /// list is still a useful list.
+    ///
+    /// Because the tray sheds before the rule, `hint_rows > 0` implies
+    /// `sep_row.is_some()` — which is what makes [`Self::hint_top_row`] able to
+    /// anchor the tray off the rule's row.
+    pub fn solve_with(rows: u16, want_banner_rows: u16, want_hint_rows: u16) -> Self {
         let per = crate::escalation::ROWS_PER_BANNER.max(1);
+        let mut hint_rows = want_hint_rows;
         // Normalize DOWN to whole banners first: a banner is an indivisible
         // 2-row unit (the escalation message + that worker's latest status), so
         // half a banner must never become reservable.
@@ -135,14 +160,20 @@ impl FooterLayout {
         // Budget = every row except the body rows we refuse to give up.
         let budget = rows.saturating_sub(MIN_BODY_ROWS);
         let height = loop {
-            let h =
-                banner_rows + u16::from(sep) + u16::from(msg) + u16::from(bar) + u16::from(input);
+            let h = banner_rows
+                + hint_rows
+                + u16::from(sep)
+                + u16::from(msg)
+                + u16::from(bar)
+                + u16::from(input);
             if h <= budget {
                 break h;
             }
             // Shed strictly in priority order. `input` is last, and shedding it
             // yields h == 0, which fits any budget — so the loop terminates.
-            if banner_rows > 0 {
+            if hint_rows > 0 {
+                hint_rows -= 1;
+            } else if banner_rows > 0 {
                 banner_rows -= per;
             } else if sep {
                 sep = false;
@@ -190,10 +221,20 @@ impl FooterLayout {
         let msg_row = take(msg);
         let input_row = take(input);
         let sep_row = take(sep);
+        // The tray is anchored off the rule, so it MUST sit flush against the
+        // bottom of the banner block — a gap would mean the paint wrote outside
+        // the rows the region reserved.
+        debug_assert!(
+            hint_rows == 0
+                || sep_row.map(|r| r - hint_rows)
+                    == Some(rows.saturating_sub(height.saturating_sub(1)).max(1) + banner_rows),
+            "hint tray must pack flush between the banners and the rule ({rows} rows)"
+        );
         Self {
             rows,
             height,
             banner_rows,
+            hint_rows,
             sep_row,
             msg_row,
             bar_row,
@@ -210,7 +251,7 @@ impl FooterLayout {
         } else {
             0 // common case: no escalation, no banner arithmetic
         };
-        Self::solve(rows, want)
+        Self::solve_with(rows, want, hint_tray_rows())
     }
 
     /// True when any footer — full or degraded — fits this window.
@@ -221,6 +262,20 @@ impl FooterLayout {
     /// How many WHOLE banners the plan granted.
     pub fn banner_count(&self) -> usize {
         (self.banner_rows / crate::escalation::ROWS_PER_BANNER.max(1)) as usize
+    }
+
+    /// First screen row of the `:`-command hint tray, or `None` when the plan
+    /// granted it no rows. The tray runs from here for [`Self::hint_rows`] rows
+    /// and ends one row above the rule.
+    ///
+    /// Anchored off `sep_row` rather than computed from the top, because that is
+    /// the invariant the operator actually sees: the menu hangs UNDER the
+    /// escalation tray and SITS ON the rule, whatever else the window shed.
+    pub fn hint_top_row(&self) -> Option<u16> {
+        if self.hint_rows == 0 {
+            return None;
+        }
+        self.sep_row.map(|r| r.saturating_sub(self.hint_rows))
     }
 
     /// The first (topmost) screen row the footer owns. Teardown paths clear from
@@ -314,6 +369,193 @@ static MIDTURN_INPUT: Mutex<Option<String>> = Mutex::new(None);
 /// on row H-2 even when nothing is being typed. THIS is what makes the input row
 /// unconditional: the row always has content, in every state of the shell.
 static LAST_PROMPT: Mutex<String> = Mutex::new(String::new());
+
+/// The `:`-command HINT TRAY: the dim palette rows shown while the operator
+/// types a `:`-command, one `String` per screen row (already styled, no
+/// newlines).
+///
+/// ## Why a footer tray instead of an inline hint
+/// The palette used to ride along as rustyline's inline hint — N newline-joined
+/// rows painted immediately after the input line. That worked only while the
+/// prompt lived at the END of the transcript, where there was room below it.
+/// With the input line pinned to row H-2 ([`park_input_row`]) there are exactly
+/// two rows beneath it, and they belong to the status message and the
+/// statusline: an N-row inline hint overwrites both and then line-feeds off the
+/// bottom of the screen, which scrolls the WHOLE viewport — footer included —
+/// out from under rustyline's relative cursor arithmetic. The visible symptom is
+/// the prompt jumping the instant `:` is typed.
+///
+/// Routing the menu into its own footer zone fixes it by construction: the rows
+/// are reserved by [`FooterLayout::solve_with`] before they are painted, so the
+/// tray grows UPWARD into the body (above the rule, below the escalation block)
+/// and the input row never moves.
+static HINT_TRAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Ceiling on the hint tray as a fraction (`1/N`) of the window. The solver
+/// already guarantees [`MIN_BODY_ROWS`] of scrolling body, but "2 rows of body"
+/// is a technically-correct, practically-useless screen: a menu is a glance, not
+/// a page, so cap it well short of what merely fits.
+const HINT_TRAY_MAX_FRACTION: u16 = 3;
+
+/// Rows the live hint tray currently holds. Read by [`FooterLayout::for_rows`],
+/// so every region install and every paint sees the same tray height.
+pub fn hint_tray_rows() -> u16 {
+    HINT_TRAY
+        .lock()
+        .map(|t| t.len() as u16)
+        .unwrap_or_else(|e| e.into_inner().len() as u16)
+}
+
+/// How many rows the hint tray may use at the LIVE terminal size, or `None` when
+/// there is no footer to hang a tray on (off-tty, short window, region not yet
+/// installed) — in which case the caller should keep the classic inline hint.
+pub fn hint_tray_capacity() -> Option<usize> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (rows, _cols) = term_size()?;
+    if !FooterLayout::solve(rows, 0).enabled() {
+        return None;
+    }
+    // Everything the solver would hand a tray, then the "a glance, not a page"
+    // cap. `max(1)` so a tray that exists is never zero rows tall.
+    let fits = rows
+        .saturating_sub(MIN_BODY_ROWS)
+        .saturating_sub(FOOTER_ROWS);
+    Some(fits.min((rows / HINT_TRAY_MAX_FRACTION).max(1)) as usize)
+}
+
+/// Install `rows` as the hint tray and repaint the footer around the change.
+///
+/// Returns `false` when no footer region is installed — the tray does not exist
+/// in that mode, and the caller is expected to fall back to the inline hint
+/// rather than silently dropping the menu. Returns `true` when the tray owns the
+/// menu (including when the content was already identical, which short-circuits
+/// the repaint so holding a key down doesn't restorm the footer).
+///
+/// Safe to call from rustyline's `Hinter`, which is exactly where it runs: the
+/// repaint is DECSC/DECRC-wrapped and touches only rows at or above the rule, so
+/// the editor's line and cursor on row H-2 are untouched.
+pub fn set_hint_tray(rows: Vec<String>) -> bool {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let prev = {
+        let mut slot = HINT_TRAY.lock().unwrap_or_else(|e| e.into_inner());
+        if *slot == rows {
+            return true;
+        }
+        let prev = slot.len() as u16;
+        *slot = rows;
+        prev
+    };
+    repaint_hint_tray(prev);
+    true
+}
+
+/// Retire the hint tray and repaint, shrinking the footer back. No-op when the
+/// tray is already empty, so the common keystroke (no palette open) costs one
+/// atomic load and a lock.
+pub fn clear_hint_tray() {
+    let prev = {
+        let mut slot = HINT_TRAY.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_empty() {
+            return;
+        }
+        let prev = slot.len() as u16;
+        slot.clear();
+        prev
+    };
+    if ACTIVE.load(Ordering::Relaxed) {
+        repaint_hint_tray(prev);
+    }
+}
+
+/// Body rows a tray change claims (`> 0`) or releases (`< 0` direction), given
+/// the tray height `prev_rows` the CURRENT region was installed for. Pure, so
+/// the choreography below is unit-testable at every window size.
+///
+/// `(grow, clear_from, clear_to)`: `grow` rows the body must scroll up before
+/// the tray paints over them, and the half-open row range `[clear_from,
+/// clear_to)` of stale tray text a SHRINKING tray handed back to the body.
+pub fn hint_tray_delta(
+    rows: u16,
+    want_banner_rows: u16,
+    prev_rows: u16,
+    next_rows: u16,
+) -> (u16, u16, u16) {
+    let before = FooterLayout::solve_with(rows, want_banner_rows, prev_rows);
+    let after = FooterLayout::solve_with(rows, want_banner_rows, next_rows);
+    (
+        before.body_bottom.saturating_sub(after.body_bottom),
+        before.top_row(),
+        after.top_row(),
+    )
+}
+
+/// Repaint the footer for a tray that just went from `prev_rows` rows to
+/// whatever [`HINT_TRAY`] now holds.
+///
+/// ## Why `SU` and not the line-feed choreography banners use
+/// [`banner_growth_seq`] scrolls the body with LFs issued FROM THE CURSOR, which
+/// only works when the cursor is in the body. A tray opens while the operator is
+/// mid-edit, with the cursor parked on the input row BELOW the scroll region —
+/// line feeds from there would walk onto the status rows and then scroll the
+/// entire screen, which is the very bug this tray exists to fix. `SU` (`ESC[nS`)
+/// scrolls the region's contents regardless of where the cursor is, so the body
+/// lifts and the editor's row does not move.
+///
+/// The trade-off is deliberate: a region-scoped `SU` discards the rows it lifts
+/// past the region's top edge instead of pushing them to native scrollback. A
+/// transient menu is worth a few rows of already-scrolled transcript, and the
+/// alternative (full-screen scroll for scrollback's sake) would move the
+/// editor's line and desync rustyline.
+fn repaint_hint_tray(prev_rows: u16) {
+    {
+        // Same boundary the heartbeat and the banner absorb take, so a repaint on
+        // another thread cannot land between this scroll and the paint that fills
+        // the rows it opened. Released before `paint_cached_footer`, which takes
+        // the lock itself.
+        let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((rows, _cols)) = term_size() else {
+            return;
+        };
+        let want_banners = if crate::escalation::active() {
+            crate::escalation::row_count()
+        } else {
+            0
+        };
+        let (grow, clear_from, clear_to) =
+            hint_tray_delta(rows, want_banners, prev_rows, hint_tray_rows());
+        let mut seq = String::new();
+        if grow > 0 {
+            seq.push_str(&format!("\x1b7\x1b[{grow}S\x1b8"));
+            // The transcript just moved up with it, so the remembered body row
+            // has to move too or the next `print_in_body` overwrites live text.
+            let cur = BODY_ROW.load(Ordering::Relaxed);
+            if cur > 0 {
+                BODY_ROW.store(cur.saturating_sub(grow).max(1), Ordering::Relaxed);
+            }
+        }
+        if clear_to > clear_from {
+            // A shrinking tray hands rows back to the body; wipe the menu text
+            // off them or it lingers above the rule looking like output.
+            seq.push_str("\x1b7");
+            for row in clear_from..clear_to {
+                seq.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+            }
+            seq.push_str("\x1b8");
+        }
+        if !seq.is_empty() {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "{seq}");
+            let _ = out.flush();
+        }
+    }
+    // Re-asserts the region at the NEW height and paints every zone, tray
+    // included, from cached content.
+    paint_cached_footer(false);
+}
 
 /// What to paint on the INPUT row, or `None` to LEAVE THE ROW ALONE.
 ///
@@ -940,6 +1182,13 @@ pub fn footer_seq(
     let keep = escalation_rows_that_fit(rows, crate::escalation::row_count())
         / crate::escalation::ROWS_PER_BANNER;
     let banners = crate::escalation::rows(crate::style::colors_enabled(), keep as usize);
+    // Snapshot the hint tray the same way and for the same reason: the row plan
+    // and the paint must agree even if the operator's next keystroke swaps the
+    // menu out mid-paint.
+    let hints = HINT_TRAY
+        .lock()
+        .map(|t| t.clone())
+        .unwrap_or_else(|e| e.into_inner().clone());
     footer_seq_with(
         rows,
         cols,
@@ -948,6 +1197,7 @@ pub fn footer_seq(
         statusline,
         banners,
         effective_input_line().as_deref(),
+        &hints,
     )
 }
 
@@ -958,6 +1208,10 @@ pub fn footer_seq(
 ///
 /// `input == None` means "do not touch the input row": the line editor is
 /// drawing there and owns the cursor. `Some(text)` paints `text` on row H-2.
+///
+/// `hints` are the `:`-command tray rows (see [`set_hint_tray`]), painted
+/// between the banner block and the rule — one row each, already styled.
+#[allow(clippy::too_many_arguments)]
 pub fn footer_seq_with(
     rows: u16,
     cols: u16,
@@ -966,6 +1220,7 @@ pub fn footer_seq_with(
     statusline: &str,
     banners: Vec<(String, String)>,
     input: Option<&str>,
+    hints: &[String],
 ) -> String {
     // ONE row plan, solved from `(rows, banners.len())`, drives both the
     // reserved region and every painted row — see [`FooterLayout`] for why the
@@ -982,9 +1237,10 @@ pub fn footer_seq_with(
     // thing the body said, which is where the operator's eye goes for "what is
     // running right now", and the rule stays welded to the statusline rows it
     // opens whether or not a banner is pinned.
-    let layout = FooterLayout::solve(
+    let layout = FooterLayout::solve_with(
         rows,
         (banners.len() as u16) * crate::escalation::ROWS_PER_BANNER,
+        hints.len() as u16,
     );
     let top_row = layout.top_row();
     let max = cols as usize;
@@ -1021,6 +1277,24 @@ pub fn footer_seq_with(
             "\x1b[{worker_row};1H\x1b[2K{}",
             clip_visible(worker, max)
         ));
+    }
+    // The `:`-command hint tray: directly BELOW the escalation block and
+    // directly ABOVE the rule, so the menu reads as the last thing the body said
+    // and — crucially — grows UPWARD. The input row below the rule cannot move,
+    // which is the whole point of the tray (see [`HINT_TRAY`]).
+    //
+    // `layout.hint_rows` clamps to what the window granted; a resize that shrank
+    // the tray mid-keystroke drops the TAIL rows (the palette's own `… and N
+    // more` summary is the first casualty) rather than painting outside the
+    // reserved region. The next keystroke rebuilds the menu at the new cap.
+    if let Some(hint_top) = layout.hint_top_row() {
+        for (i, row) in hints.iter().take(layout.hint_rows as usize).enumerate() {
+            let hint_row = hint_top + i as u16;
+            s.push_str(&format!(
+                "\x1b[{hint_row};1H\x1b[2K{}",
+                clip_visible(row, max)
+            ));
+        }
     }
     // Each zone paints ONLY if the plan granted it a row. A degraded footer
     // (short window) silently drops the rule, then the message, then the
@@ -1870,6 +2144,12 @@ pub fn park_input_row(prompt: &str) {
 /// nothing. Either way the cursor lands back in the body, so the command's own
 /// output scrolls inside the region as usual.
 pub fn unpark_input_row(echo: Option<&str>) {
+    // The read is over, so any `:`-palette the operator was typing is stale —
+    // retire the tray (and give its rows back to the body) BEFORE the echo, so
+    // the submitted line lands in a body that is already its final height.
+    // Covers submit, Ctrl-C and EOF alike, which is why it lives here rather
+    // than in the editor's success path.
+    clear_hint_tray();
     let Some(layout) = live_layout() else { return };
     let Some(input_row) = layout.input_row else {
         return;
@@ -2299,7 +2579,7 @@ mod tests {
     #[test]
     fn footer_positions_four_rows_bottom_up() {
         // No banner → 4-row footer: rule, input, status message, statusline.
-        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", vec![], Some("❯ "));
+        let seq = footer_seq_with(24, 10, "----------", "msg", "bar", vec![], Some("❯ "), &[]);
         assert!(seq.starts_with("\x1b7")); // DECSC
         assert!(seq.ends_with("\x1b8")); // DECRC
         // The scroll-region re-assert (DECSTBM) must be saved-then-emitted: it
@@ -2336,7 +2616,7 @@ mod tests {
 
         // 24-row window, 6-row footer: banner 19-20, rule 21, input 22, msg 23,
         // bar 24.
-        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner, Some("❯ "));
+        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banner, Some("❯ "), &[]);
         let esc = seq.find("\x1b[19;1H").expect("escalation row = H-5");
         let worker = seq.find("\x1b[20;1H").expect("worker status row = H-4");
         let rule = seq.find("\x1b[21;1H").expect("separator row = H-3");
@@ -2944,7 +3224,7 @@ mod tests {
         ];
         // 24-row window, 3 banners → 10-row footer: rows 15..20 banners, 21
         // rule, 22 input, 23 msg, 24 bar.
-        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banners, Some("❯ "));
+        let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banners, Some("❯ "), &[]);
         let newest = seq.find("\x1b[15;1H").expect("newest escalation row");
         let newest_status = seq.find("\x1b[16;1H").expect("newest status row");
         let middle = seq.find("\x1b[17;1H").expect("middle escalation row");
@@ -2997,5 +3277,139 @@ mod tests {
             pack_size(30, 100),
             LAST_PAINTED_SIZE.load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn hint_tray_packs_flush_between_banners_and_rule() {
+        // 24 rows, no banners, 2-row tray → 6-row footer: 19-20 tray, 21 rule,
+        // 22 input, 23 msg, 24 bar. The tray must END one row above the rule.
+        let l = FooterLayout::solve_with(24, 0, 2);
+        assert_eq!(l.hint_rows, 2);
+        assert_eq!(l.sep_row, Some(21));
+        assert_eq!(l.hint_top_row(), Some(19));
+        assert_eq!(l.input_row, Some(22), "input row must NOT move for a tray");
+        assert_eq!(l.height, 6);
+
+        // With a banner pinned, the tray slides down under it — still flush
+        // against the rule, still leaving the input row alone.
+        let b = FooterLayout::solve_with(24, crate::escalation::ROWS_PER_BANNER, 3);
+        assert_eq!(b.hint_rows, 3);
+        assert_eq!(b.hint_top_row(), Some(b.sep_row.unwrap() - 3));
+        assert_eq!(b.input_row, Some(22));
+        assert_eq!(
+            b.hint_top_row(),
+            Some(b.top_row() + b.banner_rows),
+            "tray must hang directly off the bottom of the banner block"
+        );
+    }
+
+    #[test]
+    fn hint_tray_sheds_first_and_one_row_at_a_time() {
+        // The tray is the cheapest zone to lose (the next keystroke rebuilds
+        // it), so a window too short for everything trims the TRAY before it
+        // touches a banner, the rule, or the input row.
+        let per = crate::escalation::ROWS_PER_BANNER;
+        for rows in 0..40u16 {
+            for want_hints in [0u16, 1, 4, 12] {
+                let l = FooterLayout::solve_with(rows, per, want_hints);
+                assert!(l.hint_rows <= want_hints, "{rows}/{want_hints}");
+                assert!(l.height <= rows.saturating_sub(MIN_BODY_ROWS));
+                // A granted tray implies a rule to anchor it to.
+                if l.hint_rows > 0 {
+                    assert!(l.sep_row.is_some(), "{rows}/{want_hints}");
+                    assert!(l.hint_top_row().is_some());
+                }
+                // Shed order: no tray row survives once a banner row is gone.
+                if l.banner_rows < per {
+                    assert_eq!(l.hint_rows, 0, "{rows}/{want_hints}");
+                }
+            }
+        }
+        // Concretely: a 10-row window keeps a banner (6-row footer) and trims a
+        // 12-row ask down to the 2 rows the body can spare.
+        let tight = FooterLayout::solve_with(10, per, 12);
+        assert_eq!(tight.banner_rows, per);
+        assert_eq!(tight.hint_rows, 2);
+        assert_eq!(tight.input_row, Some(8));
+    }
+
+    #[test]
+    fn zero_hint_rows_is_exactly_the_old_layout() {
+        // Back-compat guard: every window size must solve identically with an
+        // empty tray, so the common (no palette) path is bit-for-bit unchanged.
+        for rows in 0..60u16 {
+            for want in [0u16, 2, 4, 6] {
+                assert_eq!(
+                    FooterLayout::solve_with(rows, want, 0),
+                    FooterLayout::solve(rows, want),
+                    "{rows}/{want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hint_tray_delta_claims_and_releases_body_rows() {
+        // Opening a 3-row tray claims 3 body rows, so the body must scroll up 3
+        // before the tray paints over them.
+        let (grow, from, to) = hint_tray_delta(24, 0, 0, 3);
+        assert_eq!(grow, 3);
+        assert!(to < from, "a growing tray moves the footer top UP");
+
+        // Closing it releases them and hands back the rows to clear.
+        let (grow, from, to) = hint_tray_delta(24, 0, 3, 0);
+        assert_eq!(grow, 0);
+        assert!(from < to, "a shrinking tray leaves stale rows to clear");
+        assert_eq!(to - from, 3, "exactly the rows the tray gave back");
+
+        // No change ⇒ no scroll, no clear.
+        assert_eq!(hint_tray_delta(24, 0, 2, 2), (0, 19, 19));
+    }
+
+    #[test]
+    fn footer_paints_hint_rows_above_the_rule() {
+        let hints = vec![":quit  leave".to_string(), ":jobs  list".to_string()];
+        let seq = footer_seq_with(
+            24,
+            80,
+            "----------",
+            "msg",
+            "bar",
+            vec![],
+            Some("❯ "),
+            &hints,
+        );
+        let first = seq.find("\x1b[19;1H").expect("first tray row = H-5");
+        let second = seq.find("\x1b[20;1H").expect("second tray row = H-4");
+        let rule = seq.find("\x1b[21;1H").expect("separator row = H-3");
+        let input = seq.find("\x1b[22;1H").expect("input row = H-2");
+        assert!(
+            first < second && second < rule,
+            "tray stacks above the rule"
+        );
+        assert!(seq[first..second].contains(":quit"));
+        assert!(seq[second..rule].contains(":jobs"));
+        assert!(rule < input, "the rule still sits above the input row");
+        // The region must reserve the tray rows too (24 - 6 = 18).
+        assert!(
+            seq.contains("\x1b[1;18r"),
+            "region must cover every tray row"
+        );
+    }
+
+    #[test]
+    fn footer_clips_hints_to_the_rows_the_window_granted() {
+        // Ask for more tray than fits: the paint must stop at `hint_rows` rather
+        // than write outside the reserved region.
+        let hints: Vec<String> = (0..12).map(|i| format!(":cmd{i}")).collect();
+        let seq = footer_seq_with(12, 40, "----", "msg", "bar", vec![], Some("❯ "), &hints);
+        let layout = FooterLayout::solve_with(12, 0, hints.len() as u16);
+        assert!(layout.hint_rows < hints.len() as u16);
+        let top = layout.hint_top_row().expect("some tray survived");
+        for i in 0..layout.hint_rows {
+            assert!(seq.contains(&format!("\x1b[{};1H", top + i)), "row {i}");
+        }
+        // One past the plan must never be addressed.
+        assert!(!seq.contains(&format!("\x1b[{};1H", top - 1)));
     }
 }

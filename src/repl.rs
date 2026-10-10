@@ -2809,6 +2809,27 @@ fn palette_max_rows() -> usize {
 /// the match set overflows the cap, the last row becomes a dim `… and N more`
 /// summary so the hint never scrolls the bottom-anchored prompt off-screen.
 fn palette_hint(line: &str, pos: usize, max_rows: usize) -> Option<String> {
+    let rows = palette_rows(line, pos, max_rows)?;
+    // One leading newline per row drops each onto its own line below the input.
+    Some(rows.iter().fold(String::new(), |mut s, row| {
+        s.push('\n');
+        s.push_str(row);
+        s
+    }))
+}
+
+/// The palette as ONE STYLED STRING PER ROW — the shape the footer hint tray
+/// wants ([`crate::terminal::set_hint_tray`]), and the source of truth that
+/// [`palette_hint`] newline-joins for the inline fallback.
+///
+/// Returns `None` (not an empty `Vec`) when the palette does not apply, so both
+/// callers can distinguish "no menu" from "a menu with no rows" — only the
+/// former should fall through to the history ghost text.
+///
+/// Rows carry their own dim SGR so they read as a hint rather than typed text,
+/// and they are newline-FREE: the tray paints each at an absolute row, where a
+/// stray line feed would scroll the region.
+fn palette_rows(line: &str, pos: usize, max_rows: usize) -> Option<Vec<String>> {
     // Only while typing the command name: cursor at the end of a bare `:`-token
     // (no space yet — once an argument starts, the palette is done).
     if pos != line.len() {
@@ -2830,23 +2851,21 @@ fn palette_hint(line: &str, pos: usize, max_rows: usize) -> Option<String> {
     } else {
         names.len()
     };
-    let mut out = String::new();
+    let mut rows: Vec<String> = Vec::with_capacity(shown + usize::from(overflow));
     for name in names.iter().take(shown) {
         let desc = COLON_COMMANDS
             .iter()
             .find(|(n, _)| n == name)
             .map_or("", |(_, d)| *d);
-        // The leading newline drops each row onto its own line below the input;
-        // the whole row is dim so it reads as a hint, not as typed text.
-        out.push_str(&format!("\n\x1b[2m:{name:<14} {desc}\x1b[0m"));
+        rows.push(format!("\x1b[2m:{name:<14} {desc}\x1b[0m"));
     }
     if overflow {
         let more = names.len() - shown;
-        out.push_str(&format!(
-            "\n\x1b[2m… and {more} more (keep typing to filter)\x1b[0m"
+        rows.push(format!(
+            "\x1b[2m… and {more} more (keep typing to filter)\x1b[0m"
         ));
     }
-    Some(out)
+    Some(rows)
 }
 
 /// An inline hint painted after the prompt. One type carries both shapes the
@@ -3066,6 +3085,39 @@ impl Hinter for AishHelper {
     /// applies, leaving ordinary input untouched. rustyline recomputes this each
     /// keystroke and redraws the hint in place.
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<AishHint> {
+        // The palette prefers the FOOTER HINT TRAY: with the input row parked at
+        // H-2 there is no room below it for an N-row inline hint, and painting
+        // one there scrolls the whole viewport and tears the prompt loose (see
+        // `terminal::HINT_TRAY`). The tray reserves its rows above the rule
+        // instead, so the input row never moves.
+        if let Some(cap) = crate::terminal::hint_tray_capacity() {
+            match palette_rows(line, pos, cap) {
+                Some(rows) => {
+                    if crate::terminal::set_hint_tray(rows) {
+                        // Painted in the tray — emit NO inline hint, so the input
+                        // row stays exactly where it is.
+                        return None;
+                    }
+                    // Tray unavailable after all (region torn down between the
+                    // capacity probe and the install) — fall back to inline
+                    // rather than swallow the menu.
+                    return palette_hint(line, pos, palette_max_rows()).map(|menu| AishHint {
+                        display: menu,
+                        completion: None,
+                    });
+                }
+                None => {
+                    // No palette for this buffer: retire any tray we installed on
+                    // an earlier keystroke, then fall through to ghost text.
+                    crate::terminal::clear_hint_tray();
+                    let suffix = history_suggestion(line, pos, ctx.history())?;
+                    return Some(AishHint {
+                        display: format!("{GHOST_COLOR}{suffix}\x1b[0m"),
+                        completion: Some(suffix),
+                    });
+                }
+            }
+        }
         if let Some(menu) = palette_hint(line, pos, palette_max_rows()) {
             return Some(AishHint {
                 display: menu,
