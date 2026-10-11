@@ -566,20 +566,15 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         }
     };
 
-    // Rows the tray may paint. With a footer scroll region live the band is the
-    // body area above the rule; the chrome rows and the selected row's extra
-    // wrap lines are reserved FIRST so the tray always fits instead of being
-    // bottom-cropped (which used to eat the title/header and could scroll the
-    // selection off screen). Unknown band (piped / legacy redraw) ⇒ show all.
-    let band = match (
-        crate::terminal::footer_active(),
-        crate::terminal::screen_rows(),
-    ) {
-        (true, Some(total)) => {
-            Some(total.saturating_sub(crate::terminal::FOOTER_ROWS).max(1) as usize)
-        }
-        _ => None,
-    };
+    // Rows the tray may paint — the footer solver's full grant for a
+    // bottom-anchored tray, which already excludes the footer rows, the spacer,
+    // the minimum body, AND the live escalation banners (so a tall worker list
+    // pushes the escalation stack up rather than fighting it for rows). The
+    // chrome rows and the selected row's extra wrap lines are reserved FIRST so
+    // the tray always fits instead of being bottom-cropped (which used to eat
+    // the title/header and could scroll the selection off screen). Unknown band
+    // (piped / legacy redraw) ⇒ show all.
+    let band = crate::terminal::tray_capacity_full();
     let sel_extra = rows
         .get(sel)
         .map(|r| wrap_cell(&r.task, task_budget(r.depth), MAX_TASK_LINES).len())
@@ -689,39 +684,17 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
     });
 
     let n = lines.len();
-    let mut out = String::new();
-    if let (true, Some(total)) = (
-        crate::terminal::footer_active(),
-        crate::terminal::screen_rows(),
-    ) {
-        // Last scrolling body row = row directly above the footer rule.
-        let body_bottom = total.saturating_sub(crate::terminal::FOOTER_ROWS).max(1);
-        let avail = body_bottom as usize;
-        // If the tray is taller than the body area, keep the BOTTOM `avail`
-        // lines so it never writes into (and corrupts) the footer rows.
-        let start = n.saturating_sub(avail);
-        let visible = &lines[start..];
-        let vn = visible.len() as u16;
-        let top = body_bottom - vn + 1; // vn <= avail ⇒ top >= 1
-        out.push_str("\x1b7"); // DECSC — save the caller's cursor
-        // A shorter repaint (a worker closed) leaves stale rows above the new
-        // top — clear them so the tray shrinks cleanly from the top.
-        if prev_lines > vn as usize {
-            let prev_top = body_bottom.saturating_sub(prev_lines as u16 - 1).max(1);
-            for row in prev_top..top {
-                out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
-            }
-        }
-        for (i, line) in visible.iter().enumerate() {
-            let row = top + i as u16;
-            out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
-            out.push_str(line);
-        }
-        out.push_str("\x1b8"); // DECRC — restore the caller's cursor
-        let _ = write!(io::stdout(), "{out}");
-        let _ = io::stdout().flush();
-        return vn as usize;
+    // Preferred path: hand the rows to the footer's hint-tray zone. The tray is
+    // a first-class footer region, so the solver seats it flush between the
+    // escalation banners and the rule and scrolls the BODY to make room — which
+    // is what makes a growing `:workers` tray PUSH the escalation stack up
+    // (together with the rule) instead of painting over it. The previous
+    // hand-rolled band wrote raw body rows from `body_bottom` upward, which sat
+    // on top of any live escalation banner and clobbered it.
+    if crate::terminal::footer_active() && crate::terminal::set_hint_tray(lines.clone()) {
+        return n;
     }
+    let mut out = String::new();
     // Legacy in-place redraw (no footer region).
     if prev_lines > 0 {
         out.push_str(&format!("\x1b[{prev_lines}A"));
@@ -741,21 +714,16 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
 /// the footer rule. No-op without a footer region (the legacy path leaves its
 /// in-place block in scrollback, matching the pre-tray behavior).
 fn clear_tray(prev_lines: usize) {
-    if prev_lines == 0 || !crate::terminal::footer_active() {
+    // Row bookkeeping now belongs to the footer's tray zone, not to us.
+    let _ = prev_lines;
+    if !crate::terminal::footer_active() {
         return;
     }
-    let Some(total) = crate::terminal::screen_rows() else {
-        return;
-    };
-    let body_bottom = total.saturating_sub(crate::terminal::FOOTER_ROWS).max(1);
-    let top = body_bottom.saturating_sub(prev_lines as u16 - 1).max(1);
-    let mut out = String::new();
-    for row in top..=body_bottom {
-        out.push_str(&format!("\x1b[{row};1H\x1b[2K"));
-    }
-    out.push_str(&format!("\x1b[{body_bottom};1H"));
-    let _ = write!(io::stdout(), "{out}");
-    let _ = io::stdout().flush();
+    // Retiring THROUGH the tray gives the body rows back (the solver shrinks the
+    // reserved region, scrolls the transcript back down, and re-seats the
+    // escalation banners against the rule) — a raw row-wipe could only blank
+    // pixels and would leave the banners displaced.
+    crate::terminal::clear_hint_tray();
 }
 
 /// Clip to `max` display columns with an ellipsis.

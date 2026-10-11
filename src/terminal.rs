@@ -436,6 +436,41 @@ pub fn hint_tray_capacity() -> Option<usize> {
     Some(fits.min((rows / HINT_TRAY_MAX_FRACTION).max(1)) as usize)
 }
 
+/// Rows a bottom-anchored tray may claim RIGHT NOW — the solver's full grant,
+/// without the "a glance, not a page" fraction [`hint_tray_capacity`] applies to
+/// the `:`-command palette. `None` when there is no footer to hang a tray on
+/// (off-tty, short window, region not installed), in which case the caller must
+/// fall back to its own in-place rendering.
+///
+/// The live escalation stack is reserved FIRST (`solve_with(.., want, 0)` seats
+/// the banners as if no tray existed, and we hand the tray only what is left).
+/// That reservation is what lets a tall tray and a live escalation banner
+/// coexist: the tray packs flush between the banners and the rule, so growing it
+/// PUSHES the banner stack up with the rule instead of overwriting it.
+pub fn tray_capacity_full() -> Option<usize> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (rows, _cols) = term_size()?;
+    let want = if crate::escalation::active() {
+        crate::escalation::row_count()
+    } else {
+        0
+    };
+    let plan = FooterLayout::solve_with(rows, want, 0);
+    if !plan.enabled() {
+        return None;
+    }
+    // `FOOTER_ROWS + 1` is the footer proper plus the spacer row the solver puts
+    // above a non-empty banner/tray block; `banner_rows` is the escalation stack
+    // we must not sit on top of.
+    let fits = rows
+        .saturating_sub(MIN_BODY_ROWS)
+        .saturating_sub(FOOTER_ROWS + 1)
+        .saturating_sub(plan.banner_rows);
+    Some(fits.max(1) as usize)
+}
+
 /// Install `rows` as the hint tray and repaint the footer around the change.
 ///
 /// Returns `false` when no footer region is installed — the tray does not exist
@@ -3696,6 +3731,36 @@ mod tests {
             Some(b.top_row() + 1 + b.banner_rows),
             "tray must hang directly off the bottom of the banner block"
         );
+    }
+
+    #[test]
+    fn growing_tray_pushes_the_escalation_stack_up() {
+        // The `:workers` tray renders THROUGH this zone, so "a tall worker list
+        // must push the escalation tray up instead of painting over it" is a
+        // property of the solver, not of the caller. Each extra tray row has to
+        // lift the whole banner block by exactly one row — with the banners
+        // intact, the tray hanging flush off their bottom edge, and the body
+        // giving up the row (the footer grows upward into the transcript).
+        let per = crate::escalation::ROWS_PER_BANNER;
+        let base = FooterLayout::solve_with(40, per, 0);
+        for hints in 1..=6u16 {
+            let l = FooterLayout::solve_with(40, per, hints);
+            assert_eq!(l.hint_rows, hints, "40 rows is roomy enough for {hints}");
+            assert_eq!(l.banner_rows, per, "a tray must never cost a banner");
+            // Banner block starts one row below the spacer at `top_row()`.
+            assert_eq!(
+                l.top_row() + 1,
+                base.top_row() + 1 - hints,
+                "banner block must rise exactly {hints} row(s)"
+            );
+            // ...and the tray fills precisely the gap that opened up, ending on
+            // the rule, which itself has not moved.
+            assert_eq!(l.hint_top_row(), Some(l.top_row() + 1 + l.banner_rows));
+            assert_eq!(l.sep_row, base.sep_row, "the rule is the fixed anchor");
+            assert_eq!(l.input_row, base.input_row);
+            // The rows came from the transcript, not from another footer zone.
+            assert_eq!(l.body_bottom, base.body_bottom - hints);
+        }
     }
 
     #[test]
