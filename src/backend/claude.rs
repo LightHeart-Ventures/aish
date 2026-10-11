@@ -1310,7 +1310,146 @@ fn render_messages(history: &[Msg]) -> Vec<Value> {
             }
         }
     }
-    out
+    repair_tool_pairing(out)
+}
+
+/// The synthetic result sent for a `tool_use` that never produced one.
+const CANCELLED_RESULT: &str = "[aish: tool call did not complete — cancelled, interrupted, or its result was dropped from context. No output was produced.]";
+
+/// Collect the `tool_use` ids a rendered assistant message asks to be answered.
+///
+/// Reads the RENDERED blocks (not `Msg::tool_calls`) on purpose: when `raw` is
+/// echoed verbatim it can carry `tool_use` blocks the normalized field no longer
+/// knows about, and those count just the same to the API.
+fn rendered_tool_use_ids(m: &Value) -> Vec<String> {
+    if m["role"] != "assistant" {
+        return vec![];
+    }
+    m["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "tool_use")
+                .filter_map(|b| b["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_tool_result_msg(m: &Value) -> bool {
+    m["role"] == "user"
+        && m["content"]
+            .as_array()
+            .map(|b| b.iter().any(|x| x["type"] == "tool_result"))
+            .unwrap_or(false)
+}
+
+fn synth_tool_result(id: &str) -> Value {
+    json!({
+        "type": "tool_result",
+        "tool_use_id": id,
+        "content": CANCELLED_RESULT,
+        "is_error": true,
+    })
+}
+
+/// Enforce the Claude `tool_use` ⇄ `tool_result` pairing invariant on the wire.
+///
+/// The API hard-rejects (400 `invalid_request_error`) a history where a
+/// `tool_use` block is not answered by a matching `tool_result` in the
+/// IMMEDIATELY following message, or where a `tool_result` references an id no
+/// preceding `tool_use` offered. Both shapes are reachable without any model
+/// misbehaviour:
+///
+/// * a turn aborted mid-dispatch (Ctrl-C, a declined/cancelled tool call, a
+///   dropped turn future) pushes the assistant `tool_use` but never its results;
+/// * context compaction / offload can evict the `tool_result` message while the
+///   `tool_use` that precedes it survives (or vice-versa);
+/// * a partially-answered round leaves some ids uncovered.
+///
+/// A poisoned transcript is otherwise UNRECOVERABLE — every subsequent request
+/// 400s on the same stale ids, so the session is dead until it is cleared.
+/// Repairing here (the single choke point every request renders through) is
+/// idempotent, keeps role alternation intact, and self-heals histories that are
+/// *already* broken rather than only preventing new breakage.
+fn repair_tool_pairing(mut msgs: Vec<Value>) -> Vec<Value> {
+    // Pass 1 — drop orphan `tool_result` blocks. Only the ids offered by the
+    // immediately preceding assistant message are legal; `last_ids` is consumed
+    // on use so a second consecutive results message can't re-claim them.
+    let mut last_ids: Vec<String> = vec![];
+    for m in msgs.iter_mut() {
+        if m["role"] == "assistant" {
+            last_ids = rendered_tool_use_ids(m);
+            continue;
+        }
+        if !is_tool_result_msg(m) {
+            last_ids.clear();
+            continue;
+        }
+        let kept: Vec<Value> = m["content"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| {
+                        b["type"] != "tool_result"
+                            || b["tool_use_id"]
+                                .as_str()
+                                .map(|id| last_ids.iter().any(|k| k == id))
+                                .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if kept.is_empty() {
+            // Every block was stale. Keep the message (role alternation) but
+            // turn it into plain text — an empty content array is also a 400.
+            *m = json!({
+                "role": "user",
+                "content": "[aish: stale tool results dropped — their tool calls are no longer in context]",
+            });
+        } else {
+            m["content"] = Value::Array(kept);
+        }
+        last_ids.clear();
+    }
+
+    // Pass 2 — answer every unanswered `tool_use`, walking back to front so the
+    // inserts don't shift indices we still have to visit.
+    for i in (0..msgs.len()).rev() {
+        let ids = rendered_tool_use_ids(&msgs[i]);
+        if ids.is_empty() {
+            continue;
+        }
+        let next_is_results = msgs.get(i + 1).map(is_tool_result_msg).unwrap_or(false);
+        if next_is_results {
+            let have: Vec<Value> = msgs[i + 1]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            // Re-emit one block per call, in the order the calls were made:
+            // the real result when we have it, a synthesized one when we don't.
+            // Pass 1 already dropped any block whose id isn't in `ids`.
+            let rebuilt: Vec<Value> = ids
+                .iter()
+                .map(|id| {
+                    have.iter()
+                        .find(|b| b["tool_use_id"].as_str() == Some(id.as_str()))
+                        .cloned()
+                        .unwrap_or_else(|| synth_tool_result(id))
+                })
+                .collect();
+            if rebuilt != have {
+                msgs[i + 1]["content"] = Value::Array(rebuilt);
+            }
+        } else {
+            let blocks: Vec<Value> = ids.iter().map(|id| synth_tool_result(id)).collect();
+            msgs.insert(i + 1, json!({"role": "user", "content": blocks}));
+        }
+    }
+    msgs
 }
 
 #[cfg(test)]
@@ -1542,12 +1681,34 @@ mod tests {
         // The exact-key-count assertion is the guardrail: letting the payload
         // serialize as a wire sibling fails this test.
         use super::super::{Msg, ToolResult};
-        let hist = vec![Msg::tool_results(vec![
-            ToolResult::text("ok", "verbatim output", false),
-            ToolResult::text("bad", "it failed", true),
-        ])];
+        let hist = vec![
+            // The offering assistant turn: render repairs unanswered/orphan
+            // pairings, so a results message needs its tool_use to survive.
+            Msg {
+                role: Role::Assistant,
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "ok".into(),
+                        name: "ls".into(),
+                        args: json!({}),
+                    },
+                    ToolCall {
+                        id: "bad".into(),
+                        name: "ls".into(),
+                        args: json!({}),
+                    },
+                ],
+                tool_results: vec![],
+                raw: None,
+            },
+            Msg::tool_results(vec![
+                ToolResult::text("ok", "verbatim output", false),
+                ToolResult::text("bad", "it failed", true),
+            ]),
+        ];
         let msgs = render_messages(&hist);
-        let blocks = msgs[0]["content"].as_array().unwrap();
+        let blocks = msgs[1]["content"].as_array().unwrap();
 
         let ok = blocks[0].as_object().unwrap();
         assert_eq!(ok["type"], "tool_result");
@@ -1573,17 +1734,37 @@ mod tests {
         // S7.3 / AC1: a structured tool result is rendered to the model as the
         // compact JSON payload, while a plain text result sends `content`.
         use super::super::{Msg, ToolResult};
-        let hist = vec![Msg::tool_results(vec![
-            ToolResult::structured(
-                "s1",
-                "rendered table the human sees",
-                json!({"path": "f.txt", "type": "file", "size": 3}),
-                false,
-            ),
-            ToolResult::text("t1", "plain text result", false),
-        ])];
+        let hist = vec![
+            Msg {
+                role: Role::Assistant,
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "s1".into(),
+                        name: "stat_file".into(),
+                        args: json!({}),
+                    },
+                    ToolCall {
+                        id: "t1".into(),
+                        name: "ls".into(),
+                        args: json!({}),
+                    },
+                ],
+                tool_results: vec![],
+                raw: None,
+            },
+            Msg::tool_results(vec![
+                ToolResult::structured(
+                    "s1",
+                    "rendered table the human sees",
+                    json!({"path": "f.txt", "type": "file", "size": 3}),
+                    false,
+                ),
+                ToolResult::text("t1", "plain text result", false),
+            ]),
+        ];
         let msgs = render_messages(&hist);
-        let blocks = msgs[0]["content"].as_array().unwrap();
+        let blocks = msgs[1]["content"].as_array().unwrap();
         // Structured → compact JSON (NOT the rendered text).
         // Note: JSON key order is determined by the serde_json serializer; we only care that the payload is correct.
         let content_str = blocks[0]["content"].as_str().unwrap();
@@ -1593,6 +1774,205 @@ mod tests {
         assert_eq!(blocks[0]["tool_use_id"], "s1");
         // Text-only → content verbatim.
         assert_eq!(blocks[1]["content"].as_str().unwrap(), "plain text result");
+    }
+
+    // ---- tool_use ⇄ tool_result pairing repair -------------------------------
+
+    fn asst(ids: &[&str]) -> Msg {
+        Msg {
+            role: Role::Assistant,
+            text: "working".into(),
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCall {
+                    id: (*id).into(),
+                    name: "ls".into(),
+                    args: json!({}),
+                })
+                .collect(),
+            tool_results: vec![],
+            raw: None,
+        }
+    }
+
+    /// Every `tool_use` on the wire is answered in the NEXT message, and no
+    /// `tool_result` references an id that was never offered. This is the exact
+    /// invariant the API 400s on.
+    fn assert_paired(msgs: &[Value]) {
+        for (i, m) in msgs.iter().enumerate() {
+            let ids = rendered_tool_use_ids(m);
+            if ids.is_empty() {
+                continue;
+            }
+            let next = msgs
+                .get(i + 1)
+                .unwrap_or_else(|| panic!("msg {i} has dangling tool_use {ids:?}"));
+            let covered: Vec<&str> = next["content"]
+                .as_array()
+                .map(|b| b.iter().filter_map(|x| x["tool_use_id"].as_str()).collect())
+                .unwrap_or_default();
+            for id in &ids {
+                assert!(
+                    covered.contains(&id.as_str()),
+                    "tool_use {id} (msg {i}) has no tool_result in the next message"
+                );
+            }
+        }
+        let mut offered: Vec<String> = vec![];
+        for m in msgs {
+            if m["role"] == "assistant" {
+                offered = rendered_tool_use_ids(m);
+                continue;
+            }
+            if let Some(blocks) = m["content"].as_array() {
+                for b in blocks.iter().filter(|b| b["type"] == "tool_result") {
+                    let id = b["tool_use_id"].as_str().unwrap();
+                    assert!(
+                        offered.iter().any(|o| o == id),
+                        "orphan tool_result {id} reached the wire"
+                    );
+                }
+            }
+            offered.clear();
+        }
+    }
+
+    #[test]
+    fn render_synthesizes_result_for_cancelled_trailing_tool_call() {
+        // The reported 400: a turn cancelled mid-dispatch leaves the assistant
+        // tool_use with no results, and EVERY later request repeats the error.
+        let hist = vec![Msg::user("go"), asst(&["toolu_a", "toolu_b"])];
+        let msgs = render_messages(&hist);
+        assert_eq!(msgs.len(), 3, "a results message is appended: {msgs:?}");
+        let blocks = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["tool_use_id"], "toolu_a");
+        assert_eq!(blocks[1]["tool_use_id"], "toolu_b");
+        assert_eq!(blocks[0]["is_error"], true);
+        assert!(blocks[0]["content"].as_str().unwrap().contains("aish"));
+        assert_paired(&msgs);
+    }
+
+    #[test]
+    fn render_fills_only_the_missing_ids_of_a_partial_round() {
+        // Two calls dispatched, one answered (the other cancelled/declined).
+        use super::super::ToolResult;
+        let hist = vec![
+            Msg::user("go"),
+            asst(&["keep", "lost"]),
+            Msg::tool_results(vec![ToolResult::text("keep", "real output", false)]),
+        ];
+        let msgs = render_messages(&hist);
+        assert_eq!(msgs.len(), 3, "no message is inserted: {msgs:?}");
+        let blocks = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        // The real result survives verbatim; only the gap is synthesized.
+        let real = blocks
+            .iter()
+            .find(|b| b["tool_use_id"] == "keep")
+            .expect("real result kept");
+        assert_eq!(real["content"], "real output");
+        assert_eq!(real["is_error"], false);
+        let synth = blocks
+            .iter()
+            .find(|b| b["tool_use_id"] == "lost")
+            .expect("gap filled");
+        assert_eq!(synth["is_error"], true);
+        assert_paired(&msgs);
+    }
+
+    #[test]
+    fn render_repairs_dangling_tool_use_mid_history() {
+        // Compaction can evict a tool_result and leave its tool_use mid-history
+        // (the reported failure named message 14, not the tail). The repair must
+        // splice a results message in place without disturbing later turns.
+        use super::super::ToolResult;
+        let hist = vec![
+            Msg::user("one"),
+            asst(&["orphaned"]),
+            // Next turn is a fresh assistant reply — results were dropped.
+            Msg {
+                role: Role::Assistant,
+                text: "moving on".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            },
+            Msg::user("two"),
+            asst(&["answered"]),
+            Msg::tool_results(vec![ToolResult::text("answered", "ok", false)]),
+        ];
+        let msgs = render_messages(&hist);
+        assert_eq!(msgs.len(), 7);
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "orphaned");
+        // The tail round is untouched.
+        assert_eq!(msgs[6]["content"][0]["content"], "ok");
+        assert_paired(&msgs);
+    }
+
+    #[test]
+    fn render_drops_orphan_tool_results() {
+        // The mirror 400 (`unexpected tool_use_id`): compaction kept the results
+        // but evicted the tool_use that offered them.
+        use super::super::ToolResult;
+        let hist = vec![
+            Msg::user("go"),
+            Msg::tool_results(vec![ToolResult::text("ghost", "stale", false)]),
+        ];
+        let msgs = render_messages(&hist);
+        // Role alternation is preserved — never an empty content array.
+        assert_eq!(msgs[1]["role"], "user");
+        assert!(msgs[1]["content"].is_string());
+        assert!(msgs[1]["content"].as_str().unwrap().contains("stale tool"));
+        assert_paired(&msgs);
+    }
+
+    #[test]
+    fn render_counts_tool_use_blocks_echoed_from_raw() {
+        // When raw is echoed verbatim it can carry tool_use blocks the
+        // normalized tool_calls field no longer knows about; they still need
+        // answering, so the repair reads the RENDERED blocks.
+        let hist = vec![
+            Msg::user("go"),
+            Msg {
+                role: Role::Assistant,
+                text: String::new(),
+                tool_calls: vec![], // normalized field cleared
+                tool_results: vec![],
+                raw: Some(json!([
+                    {"type": "text", "text": "thinking out loud"},
+                    {"type": "tool_use", "id": "raw_only", "name": "ls", "input": {}}
+                ])),
+            },
+        ];
+        let msgs = render_messages(&hist);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "raw_only");
+        assert_paired(&msgs);
+    }
+
+    #[test]
+    fn repair_is_idempotent_and_leaves_clean_history_untouched() {
+        use super::super::ToolResult;
+        let hist = vec![
+            Msg::user("go"),
+            asst(&["t1"]),
+            Msg::tool_results(vec![ToolResult::text("t1", "out", false)]),
+            Msg {
+                role: Role::Assistant,
+                text: "done".into(),
+                tool_calls: vec![],
+                tool_results: vec![],
+                raw: None,
+            },
+        ];
+        let once = render_messages(&hist);
+        assert_eq!(once.len(), 4, "a balanced history is unchanged: {once:?}");
+        let twice = repair_tool_pairing(once.clone());
+        assert_eq!(once, twice, "repair must be idempotent");
+        assert_paired(&twice);
     }
 
     #[test]
