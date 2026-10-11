@@ -4,6 +4,13 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.53.5] - 2026-10-10
+
+Patch release: input prompt anchoring and hints placement. The `:` palette hints move to a dedicated tray above the status rule (below the escalation banner), and the input row stays pinned 3 rows from the bottom regardless of tray height.
+
+### Fixed
+- **Input prompt stays anchored while hints render in a footer tray** (PR #954): when `:` is entered, the command palette hints now render in a `HINT_TRAY` footer band (above the separator rule, below the escalation tray) instead of moving the input prompt. The input row is now pinned to its position (always 3rd row from bottom) and tray height is carved from the body, never the input offset. Terminals without a full footer degrade to inline hints. New `hint_tray_capacity()`, `set_hint_tray()`, `clear_hint_tray()` APIs; hints are cleared on submit, Ctrl-C, or EOF.
+
 ## [0.53.2] - 2026-10-08
 
 The TUI-layout release. The footer and statusline stop being rigid row stacks and become pure layout solvers that shed zones by priority, so a short window degrades gracefully instead of falling off a cliff. On top of that: the `:workers` modal wraps and scrolls instead of cropping, worker-pane bursts carry a stable per-worker hue and a seam rule, the prompt prefix is budgeted so there is always room to type, and the escalation banner stops flickering through unrelated emoji.
