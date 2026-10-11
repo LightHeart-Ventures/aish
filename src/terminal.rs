@@ -108,6 +108,9 @@ pub struct FooterLayout {
     /// Rows granted to the pinned escalation block — always a whole multiple of
     /// [`crate::escalation::ROWS_PER_BANNER`].
     pub banner_rows: u16,
+    /// Blank row separating pinned tray output from the scrolling text.
+    /// Omitted in short windows before sacrificing any tray content.
+    pub spacer_row: Option<u16>,
     /// Rows granted to the `:`-command HINT TRAY, which stacks directly above
     /// the rule and directly BELOW the escalation block. `0` whenever no
     /// `:`-palette is open (the overwhelmingly common case) or a short window
@@ -230,9 +233,15 @@ impl FooterLayout {
                     == Some(rows.saturating_sub(height.saturating_sub(1)).max(1) + banner_rows),
             "hint tray must pack flush between the banners and the rule ({rows} rows)"
         );
+        // Add breathing room above the tray only when the content already fits.
+        // The spacer is the first row to disappear in a short window.
+        let spacer_row = ((banner_rows > 0 || hint_rows > 0) && height < budget)
+            .then_some(rows.saturating_sub(height));
+        let height = height + u16::from(spacer_row.is_some());
         Self {
             rows,
             height,
+            spacer_row,
             banner_rows,
             hint_rows,
             sep_row,
@@ -1330,7 +1339,9 @@ pub fn footer_seq_with(
     // hands us more banners than fit gets the newest ones painted, never a row
     // written outside the reserved region.
     for (i, (escalation, worker)) in banners.iter().take(layout.banner_count()).enumerate() {
-        let esc_row = top_row + (i as u16) * crate::escalation::ROWS_PER_BANNER;
+        let esc_row = top_row
+            + u16::from(layout.spacer_row.is_some())
+            + (i as u16) * crate::escalation::ROWS_PER_BANNER;
         let worker_row = esc_row + 1;
         s.push_str(&format!(
             "\x1b[{esc_row};1H\x1b[2K{}",
@@ -1340,6 +1351,9 @@ pub fn footer_seq_with(
             "\x1b[{worker_row};1H\x1b[2K{}",
             clip_visible(worker, max)
         ));
+    }
+    if let Some(row) = layout.spacer_row {
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
     }
     // The `:`-command hint tray: directly BELOW the escalation block and
     // directly ABOVE the rule, so the menu reads as the last thing the body said
@@ -2579,14 +2593,14 @@ mod tests {
 
     #[test]
     fn banner_growth_equals_the_body_rows_the_footer_takes() {
-        // 24-row window: no banner → body ends at 20; one banner → 18. The two
-        // rows the tray claims are exactly what the body must give up.
+        // 24-row window: no banner → body ends at 20; one banner → 17.
+        // The banner and spacer claim three body rows.
         assert_eq!(FooterLayout::solve(24, 0).body_bottom, 20);
-        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 18);
-        assert_eq!(banner_growth_rows(24, 0, 2), 2);
+        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 17);
+        assert_eq!(banner_growth_rows(24, 0, 2), 3);
         // Second banner takes two more; the first→second step is still 2.
         assert_eq!(banner_growth_rows(24, 2, 4), 2);
-        assert_eq!(banner_growth_rows(24, 0, 4), 4);
+        assert_eq!(banner_growth_rows(24, 0, 4), 5);
         // Shrink (a banner retired) is NOT growth — the body gains rows, which
         // leaves a harmless gap, so nothing is scrolled.
         assert_eq!(banner_growth_rows(24, 4, 0), 0);
@@ -2600,7 +2614,8 @@ mod tests {
         // granted — so on a short window where the solver SHEDS the banner, the
         // body is not scrolled for a tray that was never painted.
         for rows in 1..=60u16 {
-            let granted = FooterLayout::solve(rows, 2).banner_rows;
+            let layout = FooterLayout::solve(rows, 2);
+            let granted = layout.banner_rows + u16::from(layout.spacer_row.is_some());
             assert_eq!(
                 banner_growth_rows(rows, 0, 2),
                 granted,
@@ -2640,7 +2655,7 @@ mod tests {
         let grow = banner_growth_rows(rows, 0, 2);
 
         // The rows the tray claims == the rows the absorb lifts the body by.
-        assert_eq!(grow, after.banner_rows);
+        assert_eq!(grow, after.banner_rows + 1);
         assert_eq!(before.body_bottom - after.body_bottom, grow);
         let seq = banner_growth_seq(grow);
         assert_eq!(seq.matches('\n').count(), grow as usize);
@@ -2838,10 +2853,10 @@ mod tests {
             "row H-5 must carry the escalation message, got {:?}",
             &seq[esc..worker]
         );
-        // The reserved region grew with the taller footer (24 - 6 = 18), so the
+        // The reserved region includes the spacer (24 - 7 = 17), so the
         // banner can never be scrolled away by body output.
         assert!(
-            seq.contains("\x1b[1;18r"),
+            seq.contains("\x1b[1;17r"),
             "DECSTBM must reserve the banner rows too"
         );
     }
@@ -3337,7 +3352,7 @@ mod tests {
         let roomy = FooterLayout::solve(60, per * 3);
         assert_eq!(roomy.banner_rows, per * 3);
         assert_eq!(roomy.banner_count(), 3);
-        assert_eq!(roomy.height, FOOTER_ROWS + per * 3);
+        assert_eq!(roomy.height, FOOTER_ROWS + per * 3 + 1);
         // top_row must cover the BANNER block, not just the rule — teardown
         // clears from there, and clearing from the rule would strand banners.
         assert_eq!(roomy.top_row(), 60 - roomy.height + 1);
@@ -3368,7 +3383,7 @@ mod tests {
             for want in [0u16, 2, 4, 8, 20] {
                 let l = FooterLayout::solve(rows, want);
                 assert_eq!(l.region_bottom(), l.body_bottom);
-                for row in [l.sep_row, l.input_row, l.msg_row, l.bar_row]
+                for row in [l.spacer_row, l.sep_row, l.input_row, l.msg_row, l.bar_row]
                     .into_iter()
                     .flatten()
                 {
@@ -3434,9 +3449,9 @@ mod tests {
         assert!(seq[newest..newest_status].contains("newest"));
         assert!(seq[newest_status..middle].contains("newest status"));
         assert!(seq[rule..].contains("----------"));
-        // DECSTBM must reserve all ten footer rows (24 - 10 = 14).
+        // DECSTBM must reserve eleven footer rows including the spacer.
         assert!(
-            seq.contains("\x1b[1;14r"),
+            seq.contains("\x1b[1;13r"),
             "region must cover every banner row"
         );
     }
@@ -3479,15 +3494,54 @@ mod tests {
     }
 
     #[test]
+    fn tray_spacer_separates_body_and_pinned_output_and_sheds_first() {
+        for (banners, hints) in [(2, 0), (0, 2), (2, 2)] {
+            let layout = FooterLayout::solve_with(24, banners, hints);
+            assert_eq!(layout.spacer_row, Some(layout.body_bottom + 1));
+            assert_eq!(layout.top_row(), layout.spacer_row.unwrap());
+            assert_eq!(layout.input_row, Some(22));
+            let seq = footer_seq_with(
+                24,
+                80,
+                "----",
+                "msg",
+                "bar",
+                if banners > 0 {
+                    vec![("escalation".into(), "worker".into())]
+                } else {
+                    vec![]
+                },
+                None,
+                &vec!["hint".into(); hints as usize],
+            );
+            assert!(seq.contains(&format!("\x1b[{};1H\x1b[2K", layout.spacer_row.unwrap())));
+            let first_output = layout.top_row() + 1;
+            assert!(seq.contains(&format!(
+                "\x1b[{first_output};1H\x1b[2K{}",
+                if banners > 0 { "escalation" } else { "hint" }
+            )));
+            let tight = FooterLayout::solve_with(
+                MIN_BODY_ROWS + FOOTER_ROWS + banners + hints,
+                banners,
+                hints,
+            );
+            assert_eq!(tight.spacer_row, None);
+            assert_eq!(tight.banner_rows, banners);
+            assert_eq!(tight.hint_rows, hints);
+        }
+        assert_eq!(FooterLayout::solve(24, 0).spacer_row, None);
+    }
+
+    #[test]
     fn hint_tray_packs_flush_between_banners_and_rule() {
-        // 24 rows, no banners, 2-row tray → 6-row footer: 19-20 tray, 21 rule,
+        // 24 rows, no banners, 2-row tray → 7-row footer: 18 spacer, 19-20 tray, 21 rule,
         // 22 input, 23 msg, 24 bar. The tray must END one row above the rule.
         let l = FooterLayout::solve_with(24, 0, 2);
         assert_eq!(l.hint_rows, 2);
         assert_eq!(l.sep_row, Some(21));
         assert_eq!(l.hint_top_row(), Some(19));
         assert_eq!(l.input_row, Some(22), "input row must NOT move for a tray");
-        assert_eq!(l.height, 6);
+        assert_eq!(l.height, 7);
 
         // With a banner pinned, the tray slides down under it — still flush
         // against the rule, still leaving the input row alone.
@@ -3497,7 +3551,7 @@ mod tests {
         assert_eq!(b.input_row, Some(22));
         assert_eq!(
             b.hint_top_row(),
-            Some(b.top_row() + b.banner_rows),
+            Some(b.top_row() + 1 + b.banner_rows),
             "tray must hang directly off the bottom of the banner block"
         );
     }
@@ -3549,10 +3603,10 @@ mod tests {
 
     #[test]
     fn hint_tray_delta_claims_and_releases_body_rows() {
-        // Opening a 3-row tray claims 3 body rows, so the body must scroll up 3
+        // Opening a 3-row tray claims 4 body rows including its spacer
         // before the tray paints over them.
         let open = hint_tray_delta(24, 0, 0, 3);
-        assert_eq!(open.grow, 3);
+        assert_eq!(open.grow, 4);
         assert_eq!(open.release, 0, "a growing tray releases nothing");
         assert!(
             open.clear_to < open.clear_from,
@@ -3562,14 +3616,14 @@ mod tests {
         // Closing it releases them and hands back the rows to clear.
         let close = hint_tray_delta(24, 0, 3, 0);
         assert_eq!(close.grow, 0);
-        assert_eq!(close.release, 3, "a shrinking tray gives 3 rows BACK");
+        assert_eq!(close.release, 4, "a shrinking tray gives 3 rows BACK");
         assert!(
             close.clear_from < close.clear_to,
             "a shrinking tray leaves stale rows to clear"
         );
         assert_eq!(
             close.clear_to - close.clear_from,
-            3,
+            4,
             "exactly the rows the tray gave back"
         );
 
@@ -3650,9 +3704,9 @@ mod tests {
         assert!(seq[first..second].contains(":quit"));
         assert!(seq[second..rule].contains(":jobs"));
         assert!(rule < input, "the rule still sits above the input row");
-        // The region must reserve the tray rows too (24 - 6 = 18).
+        // The region must reserve the tray and spacer (24 - 7 = 17).
         assert!(
-            seq.contains("\x1b[1;18r"),
+            seq.contains("\x1b[1;17r"),
             "region must cover every tray row"
         );
     }
