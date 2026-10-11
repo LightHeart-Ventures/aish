@@ -1,0 +1,1 @@
+Vendored rustyline 18.0.1 (MIT license). Local change: Validator::transform_paste, delegated through Refresher before bracketed paste insertion. This prevents multiline paste layout from overflowing the fixed input row. All other behavior is unchanged.
