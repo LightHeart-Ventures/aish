@@ -4,6 +4,10 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Fixed
+- Command palette updates no longer freeze input: the 0.54.3 tray repaint acquired `FOOTER_PAINT` twice on the input thread. Repainting now reuses the held guard, preserving atomic scroll and footer updates without deadlocking.
+- Shrinking or closing the command palette preserves the editor cursor. The 0.54.2 shrink sequence saved the cursor after changing scroll margins, which had already moved it to the top-left. It now saves the input position before changing margins.
+
 ## [0.54.3] - 2026-10-11
 
 Bugfix release for a critical UI freeze in 0.54.2.
