@@ -303,6 +303,9 @@ impl RustylineEditor {
         if take_resume_wake() {
             return Some(ReadOutcome::Line(String::new()));
         }
+        // A completion message may have arrived since the caller parked us.
+        // Re-anchor before drawing, including the background-wait path.
+        crate::terminal::park_input_row(prompt);
         // Show the prompt while idle (cooked mode → normal output processing).
         {
             let mut out = std::io::stdout();
@@ -325,6 +328,7 @@ impl RustylineEditor {
                     guard.restore();
                     crate::tools::set_idle_prompt_active(false);
                     erase_prompt_line();
+                    crate::terminal::park_input_row(prompt);
                     // From here the operator owns a line buffer inside rustyline
                     // and we no longer poll the resume wake. Mark the window so a
                     // concurrently-finishing coordinator's TIOCSTI nudge is
@@ -342,10 +346,10 @@ impl RustylineEditor {
                         erase_prompt_line();
                         return Some(ReadOutcome::Line(String::new()));
                     }
-                    // A worker row printed above us erased the idle prompt line
-                    // (via `print_above_prompt`); repaint it below the new output
-                    // so the cursor never sits glued to forwarded worker text.
+                    // Inline terminals repaint after forwarded output; footer
+                    // terminals always return to their fixed INPUT row first.
                     if crate::tools::take_idle_prompt_dirty() {
+                        crate::terminal::park_input_row(prompt);
                         let mut out = std::io::stdout();
                         let _ = write!(out, "\r\x1b[2K{prompt}");
                         let _ = out.flush();

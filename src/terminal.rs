@@ -1271,7 +1271,7 @@ pub fn footer_seq(
     if ACTIVE.load(Ordering::Relaxed) {
         let mut installed = INSTALLED_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(before) = *installed {
-            let editing = READING_LINE.load(Ordering::Relaxed);
+            let editing = reading_line();
             seq.push_str(&layout_transition_seq(before, layout, editing));
             let delta = layout_delta(before, layout);
             let row = BODY_ROW.load(Ordering::Relaxed);
@@ -2401,6 +2401,57 @@ mod tests {
     }
 
     #[test]
+    fn background_completion_between_reads_keeps_prompt_on_input_row() {
+        const CHILD: &str = "AISH_TEST_COMPLETION_PROMPT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            use crate::editor::{LineEditor, ReadOutcome, RustylineEditor};
+            let mut term = Terminal::detect().expect("PTY required");
+            term.init_scroll_region();
+            let helper = crate::repl::AishHelper::new(
+                std::env::temp_dir(),
+                String::new(),
+                std::sync::Arc::new(std::collections::HashMap::new()),
+            );
+            let mut editor = RustylineEditor::new(
+                helper,
+                std::env::temp_dir().join("aish-completion-test-unused-history"),
+            )
+            .unwrap();
+            struct QueuedPrinter;
+            impl crate::editor::LinePrinter for QueuedPrinter {
+                fn print(&mut self, _: String) {
+                    panic!("completion was queued for an inline prompt redraw");
+                }
+            }
+            crate::tools::install_external_printer(Box::new(QueuedPrinter));
+            set_reading_line(false);
+            assert!(crate::tools::print_above_prompt(
+                "Reviewing and summarizing result\n".into()
+            ));
+            match editor.read_line("completed> ") {
+                ReadOutcome::Line(line) => assert_eq!(line, "hello"),
+                _ => panic!("input did not reach editor"),
+            }
+            return;
+        }
+        let bytes = run_pty_test(
+            "background_completion_between_reads_keeps_prompt_on_input_row",
+            CHILD,
+            Some(b"hello\r"),
+        );
+        let output = String::from_utf8_lossy(&bytes);
+        let notice = output
+            .find("Reviewing and summarizing result")
+            .expect("completion notice must print immediately");
+        let rest = &output[notice..];
+        let prompt = rest.find("completed> ").expect("prompt after completion");
+        assert!(
+            rest[..prompt].contains("\x1b[22;1H"),
+            "prompt must anchor on H-2: {output}"
+        );
+    }
+
+    #[test]
     fn escalation_and_hint_layout_changes_reconcile_on_tty() {
         const CHILD: &str = "AISH_TEST_LAYOUT_TRANSITIONS_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -2456,7 +2507,7 @@ mod tests {
         );
     }
 
-    fn run_pty_test(name: &str, child_env: &str, input: Option<&[u8]>) {
+    fn run_pty_test(name: &str, child_env: &str, input: Option<&[u8]>) -> Vec<u8> {
         // Exercise the real ioctl + repaint path in an isolated process. A pipe
         // would return before the nested lock, hiding the regression. Bound the
         // wait so a deadlock fails the test instead of hanging the entire suite.
@@ -2537,6 +2588,7 @@ mod tests {
             "PTY test {name} hung or failed: {}",
             String::from_utf8_lossy(&bytes)
         );
+        bytes
     }
 
     #[test]

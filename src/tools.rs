@@ -2854,11 +2854,10 @@ pub fn print_above_prompt(text: String) -> bool {
     // the prompt at the bottom of the screen and walk the cursor through the
     // footer rows. Write straight into the body instead: the input row is a
     // DIFFERENT row, so there is no prompt to erase or redraw — the typed line
-    // just stays put while output scrolls above it.
-    if crate::terminal::footer_active()
-        && crate::terminal::reading_line()
-        && crate::terminal::print_in_body(&to_crlf(&text))
-    {
+    // just stays put while output scrolls above it. This also applies BETWEEN
+    // reads: queuing a completion message in rustyline then would deliver it
+    // during the next read and redraw the prompt beneath the message.
+    if crate::terminal::footer_active() && crate::terminal::print_in_body(&to_crlf(&text)) {
         return true;
     }
     if let Ok(mut slot) = printer_slot().lock()
