@@ -101,36 +101,200 @@ fn surface_mcp_skips(session: &Session, skips: &[String]) {
     }
 }
 
-/// Blocking y/N/a prompt on the controlling TTY. `a` ("always") allows this
-/// call and persists the tool/command so it never prompts again.
+/// How one answer to a confirm prompt was interpreted.
 ///
-/// A prompt flagged sensitive by [`crate::sensitive`] (SEC-2.3) renders **only**
-/// `y/N`: `'a'`/`'d'` can never be honoured for a credential path, and an option
-/// that cannot be honoured must not be displayed. Any answer other than `y` —
-/// including a typed `a`/`d` — is clamped to a refusal.
-pub fn confirm_tty(prompt: &str) -> tools::Decision {
+/// Unrecognised input is [`Answer::Invalid`] — deliberately **not** a refusal.
+/// The prompt advertises exactly four keys; anything else is a typo, a stray
+/// arrow key, or a half-typed word. Folding that into "no" made aish look like
+/// it had ignored the operator and dropped the tool call for no stated reason,
+/// so we re-ask instead of guessing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Answer {
+    /// A key we advertise.
+    Decided(tools::Decision),
+    /// Nothing we advertise — re-prompt.
+    Invalid,
+    /// Operator abandoned the prompt (Ctrl-C, Ctrl-D, or EOF on a pipe).
+    /// Cancels the call: still a refusal, but one we stop asking about.
+    Cancelled,
+}
+
+/// Upper bound on re-asks. A human correcting a typo never gets near this; the
+/// cap exists so a pathological stdin (a pipe spewing garbage without ever
+/// hitting EOF) can't spin the prompt forever.
+const MAX_CONFIRM_RETRIES: usize = 25;
+
+/// Interpret one answer. Pure, so the whole accept/reject table is unit-testable
+/// without a tty.
+///
+/// An EMPTY answer (bare Enter) is the advertised default: the capital `N` in
+/// `[y/N/a/d]` means "no", so it stays a real decision rather than a re-ask.
+fn parse_answer(input: &str) -> Answer {
     use tools::Decision;
-    // If a mid-turn key watcher is active it holds stdin in cbreak (ECHO off);
-    // pause it for the length of this prompt so the answer echoes + line-edits.
-    let _pause = crate::keywatch::pause_for_prompt();
-    let (body, sensitive) = crate::sensitive::split_prompt(prompt);
-    let opts = crate::sensitive::prompt_options(sensitive);
-    print!("\x1b[33mrun?\x1b[0m {body} \x1b[33m{opts}\x1b[0m ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return Decision::Deny;
-    }
-    let d = match line.trim() {
-        "y" | "Y" | "yes" => Decision::AllowOnce,
-        "a" | "A" | "always" => Decision::AlwaysAllow,
+    match input.trim() {
+        "" => Answer::Decided(Decision::Deny),
+        "y" | "Y" | "yes" => Answer::Decided(Decision::AllowOnce),
+        // 'n' was always the documented default but was never parsed, so it only
+        // "worked" by falling through the catch-all. Now it is explicit.
+        "n" | "N" | "no" => Answer::Decided(Decision::Deny),
+        "a" | "A" | "always" => Answer::Decided(Decision::AlwaysAllow),
         // 'd' = allow this permission for the whole directory, recursively. Only
         // meaningful on a read/write/delete prompt (where a path is in scope);
         // elsewhere the gate treats it as a one-time allow.
-        "d" | "D" | "dir" => Decision::AllowDir,
-        _ => Decision::Deny,
+        "d" | "D" | "dir" => Answer::Decided(Decision::AllowDir),
+        _ => Answer::Invalid,
+    }
+}
+
+/// One-line reminder printed after an unrecognised answer. Lists only keys that
+/// can actually be honoured, so a sensitive prompt never advertises `a`/`d`.
+fn answer_hint(sensitive: bool) -> &'static str {
+    if sensitive {
+        "answer y or n — Ctrl-C cancels"
+    } else {
+        "answer y (once) / n (no) / a (always) / d (this dir) — Ctrl-C cancels"
+    }
+}
+
+/// Discard bytes already sitting in the tty buffer, without blocking.
+///
+/// # Safety
+/// Caller must hold fd 0 in a non-canonical mode; `poll`/`read` are plain fd ops.
+unsafe fn drain_pending() {
+    let mut scratch = [0u8; 32];
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a live local, and a 0ms timeout cannot block.
+        if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 || pfd.revents & libc::POLLIN == 0 {
+            return;
+        }
+        // SAFETY: poll just said fd 0 is readable; the buffer is a live local
+        // and we pass its true length.
+        if unsafe { libc::read(0, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len()) } <= 0 {
+            return;
+        }
+    }
+}
+
+/// Read ONE keypress with ICANON/ECHO/ISIG off, so the raw byte reaches us —
+/// including `0x03` for Ctrl-C.
+///
+/// Why bytes and not the signal: aish ignores SIGINT process-wide for job
+/// control, so a Ctrl-C typed at a cooked `read_line` is turned into a signal
+/// that nothing acts on and the prompt simply keeps waiting — the operator has
+/// no way out of a prompt they didn't mean to trigger. Clearing ISIG makes the
+/// keystroke arrive as data we can act on deterministically.
+///
+/// Returns `None` when the tty can't be configured or the read fails.
+fn read_key_tty() -> Option<u8> {
+    // SAFETY: termios get/set and a 1-byte read on fd 0, every call rc-checked.
+    // The original attrs are restored before returning on every path that got
+    // as far as changing them.
+    unsafe {
+        let mut cooked: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut cooked) != 0 {
+            return None;
+        }
+        let mut raw = cooked;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+        raw.c_iflag &= !(libc::IXON | libc::IXOFF);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {
+            return None;
+        }
+        let mut b = 0u8;
+        let n = libc::read(0, &mut b as *mut u8 as *mut libc::c_void, 1);
+        // An ESC introduces a multi-byte sequence (arrow keys, mouse reports).
+        // Swallow the remainder now so one arrow press costs one re-ask instead
+        // of three.
+        if n == 1 && b == 0x1b {
+            drain_pending();
+        }
+        libc::tcsetattr(0, libc::TCSANOW, &cooked);
+        if n == 1 { Some(b) } else { None }
+    }
+}
+
+/// Read one answer. On a tty that's a single keypress (echoed by us, since ECHO
+/// is off for the read); off a tty it's a line, so piped `y`/`n` still work.
+fn read_answer(on_tty: bool) -> Answer {
+    if !on_tty {
+        let mut line = String::new();
+        return match std::io::stdin().read_line(&mut line) {
+            // 0 bytes = EOF: a pipe or script with nothing left to say.
+            Ok(0) | Err(_) => Answer::Cancelled,
+            Ok(_) => parse_answer(&line),
+        };
+    }
+    let Some(b) = read_key_tty() else {
+        return Answer::Cancelled;
     };
-    crate::sensitive::clamp_decision(sensitive, d)
+    match b {
+        // Ctrl-C / Ctrl-D: abandon the prompt and cancel the call.
+        0x03 | 0x04 => {
+            println!("^C");
+            Answer::Cancelled
+        }
+        b'\r' | b'\n' => {
+            println!();
+            parse_answer("")
+        }
+        _ => {
+            // Echo only printable ASCII — a control byte or a UTF-8 continuation
+            // would just garble the line, and it's headed for Invalid anyway.
+            if b.is_ascii_graphic() {
+                println!("{}", b as char);
+            } else {
+                println!();
+            }
+            // Single keys only: the word forms ("yes"/"always") can't be typed a
+            // key at a time, and don't need to be — the keys are what's advertised.
+            parse_answer(&(b as char).to_string())
+        }
+    }
+}
+
+/// Blocking y/N/a/d prompt on the controlling TTY. `a` ("always") allows this
+/// call and persists the tool/command so it never prompts again.
+///
+/// Only the advertised keys are accepted. Anything else re-asks rather than
+/// being folded into a silent refusal, and **Ctrl-C cancels the call** — which
+/// needs the explicit byte check in [`read_key_tty`], because aish ignores
+/// SIGINT process-wide and would otherwise sit on the prompt forever.
+///
+/// A prompt flagged sensitive by [`crate::sensitive`] (SEC-2.3) renders **only**
+/// `y/N`: `'a'`/`'d'` can never be honoured for a credential path, and an option
+/// that cannot be honoured must not be displayed. A typed `a`/`d` is still
+/// parsed here and then clamped to a refusal by `clamp_decision`, so the
+/// security invariant holds regardless of what the operator presses.
+pub fn confirm_tty(prompt: &str) -> tools::Decision {
+    use tools::Decision;
+    // If a mid-turn key watcher is active it holds stdin in cbreak (ECHO off);
+    // pause it for the length of this prompt so we own the tty for the read.
+    let _pause = crate::keywatch::pause_for_prompt();
+    let (body, sensitive) = crate::sensitive::split_prompt(prompt);
+    let opts = crate::sensitive::prompt_options(sensitive);
+    // SAFETY: isatty is a plain query on fd 0.
+    let on_tty = unsafe { libc::isatty(0) == 1 };
+
+    for _ in 0..MAX_CONFIRM_RETRIES {
+        print!("\x1b[33mrun?\x1b[0m {body} \x1b[33m{opts}\x1b[0m ");
+        std::io::stdout().flush().ok();
+        match read_answer(on_tty) {
+            Answer::Decided(d) => return crate::sensitive::clamp_decision(sensitive, d),
+            Answer::Cancelled => return Decision::Deny,
+            Answer::Invalid => {
+                println!("      \x1b[90m{}\x1b[0m", answer_hint(sensitive));
+            }
+        }
+    }
+    // Out of patience: refuse, which is the safe direction.
+    Decision::Deny
 }
 
 /// Emit an OSC 0 (icon name & window title) sequence to set the terminal window title.
@@ -11646,6 +11810,114 @@ mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
     use std::collections::HashMap;
+
+    // ---- confirm prompt: only the advertised keys count --------------------
+
+    #[test]
+    fn every_advertised_key_maps_to_its_decision() {
+        for (key, want) in [
+            ("y", tools::Decision::AllowOnce),
+            ("n", tools::Decision::Deny),
+            ("a", tools::Decision::AlwaysAllow),
+            ("d", tools::Decision::AllowDir),
+        ] {
+            assert_eq!(
+                parse_answer(key),
+                Answer::Decided(want),
+                "key {key:?} must be honoured — it's printed in the prompt"
+            );
+            // Upper case and the long form are the same answer.
+            assert_eq!(parse_answer(&key.to_uppercase()), Answer::Decided(want));
+        }
+        for (word, want) in [
+            ("yes", tools::Decision::AllowOnce),
+            ("no", tools::Decision::Deny),
+            ("always", tools::Decision::AlwaysAllow),
+            ("dir", tools::Decision::AllowDir),
+        ] {
+            assert_eq!(parse_answer(word), Answer::Decided(want));
+        }
+    }
+
+    #[test]
+    fn bare_enter_takes_the_capitalised_default() {
+        // The `N` in `[y/N/a/d]` is the documented default, so an empty answer
+        // is a real refusal — not an unrecognised one to re-ask about.
+        for empty in ["", "\n", "   \n", "\r\n"] {
+            assert_eq!(parse_answer(empty), Answer::Decided(tools::Decision::Deny));
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_change_the_answer() {
+        assert_eq!(
+            parse_answer("  y \n"),
+            Answer::Decided(tools::Decision::AllowOnce)
+        );
+    }
+
+    #[test]
+    fn unadvertised_input_re_asks_instead_of_silently_refusing() {
+        // The old prompt folded all of these into Deny, so a typo looked like
+        // aish had ignored the operator and dropped the call for no reason.
+        for junk in [
+            "x",        // plain typo
+            "yep",      // nearly-right word
+            "ye",       // half-typed
+            "ya",       // two advertised letters, still not an answer
+            "1",        // wrong input modality
+            "\u{1b}[A", // up-arrow escape sequence
+            "allow",    // plausible synonym we don't advertise
+            "q",        // quit-ish, but not a documented key
+            "yn",       // two keys at once
+        ] {
+            assert_eq!(
+                parse_answer(junk),
+                Answer::Invalid,
+                "{junk:?} is not an advertised key and must re-ask, not refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_prompts_still_clamp_a_and_d_to_a_refusal() {
+        // SEC-2.3: parsing accepts the key, the clamp is what enforces the
+        // invariant — so an operator pressing 'a' on a credential path cannot
+        // persist a grant no matter how the prompt is read.
+        for key in ["a", "d", "always", "dir"] {
+            let Answer::Decided(d) = parse_answer(key) else {
+                panic!("{key:?} should parse");
+            };
+            assert_eq!(
+                crate::sensitive::clamp_decision(true, d),
+                tools::Decision::Deny
+            );
+        }
+        // 'y' is the one answer a sensitive prompt can honour.
+        let Answer::Decided(y) = parse_answer("y") else {
+            panic!("y should parse");
+        };
+        assert_eq!(
+            crate::sensitive::clamp_decision(true, y),
+            tools::Decision::AllowOnce
+        );
+    }
+
+    #[test]
+    fn hint_never_offers_an_option_the_prompt_cannot_honour() {
+        let sensitive = answer_hint(true);
+        assert!(
+            !sensitive.contains("always") && !sensitive.contains("this dir"),
+            "a sensitive prompt renders y/N only, so its hint must not mention a/d: {sensitive:?}"
+        );
+        let normal = answer_hint(false);
+        for key in ["y", "n", "a", "d"] {
+            assert!(normal.contains(key), "hint should list {key:?}: {normal:?}");
+        }
+        // Both hints must tell the operator how to get out of the prompt.
+        assert!(sensitive.contains("Ctrl-C"));
+        assert!(normal.contains("Ctrl-C"));
+    }
 
     // ---- SPR-073: file-backed statusline segments (TASK-316) ---------------
 
