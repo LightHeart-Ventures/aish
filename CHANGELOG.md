@@ -4,6 +4,8 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.54.5] - 2026-10-11
+
 ### Fixed
 - Typing during a Shift-Tab or attach return reaches the editor instead of being consumed by a cursor-position query. Prompt parking now anchors transcript writes at the body bottom without reading stdin.
 - Switching worker views or returning to interactive stops the previous durable activity tail, including mid-turn Shift-Tab. Presenter batches from a retired attachment are discarded before forwarding or updating the cursor.
