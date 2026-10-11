@@ -551,62 +551,63 @@ fn tray_reglue_seq(region_bottom: u16, release: u16) -> String {
 /// alternative (full-screen scroll for scrollback's sake) would move the
 /// editor's line and desync rustyline.
 fn repaint_hint_tray(prev_rows: u16) {
-    {
-        // Same boundary the heartbeat and the banner absorb take, so a repaint on
-        // another thread cannot land between this scroll and the paint that fills
-        // the rows it opened. Released before `paint_cached_footer`, which takes
-        // the lock itself.
-        let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((rows, _cols)) = term_size() else {
-            return;
-        };
-        let want_banners = if crate::escalation::active() {
-            crate::escalation::row_count()
-        } else {
-            0
-        };
-        let delta = hint_tray_delta(rows, want_banners, prev_rows, hint_tray_rows());
-        let mut seq = String::new();
-        if delta.grow > 0 {
-            seq.push_str(&format!("\x1b7\x1b[{}S\x1b8", delta.grow));
-            // The transcript just moved up with it, so the remembered body row
-            // has to move too or the next `print_in_body` overwrites live text.
-            let cur = BODY_ROW.load(Ordering::Relaxed);
-            if cur > 0 {
-                BODY_ROW.store(cur.saturating_sub(delta.grow).max(1), Ordering::Relaxed);
-            }
+    // Hold the boundary lock for the whole operation so a banner pinning on
+    // another thread cannot slip between this scroll and the paint that follows.
+    // This was previously released early (before `paint_cached_footer`), which
+    // could fail silently on early return: if `term_size()` returns `None` the
+    // lock was released but the tray was never painted, leaving a stale
+    // INPUT_ROW coordinate on the screen. Now the lock is held through the
+    // whole operation, ensuring atomicity.
+    let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((rows, _cols)) = term_size() else {
+        return;
+    };
+    let want_banners = if crate::escalation::active() {
+        crate::escalation::row_count()
+    } else {
+        0
+    };
+    let delta = hint_tray_delta(rows, want_banners, prev_rows, hint_tray_rows());
+    let mut seq = String::new();
+    if delta.grow > 0 {
+        seq.push_str(&format!("\x1b7\x1b[{}S\x1b8", delta.grow));
+        // The transcript just moved up with it, so the remembered body row
+        // has to move too or the next `print_in_body` overwrites live text.
+        let cur = BODY_ROW.load(Ordering::Relaxed);
+        if cur > 0 {
+            BODY_ROW.store(cur.saturating_sub(delta.grow).max(1), Ordering::Relaxed);
         }
-        if delta.clear_to > delta.clear_from {
-            // A shrinking tray hands rows back to the body; wipe the menu text
-            // off them or it lingers above the rule looking like output.
-            seq.push_str("\x1b7");
-            for row in delta.clear_from..delta.clear_to {
-                seq.push_str(&format!("\x1b[{row};1H\x1b[2K"));
-            }
-            seq.push_str("\x1b8");
+    }
+    if delta.clear_to > delta.clear_from {
+        // A shrinking tray hands rows back to the body; wipe the menu text
+        // off them or it lingers above the rule looking like output.
+        seq.push_str("\x1b7");
+        for row in delta.clear_from..delta.clear_to {
+            seq.push_str(&format!("\x1b[{row};1H\x1b[2K"));
         }
-        if delta.release > 0 {
-            // Mirror image of the `SU` above: the retiring tray handed rows back,
-            // so scroll the transcript DOWN into them. Without this the body
-            // stays parked where the grow left it and every later write — the
-            // echo of the operator's own input included — lands `release` rows
-            // above the rule with a blank band beneath it (the "my input appears
-            // a dozen lines above the separator" report). The tray grows and
-            // retires on ordinary `:`-keystrokes, so the drift accumulates.
-            seq.push_str(&tray_reglue_seq(delta.body_bottom, delta.release));
-            let cur = BODY_ROW.load(Ordering::Relaxed);
-            if cur > 0 {
-                BODY_ROW.store(
-                    cur.saturating_add(delta.release).min(delta.body_bottom),
-                    Ordering::Relaxed,
-                );
-            }
+        seq.push_str("\x1b8");
+    }
+    if delta.release > 0 {
+        // Mirror image of the `SU` above: the retiring tray handed rows back,
+        // so scroll the transcript DOWN into them. Without this the body
+        // stays parked where the grow left it and every later write — the
+        // echo of the operator's own input included — lands `release` rows
+        // above the rule with a blank band beneath it (the "my input appears
+        // a dozen lines above the separator" report). The tray grows and
+        // retires on ordinary `:`-keystrokes, so the drift accumulates.
+        seq.push_str(&tray_reglue_seq(delta.body_bottom, delta.release));
+        let cur = BODY_ROW.load(Ordering::Relaxed);
+        if cur > 0 {
+            BODY_ROW.store(
+                cur.saturating_add(delta.release).min(delta.body_bottom),
+                Ordering::Relaxed,
+            );
         }
-        if !seq.is_empty() {
-            let mut out = std::io::stdout();
-            let _ = write!(out, "{seq}");
-            let _ = out.flush();
-        }
+    }
+    if !seq.is_empty() {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "{seq}");
+        let _ = out.flush();
     }
     // Re-asserts the region at the NEW height and paints every zone, tray
     // included, from cached content.
