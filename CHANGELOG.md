@@ -4,6 +4,17 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.54.3] - 2026-10-11
+
+Bugfix release for a critical UI freeze in 0.54.2.
+
+### Fixed
+- **Hold the FOOTER_PAINT lock through the entire tray repaint to prevent stale INPUT_ROW** (PR #960): the hint tray's repaint was releasing the `FOOTER_PAINT` lock BEFORE calling `paint_cached_footer()`, which meant early returns (e.g., when `term_size()` fails) would drop the lock while leaving the tray unpainted. This stale state manifested as a UI freeze when the terminal resized while idle, because the INPUT_ROW coordinate remained pinned to the old size and later input would write outside the reserved region, hanging the shell. The lock is now held through the ENTIRE repaint operation — both scroll choreography AND footer paint — so every code path either completes atomically or returns early while holding the lock, preventing stale state. Fixes #960.
+
+## [0.54.2] - 2026-10-11
+
+## [0.54.0]
+
 ### Fixed
 - **Typed input stopped drifting a dozen rows above the rule when the `:`-hint tray retired** (TASK — input echo drift): the hint tray's growth and its retirement were not symmetric. Opening a tray correctly scrolled the body UP (`SU`) by the rows the tray was about to paint over and moved `BODY_ROW` with it; closing one only *cleared* the rows it handed back — it never scrolled the transcript back DOWN into them, and it never moved `BODY_ROW` back. So every open/close pair left the body parked N rows higher than the rule, with a blank band beneath it, and because the tray opens and retires on ordinary `:`-keystrokes the drift **accumulated** across a session: by the time the operator typed a command, its echo landed ~12 rows above the separator. `hint_tray_delta` now returns a `TrayDelta` solved from the single before/after `FooterLayout` pair — `grow`, `release`, the `[clear_from, clear_to)` wipe range, and the body's new `body_bottom` — so the scroll, the clear, and the `BODY_ROW` bookkeeping can never be computed against drifted globals. The shrink path emits the mirror image of the grow: `tray_reglue_seq` widens DECSTBM to the body's NEW bottom edge **before** the `SD`, because `SD` is clipped to the current region and emitting it first would scroll inside the old, shorter region and leave the freed rows blank. Two new tests lock the invariant: `grow` on open equals `release` on close (and the body lands back on its original `body_bottom`) across every window height 8–40, with and without the escalation banner, at tray heights 1–6; and the re-glue sequence provably widens the region before scrolling.
 
