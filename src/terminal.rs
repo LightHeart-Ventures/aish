@@ -471,26 +471,66 @@ pub fn clear_hint_tray() {
     }
 }
 
-/// Body rows a tray change claims (`> 0`) or releases (`< 0` direction), given
-/// the tray height `prev_rows` the CURRENT region was installed for. Pure, so
-/// the choreography below is unit-testable at every window size.
+/// What a tray height change costs the body: the scroll choreography plus the
+/// rows to wipe. Solved from the SAME before/after layout pair so the scroll,
+/// the clear range, and the body bookkeeping can never be computed against
+/// drifted globals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrayDelta {
+    /// Rows the body must scroll UP (`SU`) before a GROWING tray paints over
+    /// them. Zero when the tray shrank or held still.
+    pub grow: u16,
+    /// Rows a SHRINKING tray handed BACK to the body, which must therefore be
+    /// scrolled DOWN (`SD`) so the transcript stays glued to the body's new
+    /// bottom edge. Zero when the tray grew or held still.
+    pub release: u16,
+    /// First row of the stale-tray-text wipe (half-open with `clear_to`).
+    pub clear_from: u16,
+    /// One past the last row to wipe. `clear_to > clear_from` only when the
+    /// tray shrank.
+    pub clear_to: u16,
+    /// The body's bottom row AFTER the change — the clamp for [`BODY_ROW`] and
+    /// the DECSTBM bottom margin the re-glue must run inside.
+    pub body_bottom: u16,
+}
+
+/// Body rows a tray change claims or releases, given the tray height
+/// `prev_rows` the CURRENT region was installed for. Pure, so the choreography
+/// below is unit-testable at every window size.
 ///
-/// `(grow, clear_from, clear_to)`: `grow` rows the body must scroll up before
-/// the tray paints over them, and the half-open row range `[clear_from,
-/// clear_to)` of stale tray text a SHRINKING tray handed back to the body.
+/// The two directions are SYMMETRIC by construction: `grow` rows lifted on the
+/// way up are `release` rows pushed back on the way down. Treating the shrink
+/// as "just clear some rows" is what left the body stranded N rows above the
+/// rule after a palette retired.
 pub fn hint_tray_delta(
     rows: u16,
     want_banner_rows: u16,
     prev_rows: u16,
     next_rows: u16,
-) -> (u16, u16, u16) {
+) -> TrayDelta {
     let before = FooterLayout::solve_with(rows, want_banner_rows, prev_rows);
     let after = FooterLayout::solve_with(rows, want_banner_rows, next_rows);
-    (
-        before.body_bottom.saturating_sub(after.body_bottom),
-        before.top_row(),
-        after.top_row(),
-    )
+    TrayDelta {
+        grow: before.body_bottom.saturating_sub(after.body_bottom),
+        release: after.body_bottom.saturating_sub(before.body_bottom),
+        clear_from: before.top_row(),
+        clear_to: after.top_row(),
+        body_bottom: after.body_bottom,
+    }
+}
+
+/// Region-scoped `SD` choreography for a SHRINKING tray: widen the scroll
+/// region to the body's NEW bottom edge FIRST, then scroll the transcript down
+/// into the rows the tray just gave back.
+///
+/// Order is load-bearing. `SD` is clipped to the CURRENT region, so emitting it
+/// before the DECSTBM widen would scroll inside the old, shorter region and
+/// leave the freed rows blank — exactly the gap this is here to close.
+fn tray_reglue_seq(region_bottom: u16, release: u16) -> String {
+    if release == 0 || region_bottom == 0 {
+        return String::new();
+    }
+    format!("\x1b[1;{region_bottom}r\x1b7\x1b[{release}T\x1b8")
 }
 
 /// Repaint the footer for a tray that just went from `prev_rows` rows to
@@ -525,26 +565,42 @@ fn repaint_hint_tray(prev_rows: u16) {
         } else {
             0
         };
-        let (grow, clear_from, clear_to) =
-            hint_tray_delta(rows, want_banners, prev_rows, hint_tray_rows());
+        let delta = hint_tray_delta(rows, want_banners, prev_rows, hint_tray_rows());
         let mut seq = String::new();
-        if grow > 0 {
-            seq.push_str(&format!("\x1b7\x1b[{grow}S\x1b8"));
+        if delta.grow > 0 {
+            seq.push_str(&format!("\x1b7\x1b[{}S\x1b8", delta.grow));
             // The transcript just moved up with it, so the remembered body row
             // has to move too or the next `print_in_body` overwrites live text.
             let cur = BODY_ROW.load(Ordering::Relaxed);
             if cur > 0 {
-                BODY_ROW.store(cur.saturating_sub(grow).max(1), Ordering::Relaxed);
+                BODY_ROW.store(cur.saturating_sub(delta.grow).max(1), Ordering::Relaxed);
             }
         }
-        if clear_to > clear_from {
+        if delta.clear_to > delta.clear_from {
             // A shrinking tray hands rows back to the body; wipe the menu text
             // off them or it lingers above the rule looking like output.
             seq.push_str("\x1b7");
-            for row in clear_from..clear_to {
+            for row in delta.clear_from..delta.clear_to {
                 seq.push_str(&format!("\x1b[{row};1H\x1b[2K"));
             }
             seq.push_str("\x1b8");
+        }
+        if delta.release > 0 {
+            // Mirror image of the `SU` above: the retiring tray handed rows back,
+            // so scroll the transcript DOWN into them. Without this the body
+            // stays parked where the grow left it and every later write — the
+            // echo of the operator's own input included — lands `release` rows
+            // above the rule with a blank band beneath it (the "my input appears
+            // a dozen lines above the separator" report). The tray grows and
+            // retires on ordinary `:`-keystrokes, so the drift accumulates.
+            seq.push_str(&tray_reglue_seq(delta.body_bottom, delta.release));
+            let cur = BODY_ROW.load(Ordering::Relaxed);
+            if cur > 0 {
+                BODY_ROW.store(
+                    cur.saturating_add(delta.release).min(delta.body_bottom),
+                    Ordering::Relaxed,
+                );
+            }
         }
         if !seq.is_empty() {
             let mut out = std::io::stdout();
@@ -3352,18 +3408,77 @@ mod tests {
     fn hint_tray_delta_claims_and_releases_body_rows() {
         // Opening a 3-row tray claims 3 body rows, so the body must scroll up 3
         // before the tray paints over them.
-        let (grow, from, to) = hint_tray_delta(24, 0, 0, 3);
-        assert_eq!(grow, 3);
-        assert!(to < from, "a growing tray moves the footer top UP");
+        let open = hint_tray_delta(24, 0, 0, 3);
+        assert_eq!(open.grow, 3);
+        assert_eq!(open.release, 0, "a growing tray releases nothing");
+        assert!(
+            open.clear_to < open.clear_from,
+            "a growing tray moves the footer top UP"
+        );
 
         // Closing it releases them and hands back the rows to clear.
-        let (grow, from, to) = hint_tray_delta(24, 0, 3, 0);
-        assert_eq!(grow, 0);
-        assert!(from < to, "a shrinking tray leaves stale rows to clear");
-        assert_eq!(to - from, 3, "exactly the rows the tray gave back");
+        let close = hint_tray_delta(24, 0, 3, 0);
+        assert_eq!(close.grow, 0);
+        assert_eq!(close.release, 3, "a shrinking tray gives 3 rows BACK");
+        assert!(
+            close.clear_from < close.clear_to,
+            "a shrinking tray leaves stale rows to clear"
+        );
+        assert_eq!(
+            close.clear_to - close.clear_from,
+            3,
+            "exactly the rows the tray gave back"
+        );
 
         // No change ⇒ no scroll, no clear.
-        assert_eq!(hint_tray_delta(24, 0, 2, 2), (0, 19, 19));
+        let still = hint_tray_delta(24, 0, 2, 2);
+        assert_eq!((still.grow, still.release), (0, 0));
+        assert_eq!(still.clear_from, still.clear_to);
+    }
+
+    #[test]
+    fn tray_open_and_close_are_scroll_symmetric() {
+        // The regression: `grow` on open MUST be matched by `release` on close
+        // at every window size and tray height, or the body is left parked N
+        // rows above the rule and later writes (the operator's own echoed
+        // input) land in a blank band above the separator.
+        for rows in 8..40u16 {
+            for banners in [0u16, 2] {
+                for tray in 1..=6u16 {
+                    let open = hint_tray_delta(rows, banners, 0, tray);
+                    let close = hint_tray_delta(rows, banners, tray, 0);
+                    assert_eq!(
+                        open.grow, close.release,
+                        "rows={rows} banners={banners} tray={tray}"
+                    );
+                    assert_eq!(open.release, 0);
+                    assert_eq!(close.grow, 0);
+                    // And the body must land back exactly where it started.
+                    assert_eq!(
+                        close.body_bottom,
+                        FooterLayout::solve_with(rows, banners, 0).body_bottom,
+                        "closing the tray restores the original body bottom"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tray_reglue_widens_the_region_before_scrolling_down() {
+        // `SD` is clipped to the CURRENT scroll region, so the DECSTBM widen has
+        // to precede it — otherwise the freed rows stay blank.
+        let seq = tray_reglue_seq(21, 3);
+        let widen = seq.find("\x1b[1;21r").expect("widens the region first");
+        let down = seq.find("\x1b[3T").expect("scrolls the body down");
+        assert!(widen < down, "region widen must precede the SD");
+        // Cursor is saved/restored around the scroll so the caller's position
+        // (and the footer paint that follows) is untouched.
+        assert!(seq.contains("\x1b7") && seq.contains("\x1b8"));
+
+        // Degenerate inputs emit nothing at all.
+        assert!(tray_reglue_seq(21, 0).is_empty());
+        assert!(tray_reglue_seq(0, 3).is_empty());
     }
 
     #[test]
