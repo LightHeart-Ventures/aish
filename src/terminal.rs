@@ -34,7 +34,7 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Rows reserved at the bottom for the footer: separator + input + status
@@ -530,7 +530,9 @@ fn tray_reglue_seq(region_bottom: u16, release: u16) -> String {
     if release == 0 || region_bottom == 0 {
         return String::new();
     }
-    format!("\x1b[1;{region_bottom}r\x1b7\x1b[{release}T\x1b8")
+    // DECSTBM homes the cursor. Save BEFORE widening, otherwise the editor
+    // resumes at row 1 instead of its input row when the palette shrinks.
+    format!("\x1b7\x1b[1;{region_bottom}r\x1b[{release}T\x1b8")
 }
 
 /// Repaint the footer for a tray that just went from `prev_rows` rows to
@@ -553,11 +555,6 @@ fn tray_reglue_seq(region_bottom: u16, release: u16) -> String {
 fn repaint_hint_tray(prev_rows: u16) {
     // Hold the boundary lock for the whole operation so a banner pinning on
     // another thread cannot slip between this scroll and the paint that follows.
-    // This was previously released early (before `paint_cached_footer`), which
-    // could fail silently on early return: if `term_size()` returns `None` the
-    // lock was released but the tray was never painted, leaving a stale
-    // INPUT_ROW coordinate on the screen. Now the lock is held through the
-    // whole operation, ensuring atomicity.
     let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
     let Some((rows, _cols)) = term_size() else {
         return;
@@ -611,7 +608,7 @@ fn repaint_hint_tray(prev_rows: u16) {
     }
     // Re-asserts the region at the NEW height and paints every zone, tray
     // included, from cached content.
-    paint_cached_footer(false);
+    paint_cached_footer_locked(false, &_boundary);
 }
 
 /// What to paint on the INPUT row, or `None` to LEAVE THE ROW ALONE.
@@ -1108,6 +1105,15 @@ fn paint_cached_footer(home_body: bool) {
     // its footer write (see `FOOTER_PAINT`). Poisoning is not fatal here — the
     // worst case is a redundant repaint — so recover rather than propagate.
     let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
+    paint_cached_footer_locked(home_body, &_boundary);
+}
+
+/// Paint with the boundary already held. Tray updates must use this entry point:
+/// taking the non-reentrant mutex again would deadlock rustyline's hinter.
+fn paint_cached_footer_locked(home_body: bool, _boundary: &MutexGuard<'_, ()>) {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
     let Some((rows, cols)) = term_size() else {
         return;
     };
@@ -2329,6 +2335,92 @@ mod tests {
     static FOOTER_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn hint_tray_repaint_completes_on_tty() {
+        const CHILD: &str = "AISH_TEST_HINT_TRAY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(term_size(), Some((24, 80)));
+            ACTIVE.store(true, Ordering::Relaxed);
+            set_reading_line(true);
+            assert!(set_hint_tray(vec![
+                ":quit leave".into(),
+                ":jobs list".into()
+            ]));
+            assert!(set_hint_tray(vec![":quit leave".into()]));
+            clear_hint_tray();
+            assert_eq!(hint_tray_rows(), 0);
+            assert!(FOOTER_PAINT.try_lock().is_ok());
+            ACTIVE.store(false, Ordering::Relaxed);
+            return;
+        }
+
+        // Exercise the real ioctl + repaint path in an isolated process. A pipe
+        // would return before the nested lock, hiding the regression. Bound the
+        // wait so a deadlock fails the test instead of hanging the entire suite.
+        use std::os::fd::FromRawFd;
+        use std::process::{Command, Stdio};
+        let mut master = -1;
+        let mut slave = -1;
+        let mut size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: valid out-pointers; successful descriptors are owned below.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &raw mut size,
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned fresh, owned file descriptors.
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "terminal::tests::hint_tray_repaint_completes_on_tty",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(Stdio::from(slave))
+            .spawn()
+            .unwrap();
+        // Drain output concurrently, so PTY capacity cannot masquerade as a
+        // repaint deadlock even if the footer gains more content later.
+        let reader = std::thread::spawn(move || {
+            let mut master = master;
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut master, &mut bytes);
+            bytes
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let bytes = reader.join().unwrap();
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "tray repaint hung or failed: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
     fn alt_scroll_suppress_saves_once_then_restores() {
         // Deterministic starting point: not yet suppressed.
         ALT_SCROLL_SUPPRESSED.store(false, Ordering::Relaxed);
@@ -3473,6 +3565,8 @@ mod tests {
         let widen = seq.find("\x1b[1;21r").expect("widens the region first");
         let down = seq.find("\x1b[3T").expect("scrolls the body down");
         assert!(widen < down, "region widen must precede the SD");
+        let save = seq.find("\x1b7").expect("saves the editor cursor");
+        assert!(save < widen, "save must precede DECSTBM's cursor home");
         // Cursor is saved/restored around the scroll so the caller's position
         // (and the footer paint that follows) is untouched.
         assert!(seq.contains("\x1b7") && seq.contains("\x1b8"));
