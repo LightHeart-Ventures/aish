@@ -2549,6 +2549,7 @@ pub(crate) struct AishHelper {
     /// repeated paint of the same buffer in O(1); any edit (a new line) or a `cd`
     /// (new cwd) misses and recomputes exactly once.
     route_cache: Mutex<Option<RouteMemo>>,
+    pastes: Mutex<Vec<(String, String)>>,
 }
 
 /// One memoized route-preview decision, keyed on the exact `(line, cwd)` it was
@@ -2577,6 +2578,7 @@ impl AishHelper {
             aliases,
             cmd_cache: Arc::new(Mutex::new(None)),
             route_cache: Mutex::new(None),
+            pastes: Mutex::new(Vec::new()),
         }
     }
 
@@ -3282,7 +3284,49 @@ impl Highlighter for AishHelper {
         kind != CmdKind::MoveCursor
     }
 }
-impl Validator for AishHelper {}
+impl Validator for AishHelper {
+    fn transform_paste(&self, text: String) -> String {
+        if !text.contains('\n') {
+            return text;
+        }
+        let lines = text.lines().count().max(1);
+        let mut pastes = self.pastes.lock().unwrap();
+        let base = format!("[pasted {lines} lines from clipboard]");
+        let mut marker = base.clone();
+        let mut id = 2;
+        while pastes.iter().any(|(key, _)| key == &marker) {
+            marker = format!("[pasted {lines} lines from clipboard #{id}]");
+            id += 1;
+        }
+        pastes.push((marker.clone(), text));
+        marker
+    }
+}
+
+impl AishHelper {
+    pub(crate) fn clear_pastes(&self) {
+        self.pastes.lock().unwrap().clear();
+    }
+
+    pub(crate) fn expand_pastes(&self, line: &str) -> String {
+        // Replace only tokens from this editing session, without recursively
+        // interpreting clipboard text as additional placeholders.
+        let pastes = self.pastes.lock().unwrap();
+        let mut result = String::new();
+        let mut rest = line;
+        while let Some((offset, marker, payload)) = pastes
+            .iter()
+            .filter_map(|(marker, payload)| rest.find(marker).map(|i| (i, marker, payload)))
+            .min_by_key(|(i, _, _)| *i)
+        {
+            result.push_str(&rest[..offset]);
+            result.push_str(payload);
+            rest = &rest[offset + marker.len()..];
+        }
+        result.push_str(rest);
+        result
+    }
+}
 impl Helper for AishHelper {}
 
 // ---------------------------------------------------------------------------
@@ -12139,6 +12183,7 @@ mod tests {
             aliases: Arc::new(aliases),
             cmd_cache: Arc::new(Mutex::new(None)),
             route_cache: Mutex::new(None),
+            pastes: Mutex::new(Vec::new()),
         }
     }
 
@@ -14639,5 +14684,33 @@ mod tests {
             digest_worthy(&format!("{OUTPUT_SEED_PREFIX}\nout\n]\n\n   ")),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_paste_tests {
+    use super::*;
+
+    #[test]
+    fn multiline_pastes_collapse_and_expand_without_losing_content() {
+        let helper = AishHelper::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            Arc::new(HashMap::new()),
+        );
+        let first = "alpha\nbeta\n";
+        let marker = helper.transform_paste(first.into());
+        assert_eq!(marker, "[pasted 2 lines from clipboard]");
+        let second = "gamma\ndelta";
+        let other = helper.transform_paste(second.into());
+        assert_ne!(marker, other);
+        assert_eq!(
+            helper.expand_pastes(&format!("before {other} {marker} after")),
+            format!("before {second} {first} after")
+        );
+        assert_eq!(helper.transform_paste("single line".into()), "single line");
+        assert_eq!(helper.expand_pastes("deleted"), "deleted");
+        helper.clear_pastes();
+        assert_eq!(helper.expand_pastes(&marker), marker);
     }
 }

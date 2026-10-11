@@ -232,6 +232,17 @@ impl RustylineEditor {
     /// [`read_line_with_initial`](LineEditor::read_line_with_initial) so the
     /// Ctrl-O/Ctrl-C disambiguation and EOF/error mapping stay identical on both
     /// entry points.
+    fn expand_outcome(&self, outcome: ReadOutcome) -> ReadOutcome {
+        match outcome {
+            ReadOutcome::Line(line) => ReadOutcome::Line(
+                self.rl
+                    .helper()
+                    .map_or(line.clone(), |h| h.expand_pastes(&line)),
+            ),
+            other => other,
+        }
+    }
+
     fn outcome(&self, res: rustyline::Result<String>) -> ReadOutcome {
         match res {
             Ok(line) => ReadOutcome::Line(line),
@@ -398,6 +409,9 @@ impl LineEditor for RustylineEditor {
     }
 
     fn read_line(&mut self, prompt: &str) -> ReadOutcome {
+        if let Some(helper) = self.rl.helper() {
+            helper.clear_pastes();
+        }
         // Mark the idle-at-prompt window so the footer heartbeat may repaint a
         // scrolled-away footer while we block here (cleared the moment a line
         // returns).
@@ -409,10 +423,13 @@ impl LineEditor for RustylineEditor {
         let outcome = self.blocking_read(prompt);
         crate::terminal::set_reading_line(false);
         crate::terminal::unpark_input_row(echo_for(prompt, &outcome).as_deref());
-        outcome
+        self.expand_outcome(outcome)
     }
 
     fn read_line_with_initial(&mut self, prompt: &str, initial: &str) -> ReadOutcome {
+        if let Some(helper) = self.rl.helper() {
+            helper.clear_pastes();
+        }
         // rustyline takes the pre-filled buffer as a (left, right) split around
         // the cursor; we want the whole candidate to the LEFT so the cursor
         // lands at end-of-line, ready to edit or Enter.
@@ -428,7 +445,7 @@ impl LineEditor for RustylineEditor {
         crate::terminal::set_reading_line(false);
         let outcome = self.outcome(res);
         crate::terminal::unpark_input_row(echo_for(prompt, &outcome).as_deref());
-        outcome
+        self.expand_outcome(outcome)
     }
 
     fn add_history(&mut self, line: &str) {
