@@ -141,12 +141,18 @@ struct GhRelease {
     assets: Vec<GhAsset>,
 }
 
-/// A lightweight `gh release list` row — just the tag, used to find the newest
-/// release matching a channel's prefix before we fetch its full asset list.
+/// A lightweight `gh release list` row — the tag plus the two publication
+/// flags, used to pick a channel's target release before we fetch its full
+/// asset list. `isDraft`/`isPrerelease` default to `false` so the Dev/Ci paths
+/// (which only request `tagName`) still deserialize.
 #[derive(Deserialize)]
 struct GhReleaseSummary {
     #[serde(rename = "tagName")]
     tag_name: String,
+    #[serde(rename = "isDraft", default)]
+    is_draft: bool,
+    #[serde(rename = "isPrerelease", default)]
+    is_prerelease: bool,
 }
 
 /// Given tags in `gh release list` order (newest first), return the first whose
@@ -156,6 +162,41 @@ fn first_with_prefix<'a>(tags: &'a [String], prefix: &str) -> Option<&'a str> {
     tags.iter()
         .map(|s| s.as_str())
         .find(|t| t.starts_with(prefix))
+}
+
+/// Pick the HIGHEST-SEMVER published stable release from `gh release list`
+/// rows — the prod channel's target.
+///
+/// Why not GitHub's "latest" pointer: `/releases/latest` (and bare `gh release
+/// view`) is ordered by PUBLISH DATE, not by version. Publishing an older tag
+/// after a newer one — a backport, a re-publish, a hand-cut hotfix — silently
+/// moves "latest" BACKWARD and pins every prod client to the older build while
+/// reporting "up to date". (Observed: `v0.53.5` published 2026-10-11 took the
+/// pointer from `v0.54.0` published 2026-10-09, so `:update` on 0.54.0 claimed
+/// up-to-date against a 0.53.5 "latest".) Selecting by semver max makes prod
+/// discovery order-independent and monotonic.
+///
+/// Excluded: drafts (not downloadable — assets may not exist yet), pre-releases
+/// (dev/ci channels own those), and any tag whose version can't be read as a
+/// bare `v{major}.{minor}.{patch}` — a pre-release/build suffix (`v1.2.3-rc1`)
+/// or a channel prefix (`dev-v…`, `ci-…`) is never a prod target.
+///
+/// Pure so prod discovery is unit-tested without hitting the network.
+fn highest_stable_tag(rows: &[GhReleaseSummary]) -> Option<&str> {
+    rows.iter()
+        .filter(|r| !r.is_draft && !r.is_prerelease)
+        .filter_map(|r| {
+            let tag = r.tag_name.trim();
+            // Reject pre-release/build metadata outright: `parse_semver` strips
+            // it, which would let `v1.2.3-rc1` masquerade as stable `1.2.3`.
+            let core = tag.trim_start_matches('v');
+            if core.contains('-') || core.contains('+') {
+                return None;
+            }
+            parse_semver(tag).map(|v| (v, tag))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, tag)| tag)
 }
 
 /// Rust target triples whose release asset would run on this host, most-preferred
@@ -365,43 +406,56 @@ pub fn gh_available() -> bool {
 /// Resolve the target release for `channel` on `repo`, returning its tag + full
 /// asset list (or `Ok(None)` when the channel has no matching release yet).
 ///
-/// * `Prod` keeps the historical `gh release view` path (the repo's "latest"
-///   published release) verbatim — full backward compatibility.
+/// * `Prod` lists releases and picks the HIGHEST SEMVER published stable tag —
+///   deliberately NOT GitHub's date-ordered "latest" pointer, which moves
+///   backward when an older tag is published after a newer one.
 /// * `Dev`/`Ci` `gh release list` and client-side filter by the channel's tag
 ///   prefix (newest first), then `gh release view <tag>` for the asset list.
 async fn resolve_release(repo: &str, channel: Channel) -> Result<Option<GhRelease>> {
     match channel.tag_prefix() {
-        None => resolve_latest(repo).await,
+        None => resolve_stable(repo).await,
         Some(prefix) => resolve_prefixed(repo, prefix).await,
     }
 }
 
-/// Prod discovery: `gh release view` with no tag returns the repo's latest
-/// published (non-pre-release) release. Unchanged from the original `check()`.
-async fn resolve_latest(repo: &str) -> Result<Option<GhRelease>> {
+/// Prod discovery: list releases and take the highest-semver published stable
+/// tag via [`highest_stable_tag`], then fetch that release's assets.
+///
+/// This replaces the old bare `gh release view` (GitHub's date-ordered "latest"
+/// pointer), which reported a LOWER version as the update target whenever an
+/// older tag was published after a newer one — the prod channel then sat
+/// "up to date" on a release that was not the newest one shipped.
+async fn resolve_stable(repo: &str) -> Result<Option<GhRelease>> {
     let out = tokio::process::Command::new(gh_bin()?)
         .args([
             "release",
-            "view",
+            "list",
             "--repo",
             repo,
+            "--limit",
+            "100",
             "--json",
-            "tagName,assets",
+            "tagName,isDraft,isPrerelease",
         ])
         .output()
         .await
-        .context("running `gh release view` (is the GitHub CLI installed?)")?;
+        .context("running `gh release list` (is the GitHub CLI installed?)")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         // No releases yet is a normal, quiet state — not an error to surface.
         if err.contains("release not found") || err.contains("no releases") {
             return Ok(None);
         }
-        bail!("gh release view failed: {}", err.trim());
+        bail!("gh release list failed: {}", err.trim());
     }
-    let release: GhRelease =
-        serde_json::from_slice(&out.stdout).context("parsing `gh release view` JSON")?;
-    Ok(Some(release))
+    let rows: Vec<GhReleaseSummary> =
+        serde_json::from_slice(&out.stdout).context("parsing `gh release list` JSON")?;
+    // Repo has releases, but none of them is a published stable semver tag
+    // (all drafts / pre-releases) — quiet no-op, same as "no releases yet".
+    let Some(tag) = highest_stable_tag(&rows) else {
+        return Ok(None);
+    };
+    view_release(repo, tag).await.map(Some)
 }
 
 /// Dev/Ci discovery: list releases, pick the newest whose tag starts with
@@ -1671,6 +1725,71 @@ mod tests {
         assert_eq!(first_with_prefix(&tags, "ci-"), Some("ci-42-abc12345"));
         assert_eq!(first_with_prefix(&tags, "nope-"), None);
         assert_eq!(first_with_prefix(&[], "dev-"), None);
+    }
+
+    /// Build a `gh release list` row for the prod-selection tests.
+    fn row(tag: &str, is_draft: bool, is_prerelease: bool) -> GhReleaseSummary {
+        GhReleaseSummary {
+            tag_name: tag.to_string(),
+            is_draft,
+            is_prerelease,
+        }
+    }
+
+    #[test]
+    fn prod_picks_highest_semver_not_newest_publish_date() {
+        // Regression: the real aish repo on 2026-10-11. `v0.53.5` was published
+        // AFTER `v0.54.0`, so GitHub's date-ordered "latest" pointer (and the
+        // old bare `gh release view`) named 0.53.5 — leaving 0.54.0 clients
+        // "up to date" against an OLDER release. gh lists newest-first, so
+        // 0.53.5 is the first stable row here; semver max must still win.
+        let rows = vec![
+            row("ci-249-a7884a6", false, true),
+            row("v0.53.5", false, false),
+            row("v0.54.0", false, false),
+        ];
+        assert_eq!(highest_stable_tag(&rows), Some("v0.54.0"));
+    }
+
+    #[test]
+    fn prod_skips_drafts_and_prereleases() {
+        // A stuck draft (v0.54.1, no assets) and dev/ci pre-releases must never
+        // become the prod target.
+        let rows = vec![
+            row("v0.54.1", true, false),
+            row("dev-v0.55.0-dev.2", false, true),
+            row("ci-250-deadbee", false, true),
+            row("v0.54.0", false, false),
+        ];
+        assert_eq!(highest_stable_tag(&rows), Some("v0.54.0"));
+    }
+
+    #[test]
+    fn prod_rejects_prerelease_suffixed_and_unparsable_tags() {
+        // `v1.0.0-rc1` parses to 1.0.0 under parse_semver's suffix stripping —
+        // it must be rejected explicitly, and a non-semver tag mislabeled as
+        // stable must not be selected either.
+        let rows = vec![
+            row("v1.0.0-rc1", false, false),
+            row("nightly", false, false),
+            row("v0.54.0", false, false),
+        ];
+        assert_eq!(highest_stable_tag(&rows), Some("v0.54.0"));
+
+        // Nothing stable at all → None (quiet no-op, not an error).
+        let only_unusable = vec![row("v1.0.0-rc1", false, false), row("v9.9.9", true, false)];
+        assert_eq!(highest_stable_tag(&only_unusable), None);
+        assert_eq!(highest_stable_tag(&[]), None);
+    }
+
+    #[test]
+    fn prod_compares_numerically_not_lexically() {
+        // "v0.9.0" > "v0.10.0" as strings; semver ordering must disagree.
+        let rows = vec![row("v0.9.0", false, false), row("v0.10.0", false, false)];
+        assert_eq!(highest_stable_tag(&rows), Some("v0.10.0"));
+
+        let patches = vec![row("v1.2.9", false, false), row("v1.2.10", false, false)];
+        assert_eq!(highest_stable_tag(&patches), Some("v1.2.10"));
     }
 
     #[test]

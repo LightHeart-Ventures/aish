@@ -10626,7 +10626,7 @@ fn update_confirm_prompt(running: usize, version: &str) -> String {
 /// Describe a channel in one short phrase for `:update` status lines.
 fn channel_blurb(ch: crate::update::Channel) -> &'static str {
     match ch {
-        crate::update::Channel::Prod => "stable v{semver} releases marked latest",
+        crate::update::Channel::Prod => "highest-semver published stable v{semver} release",
         crate::update::Channel::Dev => "nightly dev-v{next}-dev.{n} pre-releases",
         crate::update::Channel::Ci => "per-main-push ci-{run}-{sha} pre-releases",
     }
