@@ -2304,7 +2304,7 @@ fn build_turns_audit_from_history(history: &[Msg]) -> Vec<(usize, Vec<String>, V
 /// and leaves the cursor on the next row, so between the cursor and the top of
 /// the prior block sit exactly `raw_view_rows` block rows + 1 prompt row. We
 /// walk the cursor up over exactly those rows, erasing each one in place
-/// (`CSI 1 F` + `CSI 2 K` per row, via [`crate::ticker::erase_rows_above`] —
+/// (`CSI 1 F` + `CSI 2 K` per row — erases rows above cursor one at a time —
 /// never erase-in-display, which is unbounded by the scroll region and would
 /// take the footer with it), then paint the new view and record its physical
 /// height in `session.raw_view_rows` for the next toggle. The anchor is only valid while
@@ -2339,12 +2339,18 @@ pub fn render_raw_toggle(session: &mut Session, now_on: bool) {
     // Bounded row walk, NOT `CSI 0 J`: erase-in-display ignores the DECSTBM
     // scroll region and would wipe the bottom-anchored footer (separator,
     // statusline, escalation tray) along with the block. See
-    // `crate::ticker::erase_rows_above`.
+    // via bounded row-walk erase.
     if session.raw_view_rows > 0 {
-        eprint!(
-            "{}",
-            crate::ticker::erase_rows_above(session.raw_view_rows + 1)
-        );
+        // Erase the prior in-place block by walking UP from the cursor,
+        // erasing each row: `\x1b[1F` (cursor up) + `\x1b[2K` (erase line).
+        // This is the SAME pattern the ticker used, and why we never use
+        // `CSI 0 J` (erase-in-display): ED is not bounded by the scroll region
+        // and would wipe the bottom-anchored footer.
+        let mut erase = String::new();
+        for _ in 0..session.raw_view_rows + 1 {
+            erase.push_str("\x1b[1F\x1b[2K");
+        }
+        eprint!("{erase}");
     }
     let mut rows = 0usize;
     for line in &lines {
