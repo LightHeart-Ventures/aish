@@ -4,6 +4,16 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.54.6] - 2026-10-11
+
+### Changed
+- Multiline clipboard pastes display `[pasted x lines from clipboard]` at the input prompt while retaining the full text for submission (PR #966).
+- Escalation headers omit `escalated →`; one pulsing liveness heart replaces the separate spinner and static heart (PR #967).
+
+### Fixed
+- Every visible escalation or hint tray reserves exactly one blank row above it. Growth, shrinkage, dismissal, retirement, and resize reconcile the scrolling text area against the installed layout without colliding with tray items (PR #967).
+- Background completion notices no longer queue an inline prompt redraw between reads. The input prompt remains anchored on the third row from the bottom (PR #967).
+
 ## [0.54.5] - 2026-10-11
 
 ### Fixed
