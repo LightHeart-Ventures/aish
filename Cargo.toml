@@ -99,3 +99,7 @@ opt-level = 3
 opt-level = 2
 lto = "thin"
 strip = true
+
+# Local paste hook keeps multiline clipboard payloads out of prompt geometry.
+[patch.crates-io]
+rustyline = { path = "vendor/rustyline" }

@@ -2507,6 +2507,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multiline_clipboard_paste_stays_compact() {
+        const CHILD: &str = "AISH_TEST_CLIPBOARD_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            use crate::editor::{LineEditor, ReadOutcome, RustylineEditor};
+            let mut term = Terminal::detect().expect("PTY required");
+            term.init_scroll_region();
+            let helper = crate::repl::AishHelper::new(
+                std::env::temp_dir(),
+                String::new(),
+                std::sync::Arc::new(std::collections::HashMap::new()),
+            );
+            let mut editor = RustylineEditor::new(
+                helper,
+                std::env::temp_dir().join("aish-paste-test-unused-history"),
+            )
+            .unwrap();
+            match editor.read_line("paste> ") {
+                ReadOutcome::Line(line) => assert_eq!(line, "prefix alpha\nbeta\ngamma suffix"),
+                _ => panic!("paste did not reach editor"),
+            }
+            return;
+        }
+        let bytes = run_pty_test(
+            "multiline_clipboard_paste_stays_compact",
+            CHILD,
+            Some(b"prefix \x1b[200~alpha\nbeta\ngamma\x1b[201~ suffix\r"),
+        );
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(output.contains("[pasted 3 lines from clipboard]"));
+        assert!(
+            !output.contains("beta"),
+            "clipboard payload leaked into prompt: {output}"
+        );
+    }
+
     fn run_pty_test(name: &str, child_env: &str, input: Option<&[u8]>) -> Vec<u8> {
         // Exercise the real ioctl + repaint path in an isolated process. A pipe
         // would return before the nested lock, hiding the regression. Bound the
