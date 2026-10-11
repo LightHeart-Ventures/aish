@@ -4,6 +4,13 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.54.7] - 2026-10-11
+
+### Fixed
+- Cancelled tool calls no longer poison the session. Every Anthropic request renders through a tool-pairing repair pass that answers unanswered `tool_use` blocks with a synthetic error result and drops orphan `tool_result` blocks, so a Ctrl-C or declined call mid-dispatch can no longer wedge the transcript in a 400 `invalid_request_error` loop (PR #969).
+- A growing `:workers` tray lifts the escalation banner stack instead of painting over it. The tray renders through the footer's hint-tray zone, so the horizontal rule stays fixed, no banner is shed, and retiring the tray re-seats the banners against the rule (PR #970).
+- The `[y/N/a/d]` confirm prompt accepts only advertised keys. One keypress is read raw: `y/n/a/d` (and long forms) answer, bare Enter takes the capital-`N` default, Ctrl-C/Ctrl-D cancels, arrow keys and typos re-prompt with a hint instead of silently denying the call. Sensitive prompts still clamp to Deny (PR #971).
+
 ## [0.54.6] - 2026-10-11
 
 ### Changed
