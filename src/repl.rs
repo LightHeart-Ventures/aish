@@ -1269,6 +1269,7 @@ pub async fn run(
                         let cb_workers = cyc_workers.clone();
                         let cb_attached = cyc_attached.clone();
                         let cb_review = cyc_review.clone();
+                        let cb_durable = session.attached_durable.clone();
                         // TASK-299: clone the goal handle so a mid-turn Shift-Tab can
                         // include the active `:goal` in the rotation (checked live at
                         // press time — goal state can change during the turn).
@@ -1283,6 +1284,7 @@ pub async fn run(
                                     &cb_workers,
                                     &cb_attached,
                                     &cb_review,
+                                    &cb_durable,
                                     &cb_show,
                                     cb_goal.as_ref(),
                                 );
@@ -5552,6 +5554,7 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     if id == GOAL_ATTACH_ID {
         match &session.goal {
             Some(g) if g.is_active() => {
+                *session.attached_durable.lock().unwrap() = None;
                 crate::terminal::open_attach_view();
                 *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
                 println!(
@@ -5610,6 +5613,8 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
     match matches.as_slice() {
         [] => println!("no coordinator in this session matching '{id}' (see :workers)"),
         [(run_id, terminal, durable)] => {
+            // Stop the previous pane's tail before wiping/replaying the new one.
+            *session.attached_durable.lock().unwrap() = None;
             // Open the worker view inline on the primary buffer (mirrors
             // Shift-Tab). Non-destructive: the interactive output scrolls up into
             // scrollback rather than being wiped, and the worker's output stays
@@ -6136,9 +6141,9 @@ fn backfill_attached_durable_tail(
 /// finished run. A no-op when there is no durable attach.
 ///
 /// Deliberately does its file IO OUTSIDE the `attached_durable` lock (snapshot ->
-/// read -> write the cursor back) so a slow disk can never block the REPL, and
-/// the cursor is only written back if we are still attached to the SAME run — a
-/// `:detach` or re-attach that raced this tick wins.
+/// read -> write the cursor back) so a slow disk can never block the REPL.
+/// Rows are forwarded and the cursor updated only while the same attachment is
+/// still current. A detach/re-attach during the file read cancels the old tick.
 fn pump_durable_attach(
     durable: &Arc<Mutex<Option<crate::activity_log::DurableAttach>>>,
     store: &Option<crate::db::CoordinatorStore>,
@@ -6147,17 +6152,10 @@ fn pump_durable_attach(
     let Some(mut snap) = durable.lock().ok().and_then(|g| g.clone()) else {
         return false;
     };
+    let before = snap.clone();
     let rows = crate::activity_log::read_new(&snap.run_id, &mut snap.tail);
-    for row in &rows {
-        crate::tools::print_above_prompt(format!(
-            "{}\n",
-            crate::worker::pane_row(crate::worker::PANE_NO_LABEL, row)
-        ));
-    }
-    match durable.lock().ok().as_deref_mut() {
-        Some(Some(cur)) if cur.run_id == snap.run_id => cur.tail = snap.tail,
-        // Detached (or re-attached elsewhere) mid-tick: drop the advanced cursor.
-        _ => return false,
+    if !forward_durable_rows(durable, &before, snap.tail, &rows) {
+        return false;
     }
     // Finish detection: the durable phase is the only signal available
     // off-process. Announce once (claiming the same marker `announce_attach_review`
@@ -6176,9 +6174,16 @@ fn pump_durable_attach(
     // Stop tailing and fall back to review mode. The announce is CLAIMED with the
     // same atomic marker the in-session path uses, so the presenter and the
     // main-loop pass can't both print it.
-    if let Ok(mut g) = durable.lock() {
-        *g = None;
+    let Ok(mut current) = durable.lock() else {
+        return false;
+    };
+    if !current
+        .as_ref()
+        .is_some_and(|a| a.run_id == snap.run_id && a.tail == snap.tail)
+    {
+        return false;
     }
+    *current = None;
     if !claim_attach_announce(attach_review_announced, &snap.run_id) {
         return false;
     }
@@ -6186,6 +6191,33 @@ fn pump_durable_attach(
     crate::tools::print_above_prompt(format!(
         "\x1b[2m⇄ {short} finished — review mode: `:result {short}` for its full answer, or :detach to return to your shell.\x1b[0m\n"
     ));
+    true
+}
+
+/// Keep forwarding inside the attachment lock so a pane switch waits for the
+/// current batch to finish before wiping the screen. File reads remain outside.
+fn forward_durable_rows(
+    durable: &Arc<Mutex<Option<crate::activity_log::DurableAttach>>>,
+    before: &crate::activity_log::DurableAttach,
+    next: crate::activity_log::ActivityTail,
+    rows: &[String],
+) -> bool {
+    let Ok(mut slot) = durable.lock() else {
+        return false;
+    };
+    let Some(current) = slot.as_mut() else {
+        return false;
+    };
+    if current.run_id != before.run_id || current.tail != before.tail {
+        return false;
+    }
+    for row in rows {
+        crate::tools::print_above_prompt(format!(
+            "{}\n",
+            crate::worker::pane_row(crate::worker::PANE_NO_LABEL, row)
+        ));
+    }
+    current.tail = next;
     true
 }
 
@@ -6764,6 +6796,8 @@ fn cycle_worker(session: &mut Session) -> bool {
     // freshly-drawn interactive prompt (the "prompt doesn't always show after
     // Shift-Tab" bug). Aborting the tasks here also un-hides the cursor.
     crate::worker::quiesce_thinking_spinners();
+    // Retire the previous pane's durable tail before any screen wipe/replay.
+    *session.attached_durable.lock().unwrap() = None;
     // All coordinators this session launched, in listing order — LIVE and
     // TERMINAL — paired with a `terminal` flag so the attach branch can choose
     // review-mode vs live-stream. Shift-Tab rotates through finished/failed
@@ -6919,6 +6953,7 @@ fn cycle_worker_live(
     workers: &crate::worker::WorkerJobs,
     attached: &Arc<Mutex<Option<String>>>,
     review: &Arc<Mutex<Option<String>>>,
+    durable: &Arc<Mutex<Option<crate::activity_log::DurableAttach>>>,
     show_worker_output: &Arc<AtomicBool>,
     goal: Option<&crate::goal::Handle>,
 ) {
@@ -6954,6 +6989,7 @@ fn cycle_worker_live(
     let ids = attach_rotation_ids(&worker_ids, goal_active);
     let current = attached.lock().unwrap().clone();
     let next_idx = next_attach_index(&ids, current.as_deref());
+    *durable.lock().unwrap() = None;
     if next_idx == 0 {
         *attached.lock().unwrap() = None;
         *review.lock().unwrap() = None;
@@ -13128,6 +13164,75 @@ mod tests {
     }
 
     // ---- Shift-Tab worker cycle (next_attach_index) ---------------------
+    #[test]
+    fn shift_tab_clears_durable_tail_when_returning_to_interactive() {
+        let mut session = Session::new().unwrap();
+        *session.attached.lock().unwrap() = Some("w_remote".into());
+        *session.attached_durable.lock().unwrap() = Some(crate::activity_log::DurableAttach {
+            run_id: "w_remote".into(),
+            tail: Default::default(),
+        });
+        cycle_worker(&mut session);
+        assert!(session.attached.lock().unwrap().is_none());
+        assert!(session.attached_durable.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn midturn_shift_tab_clears_durable_tail() {
+        let session = Session::new().unwrap();
+        *session.attached.lock().unwrap() = Some("w_remote".into());
+        *session.attached_durable.lock().unwrap() = Some(crate::activity_log::DurableAttach {
+            run_id: "w_remote".into(),
+            tail: Default::default(),
+        });
+        cycle_worker_live(
+            &session.worker_jobs,
+            &session.attached,
+            &session.attach_review_announced,
+            &session.attached_durable,
+            &session.show_worker_output,
+            None,
+        );
+        assert!(session.attached.lock().unwrap().is_none());
+        assert!(session.attached_durable.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn durable_rows_from_a_retired_pane_are_discarded() {
+        let before = crate::activity_log::DurableAttach {
+            run_id: "w_old".into(),
+            tail: Default::default(),
+        };
+        let durable = Arc::new(Mutex::new(None));
+        let rows = vec!["stale worker output".to_string()];
+        assert!(!forward_durable_rows(&durable, &before, before.tail, &rows));
+
+        *durable.lock().unwrap() = Some(crate::activity_log::DurableAttach {
+            run_id: "w_new".into(),
+            tail: Default::default(),
+        });
+        assert!(!forward_durable_rows(&durable, &before, before.tail, &rows));
+        assert_eq!(durable.lock().unwrap().as_ref().unwrap().run_id, "w_new");
+
+        // A fresh backfill of the SAME run advances its cursor. An older tick
+        // must neither replay stale rows nor rewind that replacement cursor.
+        let dir = std::env::temp_dir().join(format!("aish-tail-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            crate::activity_log::log_path_in(&dir, "w_old"),
+            "new rows\n",
+        )
+        .unwrap();
+        let newer = crate::activity_log::ActivityTail::at_end_in(&dir, "w_old");
+        std::fs::remove_dir_all(&dir).unwrap();
+        *durable.lock().unwrap() = Some(crate::activity_log::DurableAttach {
+            run_id: before.run_id.clone(),
+            tail: newer,
+        });
+        assert!(!forward_durable_rows(&durable, &before, before.tail, &rows));
+        assert_eq!(durable.lock().unwrap().as_ref().unwrap().tail, newer);
+    }
+
     /// Build an ordered id list the way `cycle_worker` collects live workers.
     fn ids(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()

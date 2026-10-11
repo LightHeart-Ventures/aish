@@ -2135,8 +2135,8 @@ pub fn reading_line() -> bool {
 ///
 /// The INPUT row lives in the footer, OUTSIDE the DECSTBM region, so parking the
 /// line editor there takes the cursor out of the transcript — and something has
-/// to remember where the transcript left off. This is that memory: refreshed by
-/// a bounded DSR probe on each [`park_input_row`], advanced by every
+/// to remember where the transcript left off. A fresh prompt anchors writes at
+/// the body's bottom row; this memory is advanced by every
 /// [`print_in_body`] write, and clamped into the live body on read (a resize can
 /// shrink the body under a stale value).
 static BODY_ROW: AtomicU16 = AtomicU16::new(0);
@@ -2170,10 +2170,10 @@ fn body_cursor_row(layout: &FooterLayout) -> u16 {
 /// Called immediately before the editor blocks on a read. Two effects:
 /// 1. the prompt string is cached in `LAST_PROMPT`, which is what makes the input
 ///    row unconditional — the footer can repaint it in ANY state;
-/// 2. the transcript cursor is remembered (one bounded DSR probe, same mechanism
-///    and the same opt-out as [`query_cursor_row`]'s other caller) and the cursor
-///    is moved to the cleared input row, so rustyline renders the live buffer
-///    there.
+/// 2. transcript writes are anchored to the bottom of the body, and the cursor
+///    moves to the cleared input row so rustyline renders the live buffer there.
+///    This path must not read stdin: a cursor-position probe would consume keys
+///    typed during a Shift-Tab/attach transition before the editor sees them.
 ///
 /// No-ops when no footer is installed: off-tty, in a short window, or before the
 /// region is enabled the editor prints inline exactly as it always did.
@@ -2189,9 +2189,7 @@ pub fn park_input_row(prompt: &str) {
     }
     let Some(layout) = live_layout() else { return };
     let Some(row) = layout.input_row else { return };
-    if let Some(body) = query_cursor_row() {
-        BODY_ROW.store(body.clamp(1, layout.body_bottom), Ordering::Relaxed);
-    }
+    BODY_ROW.store(layout.body_bottom, Ordering::Relaxed);
     let mut out = std::io::stdout();
     let _ = write!(out, "\x1b[{row};1H\x1b[2K");
     let _ = out.flush();
@@ -2352,7 +2350,44 @@ mod tests {
             ACTIVE.store(false, Ordering::Relaxed);
             return;
         }
+        run_pty_test("hint_tray_repaint_completes_on_tty", CHILD, None);
+    }
 
+    #[test]
+    fn attach_return_preserves_pending_input() {
+        const CHILD: &str = "AISH_TEST_ATTACH_INPUT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            use crate::editor::{LineEditor, ReadOutcome, RustylineEditor};
+            let mut term = Terminal::detect().expect("PTY required");
+            term.init_scroll_region();
+            open_attach_view();
+            close_attach_view();
+            let helper = crate::repl::AishHelper::new(
+                std::env::temp_dir(),
+                String::new(),
+                std::sync::Arc::new(std::collections::HashMap::new()),
+            );
+            let mut editor = RustylineEditor::new(
+                helper,
+                std::env::temp_dir().join("aish-input-test-unused-history"),
+            )
+            .unwrap();
+            // Input queued during the view transition must reach rustyline,
+            // even when this terminal never answers a cursor-position query.
+            match editor.read_line("returned> ") {
+                ReadOutcome::Line(line) => assert_eq!(line, "hello"),
+                _ => panic!("input did not reach the editor"),
+            }
+            return;
+        }
+        run_pty_test(
+            "attach_return_preserves_pending_input",
+            CHILD,
+            Some(b"hello\r"),
+        );
+    }
+
+    fn run_pty_test(name: &str, child_env: &str, input: Option<&[u8]>) {
         // Exercise the real ioctl + repaint path in an isolated process. A pipe
         // would return before the nested lock, hiding the regression. Bound the
         // wait so a deadlock fails the test instead of hanging the entire suite.
@@ -2380,15 +2415,30 @@ mod tests {
             0
         );
         // SAFETY: openpty returned fresh, owned file descriptors.
-        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
         let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        if let Some(input) = input {
+            use std::os::fd::AsRawFd;
+            // Queue keystrokes before the child parks the editor. Raw mode
+            // prevents echo and canonical buffering from masking input loss.
+            let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut attrs) }, 0);
+            unsafe { libc::cfmakeraw(&mut attrs) };
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attrs) },
+                0
+            );
+            master.write_all(input).unwrap();
+        }
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "terminal::tests::hint_tray_repaint_completes_on_tty",
+                &format!("terminal::tests::{name}"),
                 "--nocapture",
             ])
-            .env(CHILD, "1")
+            .env(child_env, "1")
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave))
             .spawn()
             .unwrap();
@@ -2415,7 +2465,7 @@ mod tests {
         let bytes = reader.join().unwrap();
         assert!(
             status.is_some_and(|s| s.success()),
-            "tray repaint hung or failed: {}",
+            "PTY test {name} hung or failed: {}",
             String::from_utf8_lossy(&bytes)
         );
     }
