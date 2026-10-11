@@ -15,10 +15,10 @@
 //! footer by [`row_count`] rows and `footer_seq` paints:
 //!
 //! ```text
-//!   🚀 escalated → w_a7k3m2 · build and open pr  <- stable identity, never flickers
-//!      ⠹ ♥ 1m12s · 🔧 read_file …               <- spinner + heart + worker status
-//!   🚀 escalated → w_b2c9f1 · audit the deps     <- a SECOND live escalation
-//!      ⠧ ♥ 18s · 🔧 grep_files                  <- …its own spinner, heart, status
+//!   🚀 w_a7k3m2 · build and open pr  <- stable identity, never flickers
+//!      ♥ 1m12s · 🔧 read_file …               <- pulsing heart + worker status
+//!   🚀 w_b2c9f1 · audit the deps     <- a SECOND live escalation
+//!      ♥ 18s · 🔧 grep_files                  <- …its own heart and status
 //!   ─────────────────────────────────────────   <- separator (the statusline lid)
 //!   ⇄ detached — back to interactive …           <- SecondStatusLine
 //!   aish v0.9 · sonnet …           12:04:51      <- statusline
@@ -46,56 +46,13 @@
 //! [`crate::terminal::FooterLayout`] additionally drops whole banners (newest
 //! kept) on a window too short to hold them all.
 //!
-//! ANIMATION — IDENTITY AND MOTION ARE SEPARATE CELLS. The head row's glyph is
-//! the banner's IDENTITY and it does not move: a fixed [`LIVE_GLYPH`] (`🚀`,
-//! the same rocket the body's launch notice prints, so the operator can key the
-//! pinned banner to the line that announced it) while the coordinator works,
-//! frozen to ✅/⚠️ once it reaches a terminal state. The MOTION lives one row
-//! down, in the status row's prefix cell, as a [`SPIN_FRAMES`] braille frame on
-//! a [`FRAME_MS`] cadence.
-//!
-//! That split is deliberate, and it is a FIX. The head glyph used to animate
-//! through four unrelated pictographs (`🚀 🛸 🌠 ✨`), which the eye reads not as
-//! one thing moving but as the thing CHANGING INTO a different thing four times
-//! a second — identity flicker, not animation — while strobing four dominant
-//! hues (orange → grey → blue → yellow) through an otherwise dim/cyan footer,
-//! out-shouting the heart beside it, which is the glyph that actually carries
-//! information. It also leaked width: `✨` (U+2728) is `East_Asian_Width=Wide`
-//! in the Unicode table but is routinely drawn single-column by fallback
-//! monospace fonts, so the text after it jittered on real terminals even though
-//! the width guard passed. Braille (U+28xx) is unambiguously one column
-//! everywhere, carries no colour of its own, and — crucially — ADJACENT FRAMES
-//! DIFFER BY ONE DOT, which is what makes a cycle read as rotation instead of
-//! replacement. It is also the frame set every other spinner in aish already
-//! uses (`engine`'s thinking + tool spinners, `update`, `worker`); the escalation
-//! banner was the lone site with a bespoke emoji slideshow.
-//!
-//! Putting the spinner in the status row also puts it directly beside the heart,
-//! so the two liveness signals the LIVENESS note below describes — "the UI is
-//! repainting" and "the WORKER is alive" — now sit in one glance instead of on
-//! separate rows. The cadence is unchanged, so the footer heartbeat's wake rate
-//! and repaint cost are exactly what they were.
-//!
-//! The frame is a PURE function of elapsed time ([`frame_at`]), so every repaint
-//! path (idle heartbeat, mid-turn draw, resize) lands on the same frame without
-//! any shared animation cursor. Each banner animates off its OWN pin clock, so
-//! two escalations started seconds apart visibly tick independently. A finished
-//! banner drops the spinner for a static `↳` — motion means "still working".
-//!
-//! LIVENESS. The animation only proves the SHELL is still repainting — it keeps
-//! cycling just as happily when the coordinator behind it is wedged, rate-limited
-//! or dead, which makes a moving glyph the most confident lie the footer can
-//! tell. So each status row also carries a traffic-light HEART fed by that
-//! coordinator's own DURABLE heartbeat (`coordinator_runs.heartbeat_at`, written
-//! every 30s): green `♥` while the beat is current, yellow after ONE missed beat,
-//! red after two or more, and a dim hollow `♡` when no beat is on record yet
-//! ([`crate::style::heartbeat_heart`]). Two independent signals in one block:
-//! motion = the UI is live, heart = the WORKER is live. The REPL polls the store
-//! on a throttle and hands each banner its absolute timestamp via [`set_beat`];
-//! the age (and therefore the colour) is derived on every paint, so a worker
-//! that stops beating goes yellow then red on its own without further polling.
-//! Like every other mutator, the beat is ID-SCOPED: each banner shows its OWN
-//! worker's liveness.
+//! ANIMATION AND LIVENESS. The head row keeps its static rocket identity.
+//! The status row uses one heart for both the heartbeat animation and worker
+//! liveness. A current durable heartbeat pulses the heart's intensity twice
+//! per cycle; missed beats remain static yellow/red with their age, and an
+//! unknown beat stays hollow. The pulse never changes glyph width or colour.
+//! Each banner uses its own elapsed clock and durable heartbeat timestamp.
+//! Plain output keeps the heart without animation escape sequences.
 //!
 //! LIFECYCLE. [`pin`] on escalation, [`set_status`] on every footer paint (the
 //! REPL owns the worker list, so it composes each status row), [`note_terminal`]
@@ -130,27 +87,10 @@ pub const MAX_PINNED: usize = 32;
 /// [`crate::activity_summary::ESCALATION_HEAD_CHROME`] budgets for.
 pub const LIVE_GLYPH: &str = "🚀";
 
-/// Prefix glyph for a FINISHED banner's status row — the spinner's resting
-/// state. Motion is reserved for live work, so a terminal banner shows this
-/// static elbow instead. One column, same as a braille frame, so the row's width
-/// accounting is identical either way.
+/// Static prefix for a finished banner's status row.
 pub const IDLE_PREFIX: &str = "↳";
 
-/// Motion frames for the status row's prefix cell — the canonical aish spinner
-/// set, shared verbatim with `engine`'s thinking + tool spinners, `update`, and
-/// `worker`. Braille (U+28xx) is unambiguously ONE column in every terminal
-/// (unlike the pictographs this replaced), carries no colour of its own so it
-/// can't out-shout the heart beside it, and differs by a single dot between
-/// adjacent frames — which is what makes the cycle read as one glyph ROTATING
-/// rather than four glyphs taking turns. Pinned by `frames_are_uniform_width`.
-pub const SPIN_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Milliseconds per animation frame. ~4.5 fps, UNCHANGED from the emoji cycle it
-/// replaced: this also sets the footer heartbeat's wake rate (see
-/// `terminal::spawn_footer_heartbeat`, which sleeps `FRAME_MS.min(500)`), so
-/// holding it fixed keeps the idle repaint cost exactly where it was while the
-/// one-dot-per-frame braille delta does the perceptual work a faster cadence
-/// would otherwise have had to buy.
+/// Pulse frame cadence; the footer repaint task uses this same interval.
 pub const FRAME_MS: u64 = 220;
 
 /// How long a FINISHED escalation stays pinned before its banner retires and the
@@ -215,22 +155,13 @@ static BANNERS: Mutex<Vec<Banner>> = Mutex::new(Vec::new());
 /// REFRESHES that banner in place — same task hint, clocks reset, verdict
 /// cleared — so a retry can't stack a duplicate row for one coordinator.
 /// A pinned banner steals two body rows from the scrolling region. The STORE
-/// mutation is [`push_banner`]; it runs inside
-/// [`crate::terminal::absorb_banner_growth_around`], which measures the row
-/// demand on both sides and scrolls the body out of the rows the footer is about
-/// to claim, walking the cursor back up with it. Without that, the cursor is
-/// left sitting INSIDE the new tray rows and the next body write — the animated
-/// `thinking…` row above all — paints over the banner, so "thinking" bleeds into
-/// the tray.
-///
-/// The measure → mutate → measure → scroll transition is atomic against footer
-/// paints (the terminal side holds its boundary lock across the closure), so a
-/// heartbeat repaint cannot install the shorter region mid-transition. Both
-/// `row_count` and `push_banner` take the `BANNERS` lock themselves and are
-/// called from OUTSIDE it here, so the terminal write never happens while this
-/// module's stack is held — and the lock order stays `FOOTER_PAINT` → `BANNERS`.
+/// mutation is [`push_banner`]; [`crate::terminal::repaint_escalation_around`]
+/// reconciles the installed body/tray layout and paints the new rows under the
+/// footer boundary lock. The transcript moves before tray cells are claimed,
+/// including while the operator edits the separate input row. Lock order is
+/// `FOOTER_PAINT` → `BANNERS`, so this wrapper runs outside the banner lock.
 pub fn pin(id: &str, task: &str) {
-    crate::terminal::absorb_banner_growth_around(row_count, || push_banner(id, task));
+    crate::terminal::repaint_escalation_around(|| push_banner(id, task));
 }
 
 fn push_banner(id: &str, task: &str) {
@@ -281,20 +212,24 @@ fn push_banner(id: &str, task: &str) {
 /// pinned, and an id that isn't pinned is a silent no-op (closing a plain
 /// `:dispatch` worker that never escalated must not disturb the tray).
 pub fn unpin(id: &str) -> bool {
-    let Ok(mut banners) = BANNERS.lock() else {
-        return false;
-    };
-    let before = banners.len();
-    banners.retain(|b| b.id != id);
-    banners.len() != before
+    crate::terminal::repaint_escalation_around(|| {
+        let Ok(mut banners) = BANNERS.lock() else {
+            return false;
+        };
+        let before = banners.len();
+        banners.retain(|b| b.id != id);
+        banners.len() != before
+    })
 }
 
 /// Retire EVERY banner (the footer shrinks back on the next paint).
 #[allow(dead_code)] // completes the BANNERS push/remove/clear API; no caller wired yet.
 pub fn clear() {
-    if let Ok(mut banners) = BANNERS.lock() {
-        banners.clear();
-    }
+    crate::terminal::repaint_escalation_around(|| {
+        if let Ok(mut banners) = BANNERS.lock() {
+            banners.clear();
+        }
+    });
 }
 
 /// True while ANY banner is pinned — the gate
@@ -386,11 +321,21 @@ pub fn sweep() {
     }
 }
 
-/// The status row's spinner frame for a given elapsed time. Pure, so every
-/// repaint path (heartbeat, mid-turn draw, resize) derives the SAME frame from
-/// the clock instead of sharing a mutable cursor.
-pub fn frame_at(elapsed_ms: u64) -> &'static str {
-    SPIN_FRAMES[(elapsed_ms / FRAME_MS) as usize % SPIN_FRAMES.len()]
+/// A double pulse in the heart's intensity, only while the worker beat is
+/// current. Keep stale/unknown hearts static so UI motion cannot imply liveness.
+fn animated_heart(elapsed_ms: u64, beat_age_secs: Option<i64>, color_on: bool) -> String {
+    let heart = crate::style::heartbeat_heart(beat_age_secs, color_on);
+    let healthy = beat_age_secs.is_some_and(|age| crate::style::missed_heartbeats(age) == 0);
+    if color_on && healthy {
+        let intensity = if matches!((elapsed_ms / FRAME_MS) % 5, 0 | 2) {
+            "1"
+        } else {
+            "22"
+        };
+        format!("\x1b[{intensity}m{heart}\x1b[22m")
+    } else {
+        heart
+    }
 }
 
 /// Drop ANSI SGR/CSI sequences. The status row is composed from the worker's
@@ -455,22 +400,10 @@ pub fn one_line(text: &str, max: usize) -> String {
 /// identity, the status text, and the terminal verdict, so the rendering is
 /// unit-testable without touching the global stack or a TTY.
 ///
-/// Returns `(escalation_row, status_row)`. The escalation row leads with the
-/// STATIC identity glyph ([`LIVE_GLYPH`] live, ✅/⚠️ terminal); the status row is
-/// indented under it and leads with the ANIMATED [`SPIN_FRAMES`] cell while the
-/// coordinator works, falling back to a static [`IDLE_PREFIX`] elbow once it
-/// finishes. Both prefixes are one column, so the row width is identical either
-/// way — see the ANIMATION note in the module docs for why identity and motion
-/// are separate cells.
-///
-/// `beat_age_secs` is the age of the coordinator's last DURABLE heartbeat, which
-/// renders as the traffic-light heart (green beating / yellow one missed / red
-/// two or more — [`crate::style::heartbeat_heart`]) in a fixed position right
-/// after the prefix cell, so the spinner and the heart sit side by side. The
-/// spinner only proves the SHELL is repainting; the
-/// heart is the independent evidence that the WORKER is alive. A terminal banner
-/// renders no heart — the ✅/⚠️ verdict already settles liveness, and a second
-/// indicator there would just echo it.
+/// Returns `(escalation_row, status_row)`. The header carries a static identity
+/// glyph, short worker ID and task. The status starts with a single liveness
+/// heart: current beats pulse, missed beats show their age and colour, unknown
+/// beats stay hollow. Finished banners use the static [`IDLE_PREFIX`] instead.
 pub fn render(
     elapsed_ms: u64,
     id: &str,
@@ -492,30 +425,18 @@ pub fn render(
     let short = crate::batch::short_id(id);
     let hint = one_line(task, TASK_HINT_MAX);
     let head = if hint.is_empty() {
-        format!("{glyph} escalated → {short}")
+        format!("{glyph} {short}")
     } else {
-        format!("{glyph} escalated → {short} · {hint}")
+        format!("{glyph} {short} · {hint}")
     };
     let top = paint_with(&head, Color::Cyan, color_on);
-    // The heart is painted on its own (green/yellow/red) and spliced between two
-    // dim segments, so the liveness colour survives while the rest of the row
-    // stays recessive.
-    let heart = match terminal {
-        None => format!(
-            "{} ",
-            crate::style::heartbeat_heart(beat_age_secs, color_on)
-        ),
-        Some(_) => String::new(),
-    };
-    // MOTION: a live banner spins its prefix cell; a finished one rests on the
-    // static elbow. Both are one column, so `ESCALATION_STATUS_CHROME` holds.
-    let prefix = match terminal {
-        None => frame_at(elapsed_ms),
-        Some(_) => IDLE_PREFIX,
+    let indicator = match terminal {
+        None => animated_heart(elapsed_ms, beat_age_secs, color_on),
+        Some(_) => paint_with(IDLE_PREFIX, Color::Dim, color_on),
     };
     let bottom = format!(
-        "{}{heart}{}",
-        paint_with(&format!("   {prefix} "), Color::Dim, color_on),
+        "{}{indicator} {}",
+        paint_with("   ", Color::Dim, color_on),
         paint_with(
             &format!(
                 "{} · {}",
@@ -594,75 +515,34 @@ mod tests {
     }
 
     #[test]
-    fn frames_are_uniform_width() {
-        // Every motion frame must occupy the SAME number of columns, or the text
-        // after it jitters left/right on each tick. Braille is one column in
-        // every terminal — the pictographs this replaced were only *nominally*
-        // 2-wide (`✨` is East-Asian Wide in the table but routinely drawn
-        // single-column by fallback fonts), which is why the old guard passed
-        // while the real footer still shifted.
-        for f in SPIN_FRAMES {
-            assert_eq!(f.width(), 1, "spin frame {f:?} is not 1 column wide");
+    fn heart_pulses_without_changing_width_colour_or_head_identity() {
+        let at = |ms| render(ms, "w_1", "build it", "coordinating", None, Some(0), true);
+        let (head, bright) = at(0);
+        let (next_head, quiet) = at(FRAME_MS);
+        assert_eq!(head, next_head);
+        assert_ne!(bright, quiet);
+        assert!(bright.contains("\x1b[1m"));
+        assert!(quiet.contains("\x1b[22m"));
+        for row in [&bright, &quiet] {
+            let plain = strip_ansi(row);
+            assert!(plain.starts_with("   ♥ "), "{plain}");
+            assert_eq!(plain.matches('♥').count(), 1);
+            assert!(
+                !plain
+                    .chars()
+                    .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+            );
+            assert!(row.contains(crate::style::Color::Green.code()));
         }
-        // The resting prefix shares the spinner's cell, so swapping between them
-        // on a terminal transition must not move the text after it.
-        assert_eq!(IDLE_PREFIX.width(), 1);
-        // The head row's identity glyph is what ESCALATION_HEAD_CHROME budgets
-        // 2 columns for.
-        assert_eq!(LIVE_GLYPH.width(), 2);
-    }
-
-    #[test]
-    fn frame_advances_on_cadence_and_wraps() {
-        assert_eq!(frame_at(0), SPIN_FRAMES[0]);
-        assert_eq!(frame_at(FRAME_MS - 1), SPIN_FRAMES[0]);
-        assert_eq!(frame_at(FRAME_MS), SPIN_FRAMES[1]);
-        assert_eq!(frame_at(FRAME_MS * 3), SPIN_FRAMES[3]);
-        // Wraps cleanly — a long-running escalation keeps animating forever.
-        let n = SPIN_FRAMES.len() as u64;
-        assert_eq!(frame_at(FRAME_MS * n), SPIN_FRAMES[0]);
-        assert_eq!(frame_at(FRAME_MS * (n + 1)), SPIN_FRAMES[1]);
-    }
-
-    #[test]
-    fn head_glyph_is_stable_and_motion_lives_in_the_status_row() {
-        // THE regression this split fixes: the head glyph used to cycle four
-        // unrelated pictographs, so the banner's identity changed 4×/sec. It must
-        // now be the SAME glyph at every point in the animation cycle, with the
-        // motion carried one row down.
-        let at = |ms| {
-            render(
-                ms,
-                "w_abcdef123456",
-                "build it",
-                "coordinating",
-                None,
-                Some(0),
-                false,
-            )
-        };
-        let (a_top, a_bot) = at(0);
-        let (b_top, b_bot) = at(FRAME_MS);
-        let (c_top, _) = at(FRAME_MS * 7);
-
-        assert!(a_top.starts_with(LIVE_GLYPH), "{a_top}");
-        assert!(b_top.starts_with(LIVE_GLYPH), "{b_top}");
-        assert!(c_top.starts_with(LIVE_GLYPH), "{c_top}");
-        // No stray pictograph from the old slideshow survives on the head row.
-        for stale in ["🛸", "🌠", "✨"] {
-            assert!(!a_top.contains(stale), "stale frame {stale} in {a_top}");
+        assert_eq!("♥".width(), "♡".width());
+        for age in [None, Some(50), Some(300)] {
+            assert_eq!(
+                animated_heart(0, age, true),
+                animated_heart(FRAME_MS, age, true)
+            );
         }
-
-        // …and the status row DOES move, on the same cadence.
-        assert!(
-            a_bot.starts_with(&format!("   {} ", SPIN_FRAMES[0])),
-            "{a_bot}"
-        );
-        assert!(
-            b_bot.starts_with(&format!("   {} ", SPIN_FRAMES[1])),
-            "{b_bot}"
-        );
-        assert_ne!(a_bot, b_bot, "the status row must animate");
+        assert_eq!(animated_heart(0, Some(0), false), "♥");
+        assert_eq!(animated_heart(FRAME_MS, Some(0), false), "♥");
     }
 
     #[test]
@@ -697,10 +577,8 @@ mod tests {
             bad_bot.starts_with(&format!("   {IDLE_PREFIX} ")),
             "{bad_bot}"
         );
-        // And no spin frame leaks into a frozen row at any point in the cycle.
-        for f in SPIN_FRAMES {
-            assert!(!ok_bot.contains(f), "{ok_bot}");
-        }
+        assert!(!ok_bot.contains('♥'));
+        assert!(!bad_bot.contains('♥'));
     }
 
     #[test]
@@ -721,11 +599,8 @@ mod tests {
         );
         // Internal whitespace/newlines collapse so the hint can't wrap the footer.
         assert!(top.contains("build and open pr"), "{top}");
-        // The status row is indented under the message, led by the spinner cell.
-        assert!(
-            bottom.starts_with(&format!("   {} ", frame_at(0))),
-            "{bottom}"
-        );
+        // The status row is indented under the message, led by one heart.
+        assert!(bottom.starts_with("   ♥ "), "{bottom}");
         assert!(bottom.contains("coordinating · 1m12s"), "{bottom}");
     }
 
@@ -755,7 +630,7 @@ mod tests {
         let painted = rows(false, MAX_VISIBLE);
         assert_eq!(painted.len(), 1);
         let (top, bottom) = &painted[0];
-        assert!(top.contains("escalated"), "{top}");
+        assert!(!top.contains("escalated →"), "{top}");
         // Fresh banners state the pre-start truth rather than inventing progress.
         assert!(bottom.contains("queued"), "{bottom}");
 
@@ -981,12 +856,10 @@ mod tests {
 
     #[test]
     fn status_row_carries_the_liveness_heart() {
-        // The heart sits in a FIXED position right after the spinner cell, so the
-        // two liveness signals (UI repainting / worker beating) read as one
-        // glance. Healthy = bare glyph; a missed beat appends the age.
-        let spin = frame_at(0);
+        // The heart is the only liveness indicator. Healthy = bare glyph;
+        // a missed beat appends the age.
         let (_, fresh) = render(0, "w_1", "t", "coordinating", None, Some(3), false);
-        assert!(fresh.starts_with(&format!("   {spin} ♥ ")), "{fresh}");
+        assert!(fresh.starts_with("   ♥ "), "{fresh}");
         assert!(
             !fresh.contains("♥ 3s"),
             "healthy heart must stay quiet: {fresh}"
@@ -1003,7 +876,7 @@ mod tests {
 
         // No beat on record yet → hollow heart, no liveness claim.
         let (_, unknown) = render(0, "w_1", "t", "coordinating", None, None, false);
-        assert!(unknown.starts_with(&format!("   {spin} ♡ ")), "{unknown}");
+        assert!(unknown.starts_with("   ♡ "), "{unknown}");
 
         // The runtime and status still follow the heart, in that order.
         assert!(fresh.contains("0s · coordinating"), "{fresh}");

@@ -88,24 +88,23 @@ pub const WORKERS_ROW_CHROME: usize = 46;
 
 /// Fixed width of the escalation banner's head row.
 ///
-/// Mirrors `escalation::render`: `{glyph:2} escalated → {short:8} · ` — 2 glyph
-/// + 13 (` escalated → `) + 8 (`crate::batch::short_id`) + 3 (` · `) = 26.
+/// Mirrors `escalation::render`: `{glyph:2} {short:8} · ` — 2 glyph
+/// + 1 space + 8 (`crate::batch::short_id`) + 3 (` · `) = 14.
 ///
 /// The glyph is `escalation::LIVE_GLYPH` (`🚀`) while the coordinator works and
 /// ✅/⚠️ once it finishes — all 2 columns, and all STATIC. The banner's motion
 /// lives in the status row below (see [`ESCALATION_STATUS_CHROME`]), so nothing
 /// on this row changes width mid-animation.
-pub const ESCALATION_HEAD_CHROME: usize = 26;
+pub const ESCALATION_HEAD_CHROME: usize = 14;
 
 /// Fixed width of the escalation banner's indented status row.
 ///
 /// Mirrors `escalation::render`: `   {prefix} {elapsed} · ` — 3 indent
 /// + 2 (prefix + space) + 8 (`1h02m12s` worst case) + 3 (` · `) = 16.
 ///
-/// The prefix cell is this banner's ANIMATION: a 1-column `escalation::
-/// SPIN_FRAMES` braille frame while the coordinator works, swapping to the
-/// static 1-column `escalation::IDLE_PREFIX` elbow (`↳`) once it finishes. Both
-/// states are one column wide, so this constant holds through the whole cycle.
+/// The prefix is a pulsing one-column liveness heart, or the static
+/// `escalation::IDLE_PREFIX` elbow (`↳`) once finished. Missed beats may append
+/// their age; both glyphs hold their width throughout the pulse.
 pub const ESCALATION_STATUS_CHROME: usize = 16;
 
 /// Floor for the summary budget. Below this a summary can't carry a verb plus an

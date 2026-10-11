@@ -108,6 +108,9 @@ pub struct FooterLayout {
     /// Rows granted to the pinned escalation block — always a whole multiple of
     /// [`crate::escalation::ROWS_PER_BANNER`].
     pub banner_rows: u16,
+    /// Blank row separating pinned tray output from the scrolling text.
+    /// Always present while any tray item is visible.
+    pub spacer_row: Option<u16>,
     /// Rows granted to the `:`-command HINT TRAY, which stacks directly above
     /// the rule and directly BELOW the escalation block. `0` whenever no
     /// `:`-palette is open (the overwhelmingly common case) or a short window
@@ -165,7 +168,8 @@ impl FooterLayout {
                 + u16::from(sep)
                 + u16::from(msg)
                 + u16::from(bar)
-                + u16::from(input);
+                + u16::from(input)
+                + u16::from(banner_rows > 0 || hint_rows > 0);
             if h <= budget {
                 break h;
             }
@@ -227,12 +231,19 @@ impl FooterLayout {
         debug_assert!(
             hint_rows == 0
                 || sep_row.map(|r| r - hint_rows)
-                    == Some(rows.saturating_sub(height.saturating_sub(1)).max(1) + banner_rows),
+                    == Some(
+                        rows.saturating_sub(height.saturating_sub(1)).max(1)
+                            + u16::from(banner_rows > 0 || hint_rows > 0)
+                            + banner_rows
+                    ),
             "hint tray must pack flush between the banners and the rule ({rows} rows)"
         );
+        let spacer_row =
+            (banner_rows > 0 || hint_rows > 0).then_some(rows.saturating_sub(height) + 1);
         Self {
             rows,
             height,
+            spacer_row,
             banner_rows,
             hint_rows,
             sep_row,
@@ -421,7 +432,7 @@ pub fn hint_tray_capacity() -> Option<usize> {
     // cap. `max(1)` so a tray that exists is never zero rows tall.
     let fits = rows
         .saturating_sub(MIN_BODY_ROWS)
-        .saturating_sub(FOOTER_ROWS);
+        .saturating_sub(FOOTER_ROWS + 1);
     Some(fits.min((rows / HINT_TRAY_MAX_FRACTION).max(1)) as usize)
 }
 
@@ -502,6 +513,7 @@ pub struct TrayDelta {
 /// way up are `release` rows pushed back on the way down. Treating the shrink
 /// as "just clear some rows" is what left the body stranded N rows above the
 /// rule after a palette retired.
+#[cfg(test)]
 pub fn hint_tray_delta(
     rows: u16,
     want_banner_rows: u16,
@@ -552,63 +564,8 @@ fn tray_reglue_seq(region_bottom: u16, release: u16) -> String {
 /// transient menu is worth a few rows of already-scrolled transcript, and the
 /// alternative (full-screen scroll for scrollback's sake) would move the
 /// editor's line and desync rustyline.
-fn repaint_hint_tray(prev_rows: u16) {
-    // Hold the boundary lock for the whole operation so a banner pinning on
-    // another thread cannot slip between this scroll and the paint that follows.
-    let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((rows, _cols)) = term_size() else {
-        return;
-    };
-    let want_banners = if crate::escalation::active() {
-        crate::escalation::row_count()
-    } else {
-        0
-    };
-    let delta = hint_tray_delta(rows, want_banners, prev_rows, hint_tray_rows());
-    let mut seq = String::new();
-    if delta.grow > 0 {
-        seq.push_str(&format!("\x1b7\x1b[{}S\x1b8", delta.grow));
-        // The transcript just moved up with it, so the remembered body row
-        // has to move too or the next `print_in_body` overwrites live text.
-        let cur = BODY_ROW.load(Ordering::Relaxed);
-        if cur > 0 {
-            BODY_ROW.store(cur.saturating_sub(delta.grow).max(1), Ordering::Relaxed);
-        }
-    }
-    if delta.clear_to > delta.clear_from {
-        // A shrinking tray hands rows back to the body; wipe the menu text
-        // off them or it lingers above the rule looking like output.
-        seq.push_str("\x1b7");
-        for row in delta.clear_from..delta.clear_to {
-            seq.push_str(&format!("\x1b[{row};1H\x1b[2K"));
-        }
-        seq.push_str("\x1b8");
-    }
-    if delta.release > 0 {
-        // Mirror image of the `SU` above: the retiring tray handed rows back,
-        // so scroll the transcript DOWN into them. Without this the body
-        // stays parked where the grow left it and every later write — the
-        // echo of the operator's own input included — lands `release` rows
-        // above the rule with a blank band beneath it (the "my input appears
-        // a dozen lines above the separator" report). The tray grows and
-        // retires on ordinary `:`-keystrokes, so the drift accumulates.
-        seq.push_str(&tray_reglue_seq(delta.body_bottom, delta.release));
-        let cur = BODY_ROW.load(Ordering::Relaxed);
-        if cur > 0 {
-            BODY_ROW.store(
-                cur.saturating_add(delta.release).min(delta.body_bottom),
-                Ordering::Relaxed,
-            );
-        }
-    }
-    if !seq.is_empty() {
-        let mut out = std::io::stdout();
-        let _ = write!(out, "{seq}");
-        let _ = out.flush();
-    }
-    // Re-asserts the region at the NEW height and paints every zone, tray
-    // included, from cached content.
-    paint_cached_footer_locked(false, &_boundary);
+fn repaint_hint_tray(_prev_rows: u16) {
+    paint_cached_footer(false);
 }
 
 /// What to paint on the INPUT row, or `None` to LEAVE THE ROW ALONE.
@@ -921,7 +878,7 @@ pub fn set_reading_line(reading: bool) {
 
 /// Serializes the two writers that can move the body/footer boundary: the
 /// heartbeat's cached repaint ([`paint_cached_footer`]) and the growth absorb a
-/// pinning banner performs ([`absorb_banner_growth_around`]).
+/// pinning banner performs ([`repaint_escalation_around`]).
 ///
 /// Without it the two race in the one window that matters. `escalation::pin`
 /// measures the footer's row demand, grows the store, then scrolls the body out
@@ -937,6 +894,55 @@ pub fn set_reading_line(reading: bool) {
 /// holders reach into the escalation store while holding this; nothing takes
 /// `BANNERS` first and then this.
 static FOOTER_PAINT: Mutex<()> = Mutex::new(());
+/// The layout actually installed on screen, rather than a recomputation from
+/// mutated tray state. Every production paint reconciles this before drawing.
+static INSTALLED_LAYOUT: Mutex<Option<FooterLayout>> = Mutex::new(None);
+
+fn layout_delta(before: FooterLayout, after: FooterLayout) -> TrayDelta {
+    let old_bottom = before.body_bottom.min(after.rows).max(1);
+    TrayDelta {
+        grow: old_bottom.saturating_sub(after.body_bottom),
+        release: after.body_bottom.saturating_sub(old_bottom),
+        clear_from: before.top_row().min(after.rows.saturating_add(1)),
+        clear_to: after.top_row(),
+        body_bottom: after.body_bottom,
+    }
+}
+
+/// Move the transcript before painting into claimed rows, or restore it into
+/// released rows. Input editing uses region-scoped scrolling, preserving its
+/// cursor outside the body; active body output follows the moved content.
+fn layout_transition_seq(before: FooterLayout, after: FooterLayout, editing: bool) -> String {
+    let delta = layout_delta(before, after);
+    let mut seq = String::new();
+    if delta.grow > 0 {
+        // Scroll from the old body floor, regardless of the caller's cursor.
+        // Saving before DECSTBM preserves the editor row and text column.
+        // This also handles a body cursor above existing transcript content.
+        let bottom = before.body_bottom.min(after.rows).max(1);
+        seq.push_str(&format!(
+            "\x1b7\x1b[1;{bottom}r\x1b[{bottom};1H{}\x1b8",
+            "\n".repeat(delta.grow as usize)
+        ));
+        if !editing {
+            seq.push_str(&format!("\x1b[{}A", delta.grow));
+        }
+    }
+    if delta.clear_to > delta.clear_from {
+        seq.push_str("\x1b7");
+        for row in delta.clear_from..delta.clear_to {
+            seq.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+        }
+        seq.push_str("\x1b8");
+    }
+    if delta.release > 0 {
+        seq.push_str(&tray_reglue_seq(after.body_bottom, delta.release));
+        if !editing {
+            seq.push_str(&format!("\x1b[{}B", delta.release));
+        }
+    }
+    seq
+}
 
 /// Hook the heartbeat calls immediately before a repaint so the footer's
 /// *content* can be refreshed, not just redrawn.
@@ -1026,7 +1032,7 @@ struct HeartbeatState {
 /// operator watched a worker, which is exactly when an escalation matters most.
 /// The repaint is cursor-safe either way, so attach is no longer a veto.
 /// Body-SCROLLING writes are a different matter and still skip under attach —
-/// see [`absorb_banner_growth_around`].
+/// see [`repaint_escalation_around`].
 fn heartbeat_should_paint(s: HeartbeatState) -> bool {
     // No region to paint — `suspend_footer_region` clears ACTIVE, so this also
     // covers a foreground TTY child (vim/sudo/less) owning the screen.
@@ -1135,6 +1141,10 @@ fn paint_cached_footer_locked(home_body: bool, _boundary: &MutexGuard<'_, ()>) {
     let sep = separator_line(cols, utf8, crate::style::colors_enabled());
     // footer_seq re-asserts the scroll region internally (inside its DECSC/DECRC
     // save-restore).
+    if home_body {
+        // The screen was wiped: there is no transcript or stale tray to move.
+        *INSTALLED_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     let mut buf = footer_seq(rows, cols, &sep, &msg, &bar);
     if home_body {
         // Override the restored cursor with an explicit home into the body so
@@ -1252,7 +1262,31 @@ pub fn footer_seq(
         .lock()
         .map(|t| t.clone())
         .unwrap_or_else(|e| e.into_inner().clone());
-    footer_seq_with(
+    let layout = FooterLayout::solve_with(
+        rows,
+        banners.len() as u16 * crate::escalation::ROWS_PER_BANNER,
+        hints.len() as u16,
+    );
+    let mut seq = String::new();
+    if ACTIVE.load(Ordering::Relaxed) {
+        let mut installed = INSTALLED_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(before) = *installed {
+            let editing = reading_line();
+            seq.push_str(&layout_transition_seq(before, layout, editing));
+            let delta = layout_delta(before, layout);
+            let row = BODY_ROW.load(Ordering::Relaxed);
+            if row > 0 {
+                BODY_ROW.store(
+                    row.saturating_sub(delta.grow)
+                        .saturating_add(delta.release)
+                        .clamp(1, layout.body_bottom),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        *installed = Some(layout);
+    }
+    seq.push_str(&footer_seq_with(
         rows,
         cols,
         separator,
@@ -1261,7 +1295,8 @@ pub fn footer_seq(
         banners,
         effective_input_line().as_deref(),
         &hints,
-    )
+    ));
+    seq
 }
 
 /// [`footer_seq`] with the escalation banners AND the input-row content passed in
@@ -1330,7 +1365,9 @@ pub fn footer_seq_with(
     // hands us more banners than fit gets the newest ones painted, never a row
     // written outside the reserved region.
     for (i, (escalation, worker)) in banners.iter().take(layout.banner_count()).enumerate() {
-        let esc_row = top_row + (i as u16) * crate::escalation::ROWS_PER_BANNER;
+        let esc_row = top_row
+            + u16::from(layout.spacer_row.is_some())
+            + (i as u16) * crate::escalation::ROWS_PER_BANNER;
         let worker_row = esc_row + 1;
         s.push_str(&format!(
             "\x1b[{esc_row};1H\x1b[2K{}",
@@ -1340,6 +1377,9 @@ pub fn footer_seq_with(
             "\x1b[{worker_row};1H\x1b[2K{}",
             clip_visible(worker, max)
         ));
+    }
+    if let Some(row) = layout.spacer_row {
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
     }
     // The `:`-command hint tray: directly BELOW the escalation block and
     // directly ABOVE the rule, so the menu reads as the last thing the body said
@@ -1478,7 +1518,10 @@ impl Terminal {
         if !self.footer_enabled() {
             return;
         }
-        let body_bottom = FooterLayout::for_rows(self.rows).body_bottom;
+        let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
+        let layout = FooterLayout::for_rows(self.rows);
+        *INSTALLED_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(layout);
+        let body_bottom = layout.body_bottom;
         let mut out = std::io::stdout();
         // Install the region, suppress alternate-scroll (so the mouse wheel
         // scrolls native scrollback instead of emitting Up/Down into rustyline),
@@ -1500,7 +1543,12 @@ impl Terminal {
         if !self.active {
             return;
         }
-        let top_row = footer_top_row(self.rows);
+        let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
+        let top_row = INSTALLED_LAYOUT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map_or_else(|| footer_top_row(self.rows), |layout| layout.top_row());
         let mut out = std::io::stdout();
         // Restore alternate-scroll, reset region, then clear from the footer's
         // top row to end of screen so no stale statusline — or stale escalation
@@ -1539,6 +1587,8 @@ impl Terminal {
         if !FooterLayout::for_rows(self.rows).enabled() {
             return;
         }
+        let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
+        crate::escalation::sweep();
         let sep = separator_line(self.cols, self.utf8, crate::style::colors_enabled());
         let mut buf = String::new();
         // footer_seq re-asserts the scroll region internally, INSIDE its
@@ -1566,7 +1616,9 @@ impl Terminal {
         self.rows = rows;
         self.cols = cols;
         if self.footer_enabled() {
-            self.init_scroll_region();
+            if !self.active {
+                self.init_scroll_region();
+            }
             let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
             if !bar.is_empty() || !msg.is_empty() {
                 self.draw_footer(&msg, &bar);
@@ -1641,13 +1693,18 @@ pub fn resync_after_wake() {
 /// pair it with [`resume_footer_region`] on the way out. No-op (returns `false`)
 /// when no footer region is installed.
 pub fn suspend_footer_region() -> bool {
+    let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
     if !ACTIVE.load(Ordering::Relaxed) {
         return false;
     }
     let Some((rows, _cols)) = term_size() else {
         return false;
     };
-    let top_row = footer_top_row(rows);
+    let top_row = INSTALLED_LAYOUT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .map_or_else(|| footer_top_row(rows), |layout| layout.top_row());
     // DECSC → restore alternate-scroll (child gets normal wheel behavior) →
     // reset region to full screen → clear the footer rows (banner rows included
     // — they sit ABOVE the separator) → DECRC, so the cursor stays exactly where
@@ -1741,6 +1798,7 @@ pub fn resume_region_seq_with_cursor(rows: u16, cursor_row: Option<u16>) -> Stri
 /// both layouts come from [`FooterLayout::solve`], so this never disagrees with
 /// the region arithmetic or the paint. Zero when the growth was shed by a short
 /// window (the solver refused the extra banner) or nothing grew.
+#[cfg(test)]
 pub fn banner_growth_rows(rows: u16, prev_want_rows: u16, next_want_rows: u16) -> u16 {
     let before = FooterLayout::solve(rows, prev_want_rows).body_bottom;
     let after = FooterLayout::solve(rows, next_want_rows).body_bottom;
@@ -1770,6 +1828,7 @@ pub fn banner_growth_rows(rows: u16, prev_want_rows: u16, next_want_rows: u16) -
 ///
 /// Pure, so the sequence is unit-testable byte-for-byte. Empty string when
 /// `grow == 0` (write nothing at all).
+#[cfg(test)]
 pub fn banner_growth_seq(grow: u16) -> String {
     if grow == 0 {
         return String::new();
@@ -1777,64 +1836,14 @@ pub fn banner_growth_seq(grow: u16) -> String {
     format!("{}\x1b[{grow}A", "\n".repeat(grow as usize))
 }
 
-/// Run `mutate` — a change to the pinned-escalation store — with the footer's
-/// body-row growth absorbed around it, atomically with respect to footer paints.
-///
-/// `want_rows` is the escalation block's current row demand
-/// ([`crate::escalation::row_count`]); it is sampled before and after `mutate`
-/// so the growth is derived from what the store actually holds rather than from
-/// a caller's guess. Everything happens under [`FOOTER_PAINT`], so a heartbeat
-/// repaint cannot install the newer (shorter-body) region between the store
-/// mutation and the line feeds — the absorb MUST emit its LFs while the OLD,
-/// taller body region is still installed, which is what lets it skip a DSR round
-/// trip. See [`banner_growth_seq`] for the choreography and the bug.
-///
-/// The absorb is skipped — `mutate` still runs — unless a footer region is
-/// installed, and while a worker `:attach` view owns the body
-/// (`ATTACH_ACTIVE`) or the operator is mid-edit on a non-empty prompt line
-/// (`READING_LINE` + `INPUT_DIRTY`). In those states the line feeds would
-/// scroll a body this module does not own, and the next full repaint heals the
-/// layout anyway.
-///
-/// NOTE the deliberate asymmetry with [`heartbeat_should_paint`], which no
-/// longer treats attach as a veto: that path emits a cursor-safe DECSC/DECRC
-/// footer repaint, which is harmless under an attach view, whereas this one
-/// SCROLLS THE BODY. `INPUT_DIRTY` is scoped to `READING_LINE` for the same
-/// reason it is there: mid-turn the flag is a stale leftover from the previous
-/// prompt and rustyline is not rendering, and mid-turn is exactly when workers
-/// escalate — honoring a stale flag would skip the absorb in the common case and
-/// leave `thinking…` painting over the banner.
-pub fn absorb_banner_growth_around<T>(
-    want_rows: impl Fn() -> u16,
-    mutate: impl FnOnce() -> T,
-) -> T {
+/// Mutate escalation items and reconcile the installed layout atomically.
+/// The same paint path handles pinning, dismissal, and timed retirement,
+/// including while the editor owns the input row.
+pub fn repaint_escalation_around<T>(mutate: impl FnOnce() -> T) -> T {
     let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
-    let allowed = ACTIVE.load(Ordering::Relaxed)
-        && !ATTACH_ACTIVE.load(Ordering::Relaxed)
-        && !(READING_LINE.load(Ordering::Relaxed) && INPUT_DIRTY.load(Ordering::Relaxed));
-    if !allowed {
-        return mutate();
-    }
-    let before = want_rows();
-    let out = mutate();
-    absorb_banner_growth(before, want_rows());
-    out
-}
-
-/// Emit the growth absorb for a footer going from `prev_want_rows` to
-/// `next_want_rows` rows of escalation block. Callers come through
-/// [`absorb_banner_growth_around`], which owns the gating and the lock.
-fn absorb_banner_growth(prev_want_rows: u16, next_want_rows: u16) {
-    let Some((rows, _cols)) = term_size() else {
-        return;
-    };
-    let seq = banner_growth_seq(banner_growth_rows(rows, prev_want_rows, next_want_rows));
-    if seq.is_empty() {
-        return;
-    }
-    let mut out = std::io::stdout();
-    let _ = write!(out, "{seq}");
-    let _ = out.flush();
+    let result = mutate();
+    paint_cached_footer_locked(false, &_boundary);
+    result
 }
 
 /// Parse a DSR cursor-position reply — `ESC [ row ; col R` — out of a raw read
@@ -2001,6 +2010,7 @@ pub fn resume_footer_region() {
     // footer is about to repaint? `None` (terminal ignored the DSR query, or it
     // was disabled) degrades to the pre-fix behavior.
     let cursor_row = query_cursor_row();
+    let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
     // Scroll the overflow clear, re-assert the region + home into the last body
     // row, and re-suppress alternate-scroll alongside it (cursor-neutral:
     // `suppress_alt_scroll_seq` only toggles private mode 1007, so its position
@@ -2015,9 +2025,11 @@ pub fn resume_footer_region() {
     let _ = write!(out, "{seq}");
     let _ = out.flush();
     ACTIVE.store(true, Ordering::Relaxed);
+    *INSTALLED_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(FooterLayout::for_rows(rows));
     // Repaint the pinned footer rows from cache (cursor-safe: footer_seq wraps
     // its paint in DECSC/DECRC).
-    paint_cached_footer(false);
+    paint_cached_footer_locked(false, &_boundary);
 }
 
 /// Re-anchor the cursor into the bottom of the body after a screen wipe / buffer
@@ -2240,6 +2252,7 @@ pub fn unpark_input_row(echo: Option<&str>) {
 /// all — the editor's line simply stays where it is. `text` must carry its own
 /// trailing newline and use CRLF (the tty is in raw mode while the editor reads).
 pub fn print_in_body(text: &str) -> bool {
+    let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
     let Some(layout) = live_layout() else {
         return false;
     };
@@ -2384,6 +2397,113 @@ mod tests {
             "attach_return_preserves_pending_input",
             CHILD,
             Some(b"hello\r"),
+        );
+    }
+
+    #[test]
+    fn background_completion_between_reads_keeps_prompt_on_input_row() {
+        const CHILD: &str = "AISH_TEST_COMPLETION_PROMPT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            use crate::editor::{LineEditor, ReadOutcome, RustylineEditor};
+            let mut term = Terminal::detect().expect("PTY required");
+            term.init_scroll_region();
+            let helper = crate::repl::AishHelper::new(
+                std::env::temp_dir(),
+                String::new(),
+                std::sync::Arc::new(std::collections::HashMap::new()),
+            );
+            let mut editor = RustylineEditor::new(
+                helper,
+                std::env::temp_dir().join("aish-completion-test-unused-history"),
+            )
+            .unwrap();
+            struct QueuedPrinter;
+            impl crate::editor::LinePrinter for QueuedPrinter {
+                fn print(&mut self, _: String) {
+                    panic!("completion was queued for an inline prompt redraw");
+                }
+            }
+            crate::tools::install_external_printer(Box::new(QueuedPrinter));
+            set_reading_line(false);
+            assert!(crate::tools::print_above_prompt(
+                "Reviewing and summarizing result\n".into()
+            ));
+            match editor.read_line("completed> ") {
+                ReadOutcome::Line(line) => assert_eq!(line, "hello"),
+                _ => panic!("input did not reach editor"),
+            }
+            return;
+        }
+        let bytes = run_pty_test(
+            "background_completion_between_reads_keeps_prompt_on_input_row",
+            CHILD,
+            Some(b"hello\r"),
+        );
+        let output = String::from_utf8_lossy(&bytes);
+        let notice = output
+            .find("Reviewing and summarizing result")
+            .expect("completion notice must print immediately");
+        let rest = &output[notice..];
+        let prompt = rest.find("completed> ").expect("prompt after completion");
+        assert!(
+            rest[..prompt].contains("\x1b[22;1H"),
+            "prompt must anchor on H-2: {output}"
+        );
+    }
+
+    #[test]
+    fn escalation_and_hint_layout_changes_reconcile_on_tty() {
+        const CHILD: &str = "AISH_TEST_LAYOUT_TRANSITIONS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut term = Terminal::detect().expect("PTY required");
+            term.init_scroll_region();
+            term.draw_footer("msg", "bar");
+            set_reading_line(true);
+            park_input_row("input> ");
+            set_input_dirty(true);
+            let check = || {
+                let installed = INSTALLED_LAYOUT.lock().unwrap().unwrap();
+                let live = FooterLayout::for_rows(term_size().unwrap().0);
+                assert_eq!(installed, live);
+                if live.banner_rows > 0 || live.hint_rows > 0 {
+                    assert_eq!(live.spacer_row, Some(live.body_bottom + 1));
+                }
+                assert_eq!(BODY_ROW.load(Ordering::Relaxed), live.body_bottom);
+                assert!(FOOTER_PAINT.try_lock().is_ok());
+            };
+            crate::escalation::pin("w_first", "first");
+            check();
+            crate::escalation::pin("w_second", "second");
+            check();
+            set_hint_tray(vec!["hint".into(); 3]);
+            check();
+            crate::escalation::unpin("w_first");
+            check();
+            clear_hint_tray();
+            check();
+            // Resize with a live tray: reconcile against the installed layout,
+            // not a freshly installed margin that forgot the old body floor.
+            let size = libc::winsize {
+                ws_row: 12,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSWINSZ, &size) },
+                0
+            );
+            assert!(term.handle_resize());
+            check();
+            crate::escalation::unpin("w_second");
+            check();
+            set_reading_line(false);
+            return;
+        }
+        run_pty_test(
+            "escalation_and_hint_layout_changes_reconcile_on_tty",
+            CHILD,
+            None,
         );
     }
 
@@ -2616,14 +2736,14 @@ mod tests {
 
     #[test]
     fn banner_growth_equals_the_body_rows_the_footer_takes() {
-        // 24-row window: no banner → body ends at 20; one banner → 18. The two
-        // rows the tray claims are exactly what the body must give up.
+        // 24-row window: no banner → body ends at 20; one banner → 17.
+        // The banner and spacer claim three body rows.
         assert_eq!(FooterLayout::solve(24, 0).body_bottom, 20);
-        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 18);
-        assert_eq!(banner_growth_rows(24, 0, 2), 2);
+        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 17);
+        assert_eq!(banner_growth_rows(24, 0, 2), 3);
         // Second banner takes two more; the first→second step is still 2.
         assert_eq!(banner_growth_rows(24, 2, 4), 2);
-        assert_eq!(banner_growth_rows(24, 0, 4), 4);
+        assert_eq!(banner_growth_rows(24, 0, 4), 5);
         // Shrink (a banner retired) is NOT growth — the body gains rows, which
         // leaves a harmless gap, so nothing is scrolled.
         assert_eq!(banner_growth_rows(24, 4, 0), 0);
@@ -2637,7 +2757,8 @@ mod tests {
         // granted — so on a short window where the solver SHEDS the banner, the
         // body is not scrolled for a tray that was never painted.
         for rows in 1..=60u16 {
-            let granted = FooterLayout::solve(rows, 2).banner_rows;
+            let layout = FooterLayout::solve(rows, 2);
+            let granted = layout.banner_rows + u16::from(layout.spacer_row.is_some());
             assert_eq!(
                 banner_growth_rows(rows, 0, 2),
                 granted,
@@ -2677,7 +2798,7 @@ mod tests {
         let grow = banner_growth_rows(rows, 0, 2);
 
         // The rows the tray claims == the rows the absorb lifts the body by.
-        assert_eq!(grow, after.banner_rows);
+        assert_eq!(grow, after.banner_rows + 1);
         assert_eq!(before.body_bottom - after.body_bottom, grow);
         let seq = banner_growth_seq(grow);
         assert_eq!(seq.matches('\n').count(), grow as usize);
@@ -2875,10 +2996,10 @@ mod tests {
             "row H-5 must carry the escalation message, got {:?}",
             &seq[esc..worker]
         );
-        // The reserved region grew with the taller footer (24 - 6 = 18), so the
+        // The reserved region includes the spacer (24 - 7 = 17), so the
         // banner can never be scrolled away by body output.
         assert!(
-            seq.contains("\x1b[1;18r"),
+            seq.contains("\x1b[1;17r"),
             "DECSTBM must reserve the banner rows too"
         );
     }
@@ -3374,7 +3495,7 @@ mod tests {
         let roomy = FooterLayout::solve(60, per * 3);
         assert_eq!(roomy.banner_rows, per * 3);
         assert_eq!(roomy.banner_count(), 3);
-        assert_eq!(roomy.height, FOOTER_ROWS + per * 3);
+        assert_eq!(roomy.height, FOOTER_ROWS + per * 3 + 1);
         // top_row must cover the BANNER block, not just the rule — teardown
         // clears from there, and clearing from the rule would strand banners.
         assert_eq!(roomy.top_row(), 60 - roomy.height + 1);
@@ -3384,7 +3505,7 @@ mod tests {
 
         // Squeeze: banners shed BEFORE the separator, whole units at a time,
         // and the full 3-row footer survives intact.
-        let squeezed = FooterLayout::solve(MIN_FOOTER_ROWS + per, per * 4);
+        let squeezed = FooterLayout::solve(MIN_FOOTER_ROWS + per + 1, per * 4);
         assert_eq!(squeezed.banner_rows, per);
         assert!(squeezed.sep_row.is_some());
         assert!(squeezed.banner_rows.is_multiple_of(per));
@@ -3405,7 +3526,7 @@ mod tests {
             for want in [0u16, 2, 4, 8, 20] {
                 let l = FooterLayout::solve(rows, want);
                 assert_eq!(l.region_bottom(), l.body_bottom);
-                for row in [l.sep_row, l.input_row, l.msg_row, l.bar_row]
+                for row in [l.spacer_row, l.sep_row, l.input_row, l.msg_row, l.bar_row]
                     .into_iter()
                     .flatten()
                 {
@@ -3471,9 +3592,9 @@ mod tests {
         assert!(seq[newest..newest_status].contains("newest"));
         assert!(seq[newest_status..middle].contains("newest status"));
         assert!(seq[rule..].contains("----------"));
-        // DECSTBM must reserve all ten footer rows (24 - 10 = 14).
+        // DECSTBM must reserve eleven footer rows including the spacer.
         assert!(
-            seq.contains("\x1b[1;14r"),
+            seq.contains("\x1b[1;13r"),
             "region must cover every banner row"
         );
     }
@@ -3495,12 +3616,11 @@ mod tests {
                 }
             }
         }
-        // Concretely: a 24-row window holds 3 banners; a 10-row window holds 2;
-        // an 8-row window holds 1; a 7-row window holds none (the 4-row footer
-        // plus one banner needs 8).
+        // A 24-row window holds three banners, a 10-row window one,
+        // and an 8-row window none: the mandatory spacer needs its own row.
         assert_eq!(escalation_rows_that_fit(24, 6), 6);
-        assert_eq!(escalation_rows_that_fit(10, 6), 4);
-        assert_eq!(escalation_rows_that_fit(8, 6), 2);
+        assert_eq!(escalation_rows_that_fit(10, 6), 2);
+        assert_eq!(escalation_rows_that_fit(8, 6), 0);
         assert_eq!(escalation_rows_that_fit(7, 6), 0);
     }
 
@@ -3516,15 +3636,54 @@ mod tests {
     }
 
     #[test]
+    fn tray_spacer_separates_body_and_pinned_output_even_in_short_windows() {
+        for (banners, hints) in [(2, 0), (0, 2), (2, 2)] {
+            let layout = FooterLayout::solve_with(24, banners, hints);
+            assert_eq!(layout.spacer_row, Some(layout.body_bottom + 1));
+            assert_eq!(layout.top_row(), layout.spacer_row.unwrap());
+            assert_eq!(layout.input_row, Some(22));
+            let seq = footer_seq_with(
+                24,
+                80,
+                "----",
+                "msg",
+                "bar",
+                if banners > 0 {
+                    vec![("escalation".into(), "worker".into())]
+                } else {
+                    vec![]
+                },
+                None,
+                &vec!["hint".into(); hints as usize],
+            );
+            assert!(seq.contains(&format!("\x1b[{};1H\x1b[2K", layout.spacer_row.unwrap())));
+            let first_output = layout.top_row() + 1;
+            assert!(seq.contains(&format!(
+                "\x1b[{first_output};1H\x1b[2K{}",
+                if banners > 0 { "escalation" } else { "hint" }
+            )));
+            let tight = FooterLayout::solve_with(
+                MIN_BODY_ROWS + FOOTER_ROWS + banners + hints + 1,
+                banners,
+                hints,
+            );
+            assert!(tight.spacer_row.is_some());
+            assert_eq!(tight.banner_rows, banners);
+            assert_eq!(tight.hint_rows, hints);
+        }
+        assert_eq!(FooterLayout::solve(24, 0).spacer_row, None);
+    }
+
+    #[test]
     fn hint_tray_packs_flush_between_banners_and_rule() {
-        // 24 rows, no banners, 2-row tray → 6-row footer: 19-20 tray, 21 rule,
+        // 24 rows, no banners, 2-row tray → 7-row footer: 18 spacer, 19-20 tray, 21 rule,
         // 22 input, 23 msg, 24 bar. The tray must END one row above the rule.
         let l = FooterLayout::solve_with(24, 0, 2);
         assert_eq!(l.hint_rows, 2);
         assert_eq!(l.sep_row, Some(21));
         assert_eq!(l.hint_top_row(), Some(19));
         assert_eq!(l.input_row, Some(22), "input row must NOT move for a tray");
-        assert_eq!(l.height, 6);
+        assert_eq!(l.height, 7);
 
         // With a banner pinned, the tray slides down under it — still flush
         // against the rule, still leaving the input row alone.
@@ -3534,7 +3693,7 @@ mod tests {
         assert_eq!(b.input_row, Some(22));
         assert_eq!(
             b.hint_top_row(),
-            Some(b.top_row() + b.banner_rows),
+            Some(b.top_row() + 1 + b.banner_rows),
             "tray must hang directly off the bottom of the banner block"
         );
     }
@@ -3562,10 +3721,10 @@ mod tests {
             }
         }
         // Concretely: a 10-row window keeps a banner (6-row footer) and trims a
-        // 12-row ask down to the 2 rows the body can spare.
+        // 12-row ask down to one row while retaining the mandatory spacer.
         let tight = FooterLayout::solve_with(10, per, 12);
         assert_eq!(tight.banner_rows, per);
-        assert_eq!(tight.hint_rows, 2);
+        assert_eq!(tight.hint_rows, 1);
         assert_eq!(tight.input_row, Some(8));
     }
 
@@ -3586,10 +3745,10 @@ mod tests {
 
     #[test]
     fn hint_tray_delta_claims_and_releases_body_rows() {
-        // Opening a 3-row tray claims 3 body rows, so the body must scroll up 3
+        // Opening a 3-row tray claims 4 body rows including its spacer
         // before the tray paints over them.
         let open = hint_tray_delta(24, 0, 0, 3);
-        assert_eq!(open.grow, 3);
+        assert_eq!(open.grow, 4);
         assert_eq!(open.release, 0, "a growing tray releases nothing");
         assert!(
             open.clear_to < open.clear_from,
@@ -3599,14 +3758,14 @@ mod tests {
         // Closing it releases them and hands back the rows to clear.
         let close = hint_tray_delta(24, 0, 3, 0);
         assert_eq!(close.grow, 0);
-        assert_eq!(close.release, 3, "a shrinking tray gives 3 rows BACK");
+        assert_eq!(close.release, 4, "a shrinking tray gives 3 rows BACK");
         assert!(
             close.clear_from < close.clear_to,
             "a shrinking tray leaves stale rows to clear"
         );
         assert_eq!(
             close.clear_to - close.clear_from,
-            3,
+            4,
             "exactly the rows the tray gave back"
         );
 
@@ -3614,6 +3773,166 @@ mod tests {
         let still = hint_tray_delta(24, 0, 2, 2);
         assert_eq!((still.grow, still.release), (0, 0));
         assert_eq!(still.clear_from, still.clear_to);
+    }
+
+    #[test]
+    fn tray_transitions_preserve_transcript_cells_and_editor_cursor() {
+        // Interpret the emitted VT operations, checking screen cells rather
+        // than only counts. This catches ordering mistakes in clear/SD/DECSTBM.
+        struct Screen {
+            cells: Vec<Vec<u8>>,
+            row: usize,
+            col: usize,
+            saved: (usize, usize),
+            bottom: usize,
+        }
+        impl Screen {
+            fn scroll(&mut self, down: bool, count: usize) {
+                for _ in 0..count.min(self.bottom) {
+                    if down {
+                        self.cells[..self.bottom].rotate_right(1);
+                        self.cells[0].fill(b' ');
+                    } else {
+                        self.cells[..self.bottom].rotate_left(1);
+                        self.cells[self.bottom - 1].fill(b' ');
+                    }
+                }
+            }
+            fn apply(&mut self, seq: &str) {
+                let bytes = seq.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == 27 {
+                        match bytes[i + 1] {
+                            b'7' => {
+                                self.saved = (self.row, self.col);
+                                i += 2;
+                            }
+                            b'8' => {
+                                (self.row, self.col) = self.saved;
+                                i += 2;
+                            }
+                            b'[' => {
+                                let start = i + 2;
+                                let mut end = start;
+                                while !bytes[end].is_ascii_alphabetic() {
+                                    end += 1;
+                                }
+                                let args: Vec<usize> = seq[start..end]
+                                    .split(';')
+                                    .map(|n| n.parse().unwrap_or(1))
+                                    .collect();
+                                let n = args[0];
+                                match bytes[end] {
+                                    b'H' => {
+                                        self.row = n;
+                                        self.col = *args.get(1).unwrap_or(&1);
+                                    }
+                                    b'r' => {
+                                        self.bottom = args[1];
+                                        self.row = 1;
+                                        self.col = 1;
+                                    }
+                                    b'K' => self.cells[self.row - 1].fill(b' '),
+                                    b'S' => self.scroll(false, n),
+                                    b'T' => self.scroll(true, n),
+                                    b'A' => self.row = self.row.saturating_sub(n).max(1),
+                                    b'B' => self.row = (self.row + n).min(self.cells.len()),
+                                    other => panic!("unsupported VT operation {other}"),
+                                }
+                                i = end + 1;
+                            }
+                            _ => panic!("unsupported escape"),
+                        }
+                    } else {
+                        match bytes[i] {
+                            b'\n' if self.row == self.bottom => self.scroll(false, 1),
+                            b'\n' => self.row += 1,
+                            b'\r' => self.col = 1,
+                            c => {
+                                self.cells[self.row - 1][self.col - 1] = c;
+                                self.col += 1;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            fn line(&self, row: u16) -> String {
+                String::from_utf8(self.cells[row as usize - 1].clone()).unwrap()
+            }
+        }
+        for (editing, cursor_offset) in [(false, 0usize), (false, 4), (true, 0)] {
+            let mut before = FooterLayout::solve(24, 0);
+            let mut screen = Screen {
+                cells: vec![vec![b' '; 40]; 24],
+                row: 20,
+                col: 1,
+                saved: (20, 1),
+                bottom: 20,
+            };
+            screen.apply("TEXT");
+            screen.row -= cursor_offset;
+            if editing {
+                screen.row = 22;
+                screen.col = 7;
+            }
+            for (banners, hints) in [(2, 0), (4, 0), (4, 3), (2, 3), (0, 3), (0, 1), (0, 0)] {
+                let after = FooterLayout::solve_with(24, banners, hints);
+                screen.apply(&layout_transition_seq(before, after, editing));
+                screen.apply(&footer_seq_with(
+                    24,
+                    40,
+                    "----",
+                    "msg",
+                    "bar",
+                    vec![("banner".into(), "worker".into()); banners as usize / 2],
+                    None,
+                    &vec!["hint".into(); hints as usize],
+                ));
+                assert!(screen.line(after.body_bottom).starts_with("TEXT"));
+                for row in 1..=after.body_bottom {
+                    let line = screen.line(row);
+                    assert!(
+                        !line.contains("banner")
+                            && !line.contains("worker")
+                            && !line.contains("hint")
+                    );
+                }
+                if let Some(row) = after.spacer_row {
+                    assert!(screen.line(row).trim().is_empty());
+                }
+                assert_eq!(
+                    screen.row,
+                    if editing {
+                        22
+                    } else {
+                        after.body_bottom as usize - cursor_offset
+                    }
+                );
+                assert_eq!(screen.col, if editing { 7 } else { 5 });
+                before = after;
+            }
+        }
+    }
+
+    #[test]
+    fn visible_trays_always_have_exactly_one_gap_at_every_size() {
+        for rows in 0..80 {
+            for banners in [0, 2, 4, 6] {
+                for hints in 0..12 {
+                    let layout = FooterLayout::solve_with(rows, banners, hints);
+                    if layout.banner_rows > 0 || layout.hint_rows > 0 {
+                        assert_eq!(layout.spacer_row, Some(layout.body_bottom + 1));
+                        let first = layout.sep_row.unwrap() - layout.hint_rows - layout.banner_rows;
+                        assert_eq!(first, layout.body_bottom + 2);
+                    } else {
+                        assert_eq!(layout.spacer_row, None);
+                    }
+                    assert!(layout.height <= rows.saturating_sub(MIN_BODY_ROWS));
+                }
+            }
+        }
     }
 
     #[test]
@@ -3687,9 +4006,9 @@ mod tests {
         assert!(seq[first..second].contains(":quit"));
         assert!(seq[second..rule].contains(":jobs"));
         assert!(rule < input, "the rule still sits above the input row");
-        // The region must reserve the tray rows too (24 - 6 = 18).
+        // The region must reserve the tray and spacer (24 - 7 = 17).
         assert!(
-            seq.contains("\x1b[1;18r"),
+            seq.contains("\x1b[1;17r"),
             "region must cover every tray row"
         );
     }
@@ -3707,6 +4026,6 @@ mod tests {
             assert!(seq.contains(&format!("\x1b[{};1H", top + i)), "row {i}");
         }
         // One past the plan must never be addressed.
-        assert!(!seq.contains(&format!("\x1b[{};1H", top - 1)));
+        assert!(seq.contains(&format!("\x1b[{};1H\x1b[2K", top - 1)));
     }
 }
