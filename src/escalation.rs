@@ -155,22 +155,13 @@ static BANNERS: Mutex<Vec<Banner>> = Mutex::new(Vec::new());
 /// REFRESHES that banner in place — same task hint, clocks reset, verdict
 /// cleared — so a retry can't stack a duplicate row for one coordinator.
 /// A pinned banner steals two body rows from the scrolling region. The STORE
-/// mutation is [`push_banner`]; it runs inside
-/// [`crate::terminal::absorb_banner_growth_around`], which measures the row
-/// demand on both sides and scrolls the body out of the rows the footer is about
-/// to claim, walking the cursor back up with it. Without that, the cursor is
-/// left sitting INSIDE the new tray rows and the next body write — the animated
-/// `thinking…` row above all — paints over the banner, so "thinking" bleeds into
-/// the tray.
-///
-/// The measure → mutate → measure → scroll transition is atomic against footer
-/// paints (the terminal side holds its boundary lock across the closure), so a
-/// heartbeat repaint cannot install the shorter region mid-transition. Both
-/// `row_count` and `push_banner` take the `BANNERS` lock themselves and are
-/// called from OUTSIDE it here, so the terminal write never happens while this
-/// module's stack is held — and the lock order stays `FOOTER_PAINT` → `BANNERS`.
+/// mutation is [`push_banner`]; [`crate::terminal::repaint_escalation_around`]
+/// reconciles the installed body/tray layout and paints the new rows under the
+/// footer boundary lock. The transcript moves before tray cells are claimed,
+/// including while the operator edits the separate input row. Lock order is
+/// `FOOTER_PAINT` → `BANNERS`, so this wrapper runs outside the banner lock.
 pub fn pin(id: &str, task: &str) {
-    crate::terminal::absorb_banner_growth_around(row_count, || push_banner(id, task));
+    crate::terminal::repaint_escalation_around(|| push_banner(id, task));
 }
 
 fn push_banner(id: &str, task: &str) {
@@ -221,20 +212,24 @@ fn push_banner(id: &str, task: &str) {
 /// pinned, and an id that isn't pinned is a silent no-op (closing a plain
 /// `:dispatch` worker that never escalated must not disturb the tray).
 pub fn unpin(id: &str) -> bool {
-    let Ok(mut banners) = BANNERS.lock() else {
-        return false;
-    };
-    let before = banners.len();
-    banners.retain(|b| b.id != id);
-    banners.len() != before
+    crate::terminal::repaint_escalation_around(|| {
+        let Ok(mut banners) = BANNERS.lock() else {
+            return false;
+        };
+        let before = banners.len();
+        banners.retain(|b| b.id != id);
+        banners.len() != before
+    })
 }
 
 /// Retire EVERY banner (the footer shrinks back on the next paint).
 #[allow(dead_code)] // completes the BANNERS push/remove/clear API; no caller wired yet.
 pub fn clear() {
-    if let Ok(mut banners) = BANNERS.lock() {
-        banners.clear();
-    }
+    crate::terminal::repaint_escalation_around(|| {
+        if let Ok(mut banners) = BANNERS.lock() {
+            banners.clear();
+        }
+    });
 }
 
 /// True while ANY banner is pinned — the gate
