@@ -37,3 +37,15 @@ notes = "Design/TUI skill collection; already a documented aish skill source."
 owner = "garrytan"
 repo = "gstack"
 notes = "Plan/spec/ship skill set shipped as an aish plugin."
+
+[[repo]]
+owner = "juliusbrussee"
+repo = "caveman"
+path = "skills"
+notes = "Token-efficient coding skills (caveman-commit, caveman-review, etc.). Reduces token usage by ~65%. Apache 2.0. Replaces npx registry."
+
+[[repo]]
+owner = "supabase"
+repo = "agent-skills"
+path = "skills"
+notes = "Supabase-specific agent skills (postgres best practices, project setup, migrations). MIT licensed. Replaces npx registry."
