@@ -137,6 +137,30 @@ fn paint_midturn(cfg: &MidturnCfg, text: &str) {
 /// `Arc<Mutex>` handles) — it runs on the keywatch reader thread.
 pub type ShiftTabFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
+/// Invoke the Shift-Tab callback with panics CONTAINED.
+///
+/// The callback runs real REPL code (`cycle_worker_live` → viewport wipe →
+/// attach backfill) on the keywatch reader thread. Any panic in there used to
+/// unwind straight out of `reader_loop` and KILL this thread — after which
+/// mid-turn Shift-Tab AND mid-turn type-ahead were silently dead for the rest
+/// of the session, with nothing but a stray panic line to show for it. Seen in
+/// the wild as:
+///
+/// ```text
+/// thread 'aish-keywatch' panicked at src/worker.rs:1419:20:
+/// there is no reactor running, must be called from the context of a Tokio 1.x runtime
+/// ```
+///
+/// That specific panic is fixed at its source (the spinner now resolves a
+/// runtime handle instead of assuming one), but the reader thread is a
+/// load-bearing input path: it must survive a bad callback regardless. Worst
+/// case now is "that one keypress did nothing".
+fn fire_shift_tab(cb: Option<&ShiftTabFn>) {
+    if let Some(cb) = cb {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb()));
+    }
+}
+
 /// A key event surfaced by the mid-turn watcher. An enum (rather than a bare
 /// unit) so future mid-turn keys can be added without reshaping the channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,9 +415,7 @@ fn reader_loop(
                         paint_midturn(cfg, "");
                     }
                     Action::CycleWorker => {
-                        if let Some(cb) = on_shift_tab.as_ref() {
-                            cb();
-                        }
+                        fire_shift_tab(on_shift_tab.as_ref());
                         // The cycle SWITCHES the view: `cycle_worker_live` wipes
                         // the viewport and redraws the newly-attached pane
                         // (header + replayed tail), exactly like the at-the-prompt
@@ -418,9 +440,7 @@ fn reader_loop(
                 // yields to drain the channel; (2) also push onto the channel for
                 // any `select!` consumer that still wants the event. Best-effort
                 // send; a closed channel just drops it.
-                if let Some(cb) = on_shift_tab.as_ref() {
-                    cb();
-                }
+                fire_shift_tab(on_shift_tab.as_ref());
                 let _ = tx.send(TurnKey::ShiftTab);
             }
         }
@@ -567,7 +587,26 @@ impl Drop for PromptPause {
 
 #[cfg(test)]
 mod tests {
-    use super::{carry_over_partial, publish_partial, scan_csi_z};
+    use super::{carry_over_partial, fire_shift_tab, publish_partial, scan_csi_z};
+
+    // The Shift-Tab callback runs REPL code on this reader thread. If it
+    // panics, the reader thread must SURVIVE — it is the only source of
+    // mid-turn Shift-Tab and type-ahead, and losing it is silent (one stray
+    // panic line, then dead keys for the rest of the session).
+    #[test]
+    fn a_panicking_shift_tab_callback_does_not_unwind_into_the_reader() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the test output clean
+        let cb: super::ShiftTabFn = std::sync::Arc::new(|| panic!("boom from REPL callback"));
+        fire_shift_tab(Some(&cb));
+        std::panic::set_hook(prev);
+    }
+
+    // The None case (no callback installed) is a plain no-op, not a panic.
+    #[test]
+    fn fire_shift_tab_without_a_callback_is_a_noop() {
+        fire_shift_tab(None);
+    }
 
     // A half-typed line is rescued VERBATIM — including the trailing space the
     // operator had just typed — so the pre-filled prompt puts the cursor exactly

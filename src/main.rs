@@ -298,6 +298,11 @@ impl StartupTimer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Publish this runtime's handle process-wide FIRST. Plain OS threads we
+    // later spawn (notably `aish-keywatch`, which calls the Shift-Tab callback
+    // directly on its own thread) need it to spawn async work; without it a
+    // `tokio::spawn` off-runtime panics with "there is no reactor running".
+    worker::register_runtime_handle();
     let mut timer = StartupTimer::new();
     let args = Args::parse();
     timer.mark("args parsed");
