@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
@@ -1313,6 +1313,41 @@ struct ThinkingSpinner {
 /// Monotonic id source for live thinking spinners.
 static SPINNER_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Process-wide handle to the main Tokio runtime, registered once at startup by
+/// [`register_runtime_handle`].
+///
+/// Why this exists: parts of the REPL run on PLAIN OS threads that were never
+/// entered into the runtime — most notably the `aish-keywatch` reader thread,
+/// which invokes the Shift-Tab callback DIRECTLY on its own thread (so a
+/// mid-turn cycle works even while the async turn is parked in a blocking
+/// stretch). That path reaches `ThinkingSpinner::start`, and a bare
+/// `tokio::spawn` from a non-runtime thread PANICS with "there is no reactor
+/// running, must be called from the context of a Tokio 1.x runtime" — killing
+/// the keywatch thread outright and silently disabling mid-turn Shift-Tab and
+/// type-ahead for the rest of the session. Holding the runtime's `Handle` lets
+/// those off-runtime threads spawn onto the main runtime instead of panicking.
+static RUNTIME_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+/// Record the current Tokio runtime handle for later use from off-runtime
+/// threads. Called once from `main` (inside `#[tokio::main]`, so a runtime is
+/// current). Idempotent and never panics: a second call, or a call made with no
+/// runtime current, is a no-op.
+pub fn register_runtime_handle() {
+    if let Ok(h) = tokio::runtime::Handle::try_current() {
+        let _ = RUNTIME_HANDLE.set(h);
+    }
+}
+
+/// Resolve a handle we can `spawn` on: the runtime of the CURRENT thread when
+/// there is one, else the process-wide handle registered at startup. `None`
+/// means no runtime is reachable at all (e.g. a unit test on a bare thread) —
+/// callers must then degrade gracefully rather than panic.
+fn runtime_handle() -> Option<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current()
+        .ok()
+        .or_else(|| RUNTIME_HANDLE.get().cloned())
+}
+
 /// Count of thinking spinners currently active (started, not yet torn down).
 /// Read on each animation frame to decide between an IN-PLACE animated row (the
 /// sole thinker) and a committed one-line notice (2+ workers thinking at once).
@@ -1400,6 +1435,14 @@ impl ThinkingSpinner {
         if !stderr_is_tty() {
             return None;
         }
+        // Resolve the runtime BEFORE any terminal side-effect: this can be
+        // called from a non-runtime thread (the `aish-keywatch` reader invokes
+        // the Shift-Tab callback on its own thread → `cycle_worker_live` →
+        // `backfill_attached_live` → here), where a bare `tokio::spawn` would
+        // panic with "there is no reactor running" and take that thread down
+        // with it. With no runtime reachable we simply decline to animate; the
+        // caller already handles `None` by printing the static "thinking…" row.
+        let rt = runtime_handle()?;
         // At a LIVE interactive prompt (an above-the-prompt `ExternalPrinter` is
         // installed) in-place animation would trample the prompt line. In that
         // case run prompt-preserving: commit a single static "thinking…" line via
@@ -1416,7 +1459,7 @@ impl ThinkingSpinner {
         // in-place animation to its own committed line). Moved into the task so
         // the decrement fires on natural exit AND on abort.
         let guard = ThinkGuard::new();
-        let task = tokio::spawn(async move {
+        let task = rt.spawn(async move {
             let _guard = guard;
             let mut tick = tokio::time::interval(Duration::from_millis(80));
             // Once this spinner has committed a static one-line notice (because
@@ -4506,6 +4549,45 @@ fn flush_results(jobs: &WorkerJobs) {
 
 #[cfg(test)]
 mod tests {
+    /// Reactor-panic defect: `ThinkingSpinner::start` used a bare
+    /// `tokio::spawn`, but it is reachable from the `aish-keywatch` reader
+    /// thread (mid-turn Shift-Tab → `cycle_worker_live` → attach backfill),
+    /// which is a plain OS thread with NO runtime entered. That panicked with
+    /// "there is no reactor running, must be called from the context of a Tokio
+    /// 1.x runtime" and killed the reader thread, silently disabling mid-turn
+    /// Shift-Tab and type-ahead for the rest of the session. The fix is a
+    /// process-wide runtime `Handle` registered at startup, so off-runtime
+    /// threads can spawn onto the main runtime instead of exploding.
+    // Multi-thread flavor on purpose: the test body blocks on a std channel,
+    // so a current-thread runtime would never get to poll the spawned task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn runtime_handle_is_spawnable_from_a_thread_with_no_reactor() {
+        super::register_runtime_handle();
+
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        // A plain OS thread — exactly like the keywatch reader: never entered
+        // into any Tokio runtime.
+        let t = std::thread::spawn(move || {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "test thread must NOT have a current runtime, else it proves nothing"
+            );
+            let h =
+                super::runtime_handle().expect("registered handle must be reachable off-runtime");
+            // The payload: spawning here is what used to panic.
+            h.spawn(async move {
+                let _ = tx.send(true);
+            });
+        });
+        t.join().expect("off-runtime thread must not panic");
+
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(true),
+            "task spawned from the off-runtime thread must actually run"
+        );
+    }
+
     /// Resume-steer defect: a RESUMED worker runs under a FRESH coordinator
     /// `run_id`, while the operator keeps addressing it by its stable `w_…` job
     /// id — the only id `:tell`, `:attach`, and `background_status` ever show.
