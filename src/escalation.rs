@@ -423,7 +423,10 @@ pub fn render(
         Some(true) => "⚠️",
     };
     let short = crate::batch::short_id(id);
-    let hint = one_line(task, TASK_HINT_MAX);
+    // Peel an auto-offloaded brief's quoted-conversation digest / resume
+    // scaffolding down to the operator's ask before clipping, so the banner
+    // reads as the WORK instead of `=== Recent conversation context (for refe…`.
+    let hint = one_line(&crate::worker::task_headline(task), TASK_HINT_MAX);
     let head = if hint.is_empty() {
         format!("{glyph} {short}")
     } else {
@@ -602,6 +605,20 @@ mod tests {
         // The status row is indented under the message, led by one heart.
         assert!(bottom.starts_with("   ♥ "), "{bottom}");
         assert!(bottom.contains("coordinating · 1m12s"), "{bottom}");
+    }
+
+    #[test]
+    /// Regression (w_pckv64iw): the banner hint clipped the RAW brief, so an
+    /// escalation from an auto-offloaded run advertised the quoted-context
+    /// header rather than what the worker is stuck on.
+    fn row_hint_peels_the_context_digest() {
+        let task = "=== Recent conversation context (for reference — the operator's) ===\n\
+                    Operator: blah blah\n\
+                    === End context ===\n\n\
+                    fix the buggy ui";
+        let (top, _) = render(0, "w_pckv64iw", task, "coordinating", None, Some(0), false);
+        assert!(top.contains("fix the buggy ui"), "{top}");
+        assert!(!top.contains("Recent conversation"), "{top}");
     }
 
     #[test]

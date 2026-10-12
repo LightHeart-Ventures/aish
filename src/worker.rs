@@ -1154,7 +1154,17 @@ pub fn pane_input_row(label: &str, task: &str) -> String {
 /// renders as one clean block. The full ask is shown — `pane_row` wraps it
 /// across bordered continuation rows, so nothing is clipped. A plain task with
 /// no markers just gets the whitespace collapse. Pure — unit-tested.
-fn task_headline(task: &str) -> String {
+///
+/// This is the SHARED reducer for every human-facing rendering of a brief, not
+/// just the replay row: the worktree BRANCH name ([`worktree_layout`]), the
+/// completion notice ([`notify_pending`]), the escalation banner hint
+/// (`escalation::render`) and the attach statusline (`repl::short_task_hint`) all
+/// peel through it. They used to slug/clip the RAW brief, so an auto-offloaded
+/// run surfaced the digest header instead of the ask — branch
+/// `aish/recent-conversation-context-for-reference-the-w_pckv64iw` and a done
+/// notice reading `=== Recent conversation context (for reference — the operato…`
+/// (w_pckv64iw). One peel, every surface.
+pub fn task_headline(task: &str) -> String {
     const FOLLOW_UP: &str = "=== OPERATOR'S FOLLOW-UP ===";
     const END_CTX: &str = "=== End context ===";
     let core = if let Some(idx) = task.rfind(FOLLOW_UP) {
@@ -2357,7 +2367,14 @@ fn worktree_layout(
     id: &str,
     task: Option<&str>,
 ) -> (String, PathBuf) {
-    let branch = match task.and_then(branch_slug) {
+    // Reduce the brief to the operator's load-bearing ask BEFORE slugging
+    // ([`task_headline`]): an auto-offloaded brief leads with a quoted
+    // `=== Recent conversation context … === End context ===` digest, and
+    // slugging that raw produced branches named after the BOILERPLATE
+    // (`aish/recent-conversation-context-for-reference-the-w_pckv64iw`) instead
+    // of the work. Peeling first means the branch reads as the actual task.
+    let headline = task.map(task_headline);
+    let branch = match headline.as_deref().and_then(branch_slug) {
         Some(slug) => format!("aish/{slug}-{id}"),
         None => format!("aish/{id}"),
     };
@@ -4423,7 +4440,9 @@ pub fn notify_pending(jobs: &WorkerJobs) -> Vec<String> {
                 "{color}{icon} {} {what} — `:result {}` to view · {}{branch}\x1b[0m",
                 job.id,
                 job.id,
-                crate::batch::one_line(&job.task)
+                // Peel the quoted-context digest / resume scaffolding first, so
+                // the notice names the ASK and not the boilerplate header.
+                crate::batch::one_line(&task_headline(&job.task))
             )
         })
         .collect()
@@ -6109,6 +6128,31 @@ mod tests {
         // Still inside the existing `aish/` namespace — `current_worktree_branch`
         // (coordinator.rs) identifies a worker branch by exactly that prefix.
         assert!(branch.starts_with("aish/"), "namespace preserved: {branch}");
+    }
+
+    /// Regression (w_pckv64iw): an auto-offloaded brief leads with the quoted
+    /// conversation digest, and slugging it RAW named the branch after the
+    /// boilerplate — `aish/recent-conversation-context-for-reference-the-…`.
+    /// The branch must slug the operator's ask, not the digest header.
+    #[test]
+    fn worktree_layout_branch_peels_the_context_digest() {
+        let root = std::path::Path::new("/wt-root");
+        let (branch, _) = worktree_layout(
+            root,
+            "org--repo",
+            "w_pckv64iw",
+            Some(
+                "=== Recent conversation context (for reference — the operator's) ===\n\
+                 Operator: blah blah\n\
+                 === End context ===\n\n\
+                 fix the buggy ui",
+            ),
+        );
+        assert_eq!(branch, "aish/fix-the-buggy-ui-w_pckv64iw");
+        assert!(
+            !branch.contains("recent-conversation"),
+            "digest must not reach the branch name: {branch}"
+        );
     }
 
     /// Uniqueness is non-negotiable: the id suffix is the ONLY thing standing
