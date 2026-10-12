@@ -2611,7 +2611,10 @@ const TASK_HINT_MAX: usize = 48;
 /// truncate to `max` chars with a trailing ellipsis. Returns an empty string for
 /// an empty/whitespace-only task (caller then omits the ` - <hint>` suffix).
 fn short_task_hint(task: &str, max: usize) -> String {
-    let collapsed = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Peel the quoted-context digest / resume scaffolding first ([`task_headline`])
+    // — an auto-offloaded brief otherwise shows its boilerplate header here
+    // instead of the operator's ask. That peel also collapses whitespace.
+    let collapsed = crate::worker::task_headline(task);
     if collapsed.chars().count() <= max {
         collapsed
     } else {
@@ -13717,6 +13720,18 @@ mod tests {
         assert_eq!(hint.chars().count(), 10);
         assert!(hint.ends_with('…'));
         assert_eq!(short_task_hint("   \n\t ", 48), "");
+    }
+
+    #[test]
+    /// Regression (w_pckv64iw): the attach footer used to clip the RAW brief, so
+    /// an auto-offloaded run's status line read `=== Recent conversation context
+    /// (for reference — the operato…` instead of the ask. Peel, then clip.
+    fn short_task_hint_peels_the_context_digest() {
+        let task = "=== Recent conversation context (for reference — the operator's) ===\n\
+                    Operator: blah blah\n\
+                    === End context ===\n\n\
+                    fix the buggy ui";
+        assert_eq!(short_task_hint(task, 48), "fix the buggy ui");
     }
 
     #[test]
