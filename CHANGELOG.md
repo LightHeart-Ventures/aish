@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.54.8] - 2026-10-12
+
+### Fixed
+- The `aish-keywatch` thread no longer panics when a Shift-Tab callback tries to spawn a task. The ThinkingSpinner now resolves the current or registered `tokio::runtime::Handle` before spawning, falling back to a static spinner row when no runtime is reachable. Shift-Tab callbacks are wrapped in `catch_unwind` so a panicking callback does not kill the input thread (PR #973).
+
 ## [0.54.7] - 2026-10-11
 
 ### Fixed
