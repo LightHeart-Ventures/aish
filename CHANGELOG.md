@@ -4,6 +4,14 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.54.9] - 2026-10-13
+
+### Changed
+- Permission prompts are gated behind a selection key **plus** Enter. The prompt is drawn, the keyboard is held off for one second with the tty input queue flushed on both sides of the pause, and an answer is `y`/`n`/`a`/`d` followed by Enter — a keypress alone submits nothing and a bare Enter with nothing selected does nothing, so the Enter that submitted the gated request can no longer answer the prompt. Unadvertised keys are ignored outright, Backspace clears a pending selection, and Ctrl-C/Ctrl-D still cancels. Sensitive prompts keep their clamp (`[y/n] then Enter`, a typed `a`/`d` clamped to a refusal), and the piped path is unchanged — a blank line is still a refusal (PR #977).
+
+### Fixed
+- Auto-offloaded briefs no longer advertise their quoted-context boilerplate. `worker::task_headline` is now the shared reducer for worktree branch names, completion notices, the escalation banner hint, and the `:attach` statusline hint, so the `=== Recent conversation context … ===` digest is peeled on every human-facing surface instead of only the worker pane (PR #976).
+
 ### Changed
 - A permission prompt no longer auto-submits on a single keypress. The prompt renders `[y/n/a/d] then Enter`, holds the keyboard off for one second after it is drawn (flushing the tty input queue on both sides of the pause) so an in-flight keystroke — typically the Enter that submitted the very request being gated — cannot answer it, and then requires a selection key **and** Enter. Unadvertised keys are ignored outright (no echo, no decision, no re-ask), Backspace clears a pending selection, a second selection key replaces the first, and Ctrl-C/Ctrl-D still cancels the prompt and the tool call. Bare Enter with nothing selected does nothing on a tty; a blank line on a pipe is still a refusal, so piped `y`/`n` automation is unchanged.
 
