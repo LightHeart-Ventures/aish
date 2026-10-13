@@ -9473,7 +9473,10 @@ mod egress_tests {
         assert!(sensitive, "must render as a sensitive prompt: {prompt}");
         assert!(body.contains(reason), "{body}");
         assert!(body.contains("evil.example.com"), "{body}");
-        assert_eq!(crate::sensitive::prompt_options(sensitive), "[y/N]");
+        assert_eq!(
+            crate::sensitive::prompt_options(sensitive),
+            "[y/n] then Enter"
+        );
         assert_eq!(
             crate::sensitive::clamp_decision(sensitive, Decision::AlwaysAllow),
             Decision::Deny,

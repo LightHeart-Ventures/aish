@@ -106,13 +106,15 @@ fn surface_mcp_skips(session: &Session, skips: &[String]) {
 /// Unrecognised input is [`Answer::Invalid`] — deliberately **not** a refusal.
 /// The prompt advertises exactly four keys; anything else is a typo, a stray
 /// arrow key, or a half-typed word. Folding that into "no" made aish look like
-/// it had ignored the operator and dropped the tool call for no stated reason,
-/// so we re-ask instead of guessing.
+/// it had ignored the operator and dropped the tool call for no stated reason.
+/// Off a tty that means a re-ask; on a tty the key is simply ignored and the
+/// prompt keeps waiting (see [`read_answer`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Answer {
     /// A key we advertise.
     Decided(tools::Decision),
-    /// Nothing we advertise — re-prompt.
+    /// Nothing we advertise — re-prompt. Only reachable off a tty; the tty
+    /// reader drops unadvertised keys on the floor instead.
     Invalid,
     /// Operator abandoned the prompt (Ctrl-C, Ctrl-D, or EOF on a pipe).
     /// Cancels the call: still a refusal, but one we stop asking about.
@@ -127,8 +129,10 @@ const MAX_CONFIRM_RETRIES: usize = 25;
 /// Interpret one answer. Pure, so the whole accept/reject table is unit-testable
 /// without a tty.
 ///
-/// An EMPTY answer (bare Enter) is the advertised default: the capital `N` in
-/// `[y/N/a/d]` means "no", so it stays a real decision rather than a re-ask.
+/// An EMPTY answer is a refusal — but only the **piped** path can produce one.
+/// On a tty a bare Enter never reaches here: with no key selected it is ignored,
+/// because an Enter the operator meant for the line they were typing must not
+/// answer a permission gate.
 fn parse_answer(input: &str) -> Answer {
     use tools::Decision;
     match input.trim() {
@@ -150,9 +154,9 @@ fn parse_answer(input: &str) -> Answer {
 /// can actually be honoured, so a sensitive prompt never advertises `a`/`d`.
 fn answer_hint(sensitive: bool) -> &'static str {
     if sensitive {
-        "answer y or n — Ctrl-C cancels"
+        "answer y or n, then Enter — Ctrl-C cancels"
     } else {
-        "answer y (once) / n (no) / a (always) / d (this dir) — Ctrl-C cancels"
+        "answer y (once) / n (no) / a (always) / d (this dir), then Enter — Ctrl-C cancels"
     }
 }
 
@@ -220,8 +224,70 @@ fn read_key_tty() -> Option<u8> {
     }
 }
 
-/// Read one answer. On a tty that's a single keypress (echoed by us, since ECHO
-/// is off for the read); off a tty it's a line, so piped `y`/`n` still work.
+/// The keys a tty prompt accepts as a selection, normalised to lower case.
+/// Anything else is ignored outright: not echoed, not remembered, and never
+/// folded into a decision.
+fn selection_key(b: u8) -> Option<char> {
+    match b {
+        b'y' | b'Y' => Some('y'),
+        b'n' | b'N' => Some('n'),
+        b'a' | b'A' => Some('a'),
+        b'd' | b'D' => Some('d'),
+        _ => None,
+    }
+}
+
+/// How long a freshly-drawn prompt deliberately ignores the keyboard.
+///
+/// A permission gate interrupts whatever the operator was doing, so keystrokes
+/// already in flight — most often the Enter that submitted the very request
+/// being gated — would land on the new prompt and answer it before it was read.
+/// One second of enforced silence, with the input queue flushed on both sides of
+/// it, makes the answer a deliberate act instead of an accident.
+const PROMPT_INPUT_GRACE: Duration = Duration::from_millis(1000);
+
+/// Upper bound on keystrokes one prompt will consume. A human never gets near
+/// it; the cap stops a wedged tty from spinning the reader forever.
+const MAX_CONFIRM_KEYS: usize = 4096;
+
+/// Discard everything queued on the tty input side — works in canonical mode
+/// too, where un-newlined bytes are still parked in the kernel's line buffer and
+/// a `poll`/`read` drain would never see them.
+fn flush_tty_input() {
+    // SAFETY: tcflush is a plain terminal-queue operation on fd 0.
+    unsafe {
+        libc::tcflush(0, libc::TCIFLUSH);
+    }
+}
+
+/// Hold the keyboard off for [`PROMPT_INPUT_GRACE`]: flush what is already
+/// buffered, sleep, then flush whatever arrived while we slept.
+fn settle_input() {
+    flush_tty_input();
+    std::thread::sleep(PROMPT_INPUT_GRACE);
+    flush_tty_input();
+}
+
+/// Rub out the single character we echoed for a pending selection.
+fn erase_echoed_key() {
+    print!("\x08 \x08");
+    std::io::stdout().flush().ok();
+}
+
+/// Read one answer.
+///
+/// Off a tty it is a line, so piped `y`/`n` still work.
+///
+/// On a tty it is a **two-step** confirm: press one of `y`/`n`/`a`/`d`, then
+/// Enter. Consequences, all deliberate:
+///
+/// * the keypress alone submits nothing — no auto-submit on a single key;
+/// * a bare Enter with nothing selected does nothing, so a stray Enter cannot
+///   answer the gate;
+/// * any other key is ignored silently — not echoed, no decision, no re-ask;
+/// * Backspace clears a pending selection, and a second selection key replaces
+///   the first, so the answer is correctable before it is committed;
+/// * Ctrl-C / Ctrl-D cancels the prompt, and with it the tool call.
 fn read_answer(on_tty: bool) -> Answer {
     if !on_tty {
         let mut line = String::new();
@@ -231,44 +297,65 @@ fn read_answer(on_tty: bool) -> Answer {
             Ok(_) => parse_answer(&line),
         };
     }
-    let Some(b) = read_key_tty() else {
-        return Answer::Cancelled;
-    };
-    match b {
-        // Ctrl-C / Ctrl-D: abandon the prompt and cancel the call.
-        0x03 | 0x04 => {
-            println!("^C");
-            Answer::Cancelled
-        }
-        b'\r' | b'\n' => {
-            println!();
-            parse_answer("")
-        }
-        _ => {
-            // Echo only printable ASCII — a control byte or a UTF-8 continuation
-            // would just garble the line, and it's headed for Invalid anyway.
-            if b.is_ascii_graphic() {
-                println!("{}", b as char);
-            } else {
-                println!();
+
+    let mut selected: Option<char> = None;
+    for _ in 0..MAX_CONFIRM_KEYS {
+        let Some(b) = read_key_tty() else {
+            return Answer::Cancelled;
+        };
+        match b {
+            // Ctrl-C / Ctrl-D: abandon the prompt and cancel the call.
+            0x03 | 0x04 => {
+                println!("^C");
+                return Answer::Cancelled;
             }
-            // Single keys only: the word forms ("yes"/"always") can't be typed a
-            // key at a time, and don't need to be — the keys are what's advertised.
-            parse_answer(&(b as char).to_string())
+            // Enter commits the selection — the only way to answer.
+            b'\r' | b'\n' => match selected {
+                Some(c) => {
+                    println!();
+                    // Single keys only: the word forms ("yes"/"always") can't be
+                    // typed a key at a time, and don't need to be — the keys are
+                    // what's advertised.
+                    return parse_answer(&c.to_string());
+                }
+                None => continue,
+            },
+            // Backspace / DEL: un-select, leaving the prompt waiting.
+            0x08 | 0x7f => {
+                if selected.take().is_some() {
+                    erase_echoed_key();
+                }
+            }
+            _ => {
+                let Some(c) = selection_key(b) else {
+                    continue; // unadvertised key: ignored outright
+                };
+                if selected.take().is_some() {
+                    erase_echoed_key(); // a later key replaces the earlier one
+                }
+                print!("{c}");
+                std::io::stdout().flush().ok();
+                selected = Some(c);
+            }
         }
     }
+    // A tty that will not stop talking: cancel, which is the safe direction.
+    Answer::Cancelled
 }
 
-/// Blocking y/N/a/d prompt on the controlling TTY. `a` ("always") allows this
+/// Blocking y/n/a/d prompt on the controlling TTY. `a` ("always") allows this
 /// call and persists the tool/command so it never prompts again.
 ///
-/// Only the advertised keys are accepted. Anything else re-asks rather than
-/// being folded into a silent refusal, and **Ctrl-C cancels the call** — which
-/// needs the explicit byte check in [`read_key_tty`], because aish ignores
-/// SIGINT process-wide and would otherwise sit on the prompt forever.
+/// The prompt does not auto-submit. Answering takes a selection key **and**
+/// Enter, and the keyboard is held off for [`PROMPT_INPUT_GRACE`] after the
+/// prompt is drawn so in-flight keystrokes cannot answer it. Only the advertised
+/// keys are accepted; anything else is ignored rather than being folded into a
+/// silent refusal, and **Ctrl-C cancels the call** — which needs the explicit
+/// byte check in [`read_key_tty`], because aish ignores SIGINT process-wide and
+/// would otherwise sit on the prompt forever.
 ///
 /// A prompt flagged sensitive by [`crate::sensitive`] (SEC-2.3) renders **only**
-/// `y/N`: `'a'`/`'d'` can never be honoured for a credential path, and an option
+/// `y/n`: `'a'`/`'d'` can never be honoured for a credential path, and an option
 /// that cannot be honoured must not be displayed. A typed `a`/`d` is still
 /// parsed here and then clamped to a refusal by `clamp_decision`, so the
 /// security invariant holds regardless of what the operator presses.
@@ -282,9 +369,16 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
     // SAFETY: isatty is a plain query on fd 0.
     let on_tty = unsafe { libc::isatty(0) == 1 };
 
+    let mut first_ask = true;
     for _ in 0..MAX_CONFIRM_RETRIES {
         print!("\x1b[33mrun?\x1b[0m {body} \x1b[33m{opts}\x1b[0m ");
         std::io::stdout().flush().ok();
+        // Draw first, then go deaf for a beat: the operator sees what they are
+        // being asked before the gate will take an answer, and whatever was
+        // already in the keyboard queue is discarded rather than consumed.
+        if on_tty && std::mem::take(&mut first_ask) {
+            settle_input();
+        }
         match read_answer(on_tty) {
             Answer::Decided(d) => return crate::sensitive::clamp_decision(sensitive, d),
             Answer::Cancelled => return Decision::Deny,
@@ -11843,12 +11937,89 @@ mod tests {
     }
 
     #[test]
-    fn bare_enter_takes_the_capitalised_default() {
-        // The `N` in `[y/N/a/d]` is the documented default, so an empty answer
-        // is a real refusal — not an unrecognised one to re-ask about.
+    fn a_blank_piped_line_is_a_refusal() {
+        // Only the piped path can produce an empty answer, and there "nothing to
+        // say" is a real refusal. On a tty a bare Enter never reaches here — the
+        // reader ignores it, which is what stops a stray Enter from answering a
+        // gate (see `bare_enter_without_a_selection_is_not_an_answer`).
         for empty in ["", "\n", "   \n", "\r\n"] {
             assert_eq!(parse_answer(empty), Answer::Decided(tools::Decision::Deny));
         }
+    }
+
+    // ---- confirm prompt: the keypress never auto-submits -------------------
+
+    #[test]
+    fn only_the_advertised_keys_count_as_a_selection() {
+        for (byte, want) in [
+            (b'y', 'y'),
+            (b'Y', 'y'),
+            (b'n', 'n'),
+            (b'N', 'n'),
+            (b'a', 'a'),
+            (b'A', 'a'),
+            (b'd', 'd'),
+            (b'D', 'd'),
+        ] {
+            assert_eq!(
+                selection_key(byte),
+                Some(want),
+                "{:?} is printed in the prompt and must select",
+                byte as char
+            );
+        }
+        // Everything else is ignored outright — no echo, no decision, no re-ask.
+        // Enter and Ctrl-C are handled by the reader itself, NOT as selections:
+        // that is precisely why a stray keystroke cannot answer the prompt.
+        for byte in [
+            b'x', b'q', b'1', b' ', b'\r', b'\n', 0x1b, 0x03, 0x04, 0x7f, 0x08, b'j', b'k',
+        ] {
+            assert_eq!(
+                selection_key(byte),
+                None,
+                "byte {byte:#04x} is not advertised and must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_enter_without_a_selection_is_not_an_answer() {
+        // The reader treats Enter as "commit what is selected". With nothing
+        // selected there is nothing to commit, so the Enter that submitted the
+        // request being gated cannot also answer the gate. Encoded here as the
+        // selection table's silence on `\r`/`\n` plus the absence of any
+        // Enter-shaped default in the advertised options.
+        assert_eq!(selection_key(b'\r'), None);
+        assert_eq!(selection_key(b'\n'), None);
+        for sensitive in [true, false] {
+            let opts = crate::sensitive::prompt_options(sensitive);
+            assert!(
+                !opts.contains('N'),
+                "no capitalised default may be advertised: {opts}"
+            );
+            assert!(
+                opts.contains("then Enter"),
+                "the prompt must say the answer needs Enter: {opts}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_input_grace_is_long_enough_to_outlast_an_in_flight_keystroke() {
+        // The gate interrupts whatever the operator was typing, so the pause has
+        // to be perceptible — a few ms would still swallow the submit-Enter into
+        // the answer. One second is the specified beat; never zero.
+        assert!(PROMPT_INPUT_GRACE >= Duration::from_millis(1000));
+        // ...and not so long the prompt feels wedged.
+        assert!(PROMPT_INPUT_GRACE <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_keystroke_cap_cannot_be_reached_by_a_human_but_bounds_a_wedged_tty() {
+        // A correcting human presses a handful of keys; the cap only exists so a
+        // tty spewing bytes without EOF terminates instead of spinning forever.
+        assert!(MAX_CONFIRM_KEYS > MAX_CONFIRM_RETRIES);
+        assert!(MAX_CONFIRM_KEYS >= 1024);
     }
 
     #[test]
