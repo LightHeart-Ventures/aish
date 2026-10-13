@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Changed
+- The permission prompt no longer advertises `then Enter`. The request line renders a bare `[y/n]` / `[y/n/a/d]`; the key-**plus**-Enter gate from 0.54.9 is unchanged — a keypress alone still submits nothing, and a bare Enter with nothing selected still does nothing, so the Enter that submitted the gated request still cannot answer it. The Enter requirement is now carried by the hint printed after an unrecognised answer, which is exactly when an operator needs to be told, instead of spending three words of ceremony on every request.
+
 ## [0.54.9] - 2026-10-13
 
 ### Changed

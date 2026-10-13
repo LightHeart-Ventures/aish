@@ -166,15 +166,15 @@ pub fn split_prompt(prompt: &str) -> (&str, bool) {
 /// always-allowed or directory-granted, and an option that cannot be honoured
 /// must not be displayed.
 ///
-/// No key is capitalised: the prompt has no bare-Enter default. An answer is a
-/// selection key followed by Enter, so `[y/n]` is the honest rendering and the
-/// `then Enter` is spelled out rather than left for the operator to discover.
+/// No key is capitalised: the prompt has no bare-Enter default. An answer is
+/// still a selection key **followed by Enter** — that gate is unchanged — but
+/// the options list no longer says so. The prompt already interrupts whatever
+/// the operator was doing; restating a contract they learn once costs three
+/// words of ceremony on every single request. `[y/n]` is the rendering, and the
+/// Enter requirement is carried by `answer_hint`, which is printed precisely
+/// when someone got the answer wrong.
 pub fn prompt_options(sensitive: bool) -> &'static str {
-    if sensitive {
-        "[y/n] then Enter"
-    } else {
-        "[y/n/a/d] then Enter"
-    }
+    if sensitive { "[y/n]" } else { "[y/n/a/d]" }
 }
 
 /// Clamp a parsed answer for a sensitive prompt: only a one-shot `y` is
@@ -681,14 +681,15 @@ mod tests {
         assert!(sensitive);
         assert!(body.contains("sensitive path (.ssh)"));
         assert!(body.contains("write /home/u/.ssh/id_rsa"));
-        assert_eq!(prompt_options(true), "[y/n] then Enter");
-        assert_eq!(prompt_options(false), "[y/n/a/d] then Enter");
+        assert_eq!(prompt_options(true), "[y/n]");
+        assert_eq!(prompt_options(false), "[y/n/a/d]");
         // No capitalised key anywhere: there is no bare-Enter default to advertise.
         assert!(!prompt_options(true).contains('N'));
         assert!(!prompt_options(false).contains('N'));
-        // Both renderings tell the operator the answer needs Enter.
-        assert!(prompt_options(true).contains("then Enter"));
-        assert!(prompt_options(false).contains("then Enter"));
+        // ...and no Enter ceremony either. The answer still needs Enter — the
+        // gate is unchanged — but the request line does not restate it.
+        assert!(!prompt_options(true).contains("Enter"));
+        assert!(!prompt_options(false).contains("Enter"));
 
         // A plain prompt is untouched.
         let (body2, sensitive2) = split_prompt("write /tmp/x");
