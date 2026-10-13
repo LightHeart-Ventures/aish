@@ -186,6 +186,37 @@ impl RustylineEditor {
             EventHandler::Simple(Cmd::Kill(Movement::WholeBuffer)),
         );
 
+        // Home / End jump to the start / end of the WHOLE operator input, not
+        // the start / end of the current logical line. rustyline's defaults are
+        // `BeginningOfLine` / `EndOfLine`, which stop at the nearest `\n` once
+        // the buffer is multi-line — overriding them with the buffer-wide
+        // movements makes a single Home/End press reach the real edges of what
+        // the operator typed, matching every other chat-style composer.
+        // Ctrl-A / Ctrl-E keep their readline per-line meaning, so the
+        // finer-grained moves are still one chord away.
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Home, Modifiers::NONE),
+            EventHandler::Simple(Cmd::Move(Movement::BeginningOfBuffer)),
+        );
+        rl.bind_sequence(
+            KeyEvent(KeyCode::End, Modifiers::NONE),
+            EventHandler::Simple(Cmd::Move(Movement::EndOfBuffer)),
+        );
+
+        // Alt-Enter inserts a literal newline instead of submitting, which is
+        // what makes multi-line operator input reachable at all: plain Enter is
+        // `AcceptOrInsertLine` and `AishHelper`'s validator always reports the
+        // line valid, so Enter always submits. With a newline in the buffer,
+        // rustyline's default Up/Down (`LineUpOrPreviousHistory` /
+        // `LineDownOrNextHistory`) navigate BETWEEN the input's own lines and
+        // only fall through to history recall at the first / last line — the
+        // behaviour the operator expects, so Up/Down are deliberately left
+        // unbound here.
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Enter, Modifiers::ALT),
+            EventHandler::Simple(Cmd::Newline),
+        );
+
         // Fish-style history ghost text (S6.2 / TASK-136): accept the inline
         // autosuggestion with → or Ctrl-F. Both route through `AcceptHint`,
         // which inserts the suggested completion when an acceptable hint is shown
@@ -839,7 +870,77 @@ pub fn nudge_terminal_return() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::line_buffer::{ChangeListener, DeleteListener, Direction, LineBuffer};
     use std::collections::HashMap;
+
+    /// No-op edit listener — the buffer-movement assertions below don't care
+    /// about undo/kill-ring bookkeeping, and rustyline's own `NoListener` is
+    /// crate-private.
+    struct Silent;
+    impl DeleteListener for Silent {
+        fn delete(&mut self, _idx: usize, _string: &str, _dir: Direction) {}
+    }
+    impl ChangeListener for Silent {
+        fn insert_char(&mut self, _idx: usize, _c: char) {}
+        fn insert_str(&mut self, _idx: usize, _string: &str) {}
+        fn replace(&mut self, _idx: usize, _old: &str, _new: &str) {}
+    }
+
+    fn multi_line_buffer(cursor: usize) -> LineBuffer {
+        let mut buf = LineBuffer::with_capacity(256);
+        assert!(buf.insert_str(0, "first line\nsecond line\nthird line", &mut Silent));
+        buf.set_pos(cursor);
+        buf
+    }
+
+    /// Home / End are bound to the BUFFER-wide movements, not the per-line
+    /// ones, so one press reaches the real edges of the operator's input even
+    /// when it spans several lines. This locks the semantics the bindings in
+    /// `RustylineEditor::new` select: with the cursor parked mid-way through
+    /// the middle line, `BeginningOfBuffer` must land on byte 0 (not on the
+    /// start of that line) and `EndOfBuffer` on the final byte (not on the
+    /// line's own end). A regression to `BeginningOfLine` / `EndOfLine` would
+    /// stop at the surrounding `\n`s and fail both assertions.
+    #[test]
+    fn home_and_end_reach_the_edges_of_multi_line_input() {
+        // Byte 15 is inside "second line" (line 2 starts at byte 11).
+        let mid = 15;
+        let full_len = "first line\nsecond line\nthird line".len();
+
+        let mut buf = multi_line_buffer(mid);
+        assert!(buf.move_buffer_start(), "Home must move from mid-buffer");
+        assert_eq!(
+            buf.pos(),
+            0,
+            "Home must reach the start of the whole input, not the start of the current line"
+        );
+        assert!(
+            !buf.move_buffer_start(),
+            "Home at the start of the input is a no-op"
+        );
+
+        let mut buf = multi_line_buffer(mid);
+        assert!(buf.move_buffer_end(), "End must move from mid-buffer");
+        assert_eq!(
+            buf.pos(),
+            full_len,
+            "End must reach the end of the whole input, not the end of the current line"
+        );
+        assert!(
+            !buf.move_buffer_end(),
+            "End at the end of the input is a no-op"
+        );
+    }
+
+    // Up / Down are intentionally NOT re-bound: rustyline's defaults
+    // (`LineUpOrPreviousHistory` / `LineDownOrNextHistory`) already move
+    // BETWEEN the lines of a multi-line input and only fall through to history
+    // recall when `LineBuffer::move_to_line_{up,down}` reports `false` — i.e.
+    // on the first / last line. That path isn't unit-testable from here because
+    // it needs a `rustyline::layout::Layout` (crate-private module) to resolve
+    // the target column, and it's covered by rustyline's own
+    // `line_buffer::tests`; the binding-level intent is documented at the
+    // Alt-Enter binding in `RustylineEditor::new`.
 
     /// A throwaway helper for constructing a `RustylineEditor` in tests. The
     /// completion cwd / PATH / aliases don't matter here — these tests exercise
