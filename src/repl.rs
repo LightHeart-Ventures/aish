@@ -11998,8 +11998,16 @@ mod tests {
                 "no capitalised default may be advertised: {opts}"
             );
             assert!(
-                opts.contains("then Enter"),
-                "the prompt must say the answer needs Enter: {opts}"
+                !opts.contains("Enter"),
+                "the request line must not carry Enter ceremony: {opts}"
+            );
+            // The requirement did not go away with the words: an answer is
+            // still a selection key *and* Enter. The hint printed after a bad
+            // answer is where that contract is spelled out, so it stays
+            // discoverable exactly when an operator needs it.
+            assert!(
+                answer_hint(sensitive).contains("Enter"),
+                "the hint must still teach the Enter requirement"
             );
         }
     }
