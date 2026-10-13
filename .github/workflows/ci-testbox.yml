@@ -53,7 +53,7 @@ jobs:
       # exists specifically to mirror ci.yml's gate, so the env must match.
       CARGO_INCREMENTAL: '0'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # First half of the Testbox pair: phone home, install the SSH key the
       # CLI will connect with, ensure rsync, and start the heartbeat. Must run
