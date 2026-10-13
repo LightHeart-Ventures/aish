@@ -12018,8 +12018,10 @@ mod tests {
     fn the_keystroke_cap_cannot_be_reached_by_a_human_but_bounds_a_wedged_tty() {
         // A correcting human presses a handful of keys; the cap only exists so a
         // tty spewing bytes without EOF terminates instead of spinning forever.
-        assert!(MAX_CONFIRM_KEYS > MAX_CONFIRM_RETRIES);
-        assert!(MAX_CONFIRM_KEYS >= 1024);
+        const {
+            assert!(MAX_CONFIRM_KEYS > MAX_CONFIRM_RETRIES);
+            assert!(MAX_CONFIRM_KEYS >= 1024);
+        }
     }
 
     #[test]
