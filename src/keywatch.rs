@@ -23,7 +23,7 @@
 //! Two other things legitimately want stdin during a turn, and the reader must get
 //! out of their way or it would steal their bytes (or, worse, get SIGTTIN):
 //!
-//! * **Interactive confirm prompts** (`confirm_tty`'s `y/N/a/d` read). Those need
+//! * **Interactive confirm prompts** (`confirm_tty`'s `y/n/a/d` read). Those need
 //!   cooked mode so the answer echoes and line-edits. [`pause_for_prompt`] returns
 //!   an RAII pause that flips the tty back to cooked and parks the reader for the
 //!   life of the prompt, then restores cbreak on drop.

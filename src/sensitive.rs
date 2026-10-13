@@ -165,8 +165,16 @@ pub fn split_prompt(prompt: &str) -> (&str, bool) {
 /// The option list a prompt may offer. A sensitive path can never be
 /// always-allowed or directory-granted, and an option that cannot be honoured
 /// must not be displayed.
+///
+/// No key is capitalised: the prompt has no bare-Enter default. An answer is a
+/// selection key followed by Enter, so `[y/n]` is the honest rendering and the
+/// `then Enter` is spelled out rather than left for the operator to discover.
 pub fn prompt_options(sensitive: bool) -> &'static str {
-    if sensitive { "[y/N]" } else { "[y/N/a/d]" }
+    if sensitive {
+        "[y/n] then Enter"
+    } else {
+        "[y/n/a/d] then Enter"
+    }
 }
 
 /// Clamp a parsed answer for a sensitive prompt: only a one-shot `y` is
@@ -673,8 +681,14 @@ mod tests {
         assert!(sensitive);
         assert!(body.contains("sensitive path (.ssh)"));
         assert!(body.contains("write /home/u/.ssh/id_rsa"));
-        assert_eq!(prompt_options(true), "[y/N]");
-        assert_eq!(prompt_options(false), "[y/N/a/d]");
+        assert_eq!(prompt_options(true), "[y/n] then Enter");
+        assert_eq!(prompt_options(false), "[y/n/a/d] then Enter");
+        // No capitalised key anywhere: there is no bare-Enter default to advertise.
+        assert!(!prompt_options(true).contains('N'));
+        assert!(!prompt_options(false).contains('N'));
+        // Both renderings tell the operator the answer needs Enter.
+        assert!(prompt_options(true).contains("then Enter"));
+        assert!(prompt_options(false).contains("then Enter"));
 
         // A plain prompt is untouched.
         let (body2, sensitive2) = split_prompt("write /tmp/x");

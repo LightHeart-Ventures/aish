@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Changed
+- A permission prompt no longer auto-submits on a single keypress. The prompt renders `[y/n/a/d] then Enter`, holds the keyboard off for one second after it is drawn (flushing the tty input queue on both sides of the pause) so an in-flight keystroke — typically the Enter that submitted the very request being gated — cannot answer it, and then requires a selection key **and** Enter. Unadvertised keys are ignored outright (no echo, no decision, no re-ask), Backspace clears a pending selection, a second selection key replaces the first, and Ctrl-C/Ctrl-D still cancels the prompt and the tool call. Bare Enter with nothing selected does nothing on a tty; a blank line on a pipe is still a refusal, so piped `y`/`n` automation is unchanged.
+
 ## [0.54.8] - 2026-10-12
 
 ### Fixed
