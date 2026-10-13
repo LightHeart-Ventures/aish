@@ -1,0 +1,6 @@
+# Review requests auto-route to the sole maintainer.
+# NOTE: the `main` ruleset deliberately sets require_code_owner_review=false and
+# required_approving_review_count=0 — GitHub forbids self-approval, so requiring
+# a code-owner review with a single maintainer would deadlock every PR.
+# This file exists for routing/notification, not as a merge gate.
+* @grhohertz
