@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
@@ -40,6 +40,19 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Round-trip budget for a `:mcp test` health probe. Short: a live server
 /// answers `tools/list` in well under a second; anything slower is a signal.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A stdio server that has not answered anything for this long gets an
+/// idempotent `ping` liveness probe before the next `tools/call`.
+///
+/// Nothing reads a stdio pipe between requests, so a child that died or
+/// wedged out from under us — `docker` daemon restart, container reaped,
+/// laptop sleep, `op run` session expiry — is invisible until the next call.
+/// Worse, a WEDGED (not closed) child fails that call as a 120 s
+/// `CALL_TIMEOUT`, which is not a broken pipe, so the one-shot auto-reconnect
+/// in [`McpHost::call`] never fires and the server stays dead for the rest of
+/// the session. The probe turns both cases into a 5 s detect + reconnect.
+const IDLE_PROBE_AFTER: Duration = Duration::from_secs(120);
+/// Round-trip budget for the idle `ping`. A live server answers in ms.
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub struct McpHost {
@@ -200,6 +213,9 @@ struct McpServer {
     next_id: u64,
     tools: Vec<McpTool>,
     prompts: Vec<McpPrompt>,
+    /// Last time this server ANSWERED a request — including with a JSON-RPC
+    /// error, which still proves it is alive. Drives the idle liveness probe.
+    last_ok: Instant,
 }
 
 impl McpHost {
@@ -654,6 +670,31 @@ impl McpHost {
         Ok((count, elapsed))
     }
 
+    /// Liveness-probe one server with an idempotent `ping`: `(alive,
+    /// round_trip)`. A `-32601 method not found` reply counts as ALIVE — the
+    /// server answered. Only a dead pipe or a 5 s timeout is death.
+    pub async fn ping(&mut self, name: &str) -> Result<(bool, Duration)> {
+        let server = self
+            .servers
+            .iter_mut()
+            .find(|s| s.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown mcp server: {name}"))?;
+        let start = Instant::now();
+        let alive = server.ping().await;
+        Ok((alive, start.elapsed()))
+    }
+
+    /// Probe every server in declaration order: `(name, alive, round_trip)`.
+    pub async fn ping_all(&mut self) -> Vec<(String, bool, Duration)> {
+        let mut out = Vec::with_capacity(self.servers.len());
+        for server in &mut self.servers {
+            let start = Instant::now();
+            let alive = server.ping().await;
+            out.push((server.name.clone(), alive, start.elapsed()));
+        }
+        out
+    }
+
     /// Route an `mcp__server__tool` call to its server, with one automatic
     /// reconnect on a broken-pipe / dead-child error (stdio transport).
     pub async fn call(&mut self, qualified: &str, args: &Value) -> Result<String> {
@@ -665,6 +706,35 @@ impl McpHost {
             .ok_or_else(|| anyhow::anyhow!("malformed mcp tool name: {qualified}"))?;
 
         let call_args = json!({"name": tool, "arguments": args});
+
+        // Keep-alive gate. A stdio child can die or wedge between calls and
+        // nothing notices, because nothing reads the pipe between requests.
+        // Probe an idle server with `ping` and reconnect BEFORE burning a
+        // 120 s CALL_TIMEOUT on a corpse (a timeout is not a broken pipe, so
+        // the retry below would never fire for a wedged child).
+        let idle = self
+            .servers
+            .iter()
+            .find(|s| s.name == server_name)
+            .is_some_and(|s| s.needs_idle_probe());
+        if idle {
+            let alive = {
+                let server = self
+                    .servers
+                    .iter_mut()
+                    .find(|s| s.name == server_name)
+                    .expect("just found");
+                server.ping().await
+            };
+            if !alive {
+                eprintln!(
+                    "\x1b[33maish:\x1b[0m mcp:{server_name} idle and unresponsive — reconnecting…"
+                );
+                self.reconnect(server_name)
+                    .await
+                    .with_context(|| format!("mcp:{server_name} reconnect failed"))?;
+            }
+        }
 
         // First attempt — store the result without keeping a live server borrow
         // so we can call reconnect() below without fighting the borrow checker.
@@ -901,6 +971,7 @@ impl McpServer {
             next_id: 0,
             tools: Vec::new(),
             prompts: Vec::new(),
+            last_ok: Instant::now(),
         };
 
         let init = server
@@ -1125,6 +1196,38 @@ impl McpServer {
     /// over HTTP the response body is the answer (SSE-framed bodies are
     /// unwrapped from their `data:` lines).
     async fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        let out = self.request_raw(method, params, timeout).await;
+        // An error REPLY still proves the server is alive — only a dead pipe
+        // or a timeout means it stopped answering.
+        if !matches!(&out, Err(e) if is_transport_dead(e)) {
+            self.last_ok = Instant::now();
+        }
+        out
+    }
+
+    /// Stdio server idle long enough to be worth a liveness probe. HTTP is
+    /// excluded: there is no child to wedge, and its notification stream
+    /// already self-reconnects.
+    fn needs_idle_probe(&self) -> bool {
+        matches!(self.transport, Transport::Stdio { .. })
+            && self.last_ok.elapsed() >= IDLE_PROBE_AFTER
+    }
+
+    /// Idempotent `ping` keep-alive. A `-32601 method not found` reply counts
+    /// as ALIVE — the server answered. Only a dead pipe or a timeout is death.
+    async fn ping(&mut self) -> bool {
+        match self.request("ping", json!({}), PING_TIMEOUT).await {
+            Ok(_) => true,
+            Err(e) => !is_transport_dead(&e),
+        }
+    }
+
+    async fn request_raw(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
@@ -1312,6 +1415,13 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
     false
 }
 
+/// True when the server stopped ANSWERING: a dead pipe (see
+/// [`is_broken_pipe`]) or a round-trip timeout. A JSON-RPC error reply is
+/// deliberately NOT included — the server answered, so it is alive.
+fn is_transport_dead(e: &anyhow::Error) -> bool {
+    is_broken_pipe(e) || e.chain().any(|c| c.to_string().contains("timed out after"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1386,6 +1496,66 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(body, "Hello world");
         assert!(host.get_skill("mock", "nope", &json!({})).await.is_err());
+    }
+
+    /// A JSON-RPC ERROR reply means the server answered — it is alive. Only a
+    /// dead pipe or a timeout counts as death, which is what makes `ping` a
+    /// safe liveness probe even against servers that don't implement it.
+    #[test]
+    fn transport_death_vs_error_reply() {
+        assert!(!is_transport_dead(&anyhow::anyhow!(
+            "ping: Method not found"
+        )));
+        assert!(is_transport_dead(&anyhow::anyhow!(
+            "ping: timed out after 5s"
+        )));
+        assert!(is_transport_dead(&anyhow::anyhow!(
+            "tools/call: server closed its stdout"
+        )));
+        assert!(is_transport_dead(
+            &anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                .context("tools/call")
+        ));
+    }
+
+    /// An idle stdio server gets probed and — when the probe finds it dead —
+    /// transparently reconnected, so the caller's `tools/call` still succeeds
+    /// instead of burning a 120 s CALL_TIMEOUT on a corpse.
+    #[tokio::test]
+    async fn idle_server_is_probed_and_reconnected() {
+        let script = std::env::temp_dir().join("aish_mock_mcp_idle.py");
+        std::fs::write(&script, MOCK_SERVER).unwrap();
+        let spec = json!({"command": "python3", "args": [script.to_str().unwrap()]});
+
+        let server = match McpServer::start("mock", &spec).await {
+            Ok(s) => s,
+            Err(e) if format!("{e:#}").contains("failed to spawn") => return, // no python3
+            Err(e) => panic!("handshake failed: {e:#}"),
+        };
+        let mut host = McpHost {
+            servers: vec![server],
+            ..Default::default()
+        };
+        // Fresh server: no probe.
+        assert!(!host.servers[0].needs_idle_probe());
+
+        // Backdate the liveness clock past the idle threshold and kill the
+        // child so the probe has something real to detect.
+        host.servers[0].last_ok = Instant::now()
+            .checked_sub(IDLE_PROBE_AFTER + Duration::from_secs(1))
+            .expect("monotonic clock has headroom");
+        assert!(host.servers[0].needs_idle_probe());
+        if let Transport::Stdio { _child, .. } = &mut host.servers[0].transport {
+            _child.kill().await.unwrap();
+        }
+
+        let out = host
+            .call("mcp__mock__add", &json!({"a": 20, "b": 22}))
+            .await
+            .expect("idle probe should have reconnected the dead server");
+        assert_eq!(out, "42");
+        // The successful call reset the liveness clock.
+        assert!(!host.servers[0].needs_idle_probe());
     }
 
     #[test]

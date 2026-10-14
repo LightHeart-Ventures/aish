@@ -9920,6 +9920,7 @@ async fn handle_colon(
                  :model-detect                       re-detect + select the best local model for this machine\n\
                  :backend <claude|grok|openai|openrouter|local>  switch backend\n\
                  :mcp [list|status]                  list connected MCP servers\n\
+                 :mcp ping [name|all]                liveness-probe MCP server(s) — idempotent ping + latency\n\
                  :mcp reconnect [name|all]           restart MCP server(s)\n\
                  :mcp reload [name…]                 re-scan .mcp.json: add new + reconnect changed (config or env)\n\
                  :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
@@ -11236,6 +11237,33 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 );
             }
         }
+        // Manual liveness probe. Same `ping` the call path fires on an idle
+        // server — handy to confirm a long-idle docker-backed server (whose
+        // container the daemon may have reaped) is still answering.
+        Some((&"ping", rest)) => {
+            let results = if rest.is_empty() || (rest.len() == 1 && rest[0] == "all") {
+                session.mcp.ping_all().await
+            } else {
+                let mut out = Vec::new();
+                for name in rest {
+                    match session.mcp.ping(name).await {
+                        Ok((alive, rtt)) => out.push(((*name).to_string(), alive, rtt)),
+                        Err(e) => println!("ping {name}: {e:#}"),
+                    }
+                }
+                out
+            };
+            if results.is_empty() {
+                println!("no MCP servers to ping");
+            }
+            for (name, alive, rtt) in results {
+                if alive {
+                    println!("  {name}: alive ({} ms)", rtt.as_millis());
+                } else {
+                    println!("  {name}: NOT RESPONDING — `:mcp reconnect {name}`");
+                }
+            }
+        }
         Some((&"reconnect", rest)) => {
             if rest.is_empty() || (rest.len() == 1 && rest[0] == "all") {
                 let results = session.mcp.reconnect_all().await;
@@ -11390,7 +11418,7 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
         }
         Some((other, _)) => {
             println!(
-                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|reload|add|remove|tools|test]"
+                "unknown :mcp subcommand '{other}' — usage: :mcp [list|ping|reconnect|reload|add|remove|tools|test]"
             )
         }
     }
