@@ -4,8 +4,16 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-10-14
+
+### Added
+- `Home` / `End` now jump to the start / end of the **whole operator input** instead of the nearest newline, so reaching the edges of a multi-line (`Alt-Enter`) composition is one keypress instead of one per line. `Ctrl-A` / `Ctrl-E` keep the per-line moves, and `Up` / `Down` still walk the input's own lines before falling through to history recall at the first / last line.
+
 ### Changed
 - The permission prompt no longer advertises `then Enter`. The request line renders a bare `[y/n]` / `[y/n/a/d]`; the key-**plus**-Enter gate from 0.54.9 is unchanged — a keypress alone still submits nothing, and a bare Enter with nothing selected still does nothing, so the Enter that submitted the gated request still cannot answer it. The Enter requirement is now carried by the hint printed after an unrecognised answer, which is exactly when an operator needs to be told, instead of spending three words of ceremony on every request.
+
+### Fixed
+- Resizing the window at an idle prompt no longer leaves a dead prompt stranded on the old row. The input row is pinned at an absolute row, and `handle_resize` only runs *between* prompts, so a resize while the editor was blocked in `read_line` repainted every footer row except the one that moved. The footer heartbeat now detects the new geometry on its first paint and re-parks the resting prompt (and the caret) on the new input row — only while reading with a clean buffer, so it can't fight an in-progress edit.
 
 ## [0.54.9] - 2026-10-13
 
