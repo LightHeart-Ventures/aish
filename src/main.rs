@@ -98,7 +98,10 @@ mod transcript_ring;
 mod turn_audit;
 mod update;
 mod webhook;
+// `:whatnext` / `:next` / `:wn` — session context handed to the model as an
+// INPUT ("what should I do next?") instead of running a command.
 mod webhook_debug;
+mod whatnext;
 mod worker;
 mod worker_store;
 mod workers_modal;

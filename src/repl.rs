@@ -1389,6 +1389,21 @@ pub async fn run(
                     continue;
                 }
 
+                // "What next?" as an INPUT, not a command (`:whatnext`, aliases
+                // `:next` / `:wn`). The sibling `:suggest` above answers in the
+                // COMMAND register — one shell line, prefilled to accept. That's
+                // the wrong shape when the next move is a judgement call, and
+                // forcing it invents plausible-looking shell. So this builds the
+                // session context into a natural-language question and hands it
+                // to the model as a normal forced-model turn (`?`), where it has
+                // the full toolset to check state and answer — or just do the
+                // cheap reversible step. Nothing is dispatched as a command.
+                if let Some(focus) = crate::whatnext::parse_invocation(&line) {
+                    let input = crate::whatnext::build_from_session(&session, focus);
+                    injected = Some(crate::whatnext::injected_line(&input));
+                    continue;
+                }
+
                 if let Some(cmd) = line.strip_prefix(':') {
                     if handle_colon(cmd, &mut backend, &mut session, &mut pending_update).await {
                         break;
@@ -2974,6 +2989,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     (
         "webhook",
         "webhook broker client (status|reload|logs|test|replay)",
+    ),
+    (
+        "whatnext",
+        "ask the model what to do next from session context (aliases :next, :wn)",
     ),
     (
         "workers",
@@ -9976,6 +9995,7 @@ async fn handle_colon(
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
+                 :whatnext [focus]                   ask the model what to do next from session context — an answer, not a command (aliases :next, :wn)\n\
                  :alert <condition>                  monitor for a condition and surface it in the console when met (native file/PR/command probe,\n\
                                                      or a delegated agent for free-form conditions); distinct audible cue. :alert list, :alert clear <id|all>\n\
                  :activity [n|clear]                 recoverable tray of fired :alerts / notable events (last N) with severity-tiered badges; :activity clear\n\
