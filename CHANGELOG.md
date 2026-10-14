@@ -5,7 +5,7 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 ## [Unreleased]
 
 ### Fixed
-- Shift-Tab back to the interactive slot **mid-turn** no longer lands on an empty screen. The slot-0 wrap closed the worker pane and repainted nothing, so hopping back while a turn was in flight looked like the conversation had been lost. The operator's conversation tail is now snapshotted at turn start (`interactive_tail_rows`) and replayed by `cycle_worker_live` through the same renderer the post-turn `:detach` path uses, so both return paths print the same block — and a `clear` the operator ran is still honored (cleared scrollback does not come back).
+- (PR #994) Shift-Tab back to the interactive slot **mid-turn** no longer lands on an empty screen. The slot-0 wrap closed the worker pane and repainted nothing, so hopping back while a turn was in flight looked like the conversation had been lost. The operator's conversation tail is now snapshotted at turn start (`interactive_tail_rows`) and replayed by `cycle_worker_live` through the same renderer the post-turn `:detach` path uses, so both return paths print the same block — and a `clear` the operator ran is still honored (cleared scrollback does not come back).
 
 ## [0.55.0] - 2026-10-14
 
