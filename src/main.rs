@@ -148,7 +148,7 @@ struct Args {
     #[arg(long)]
     local: bool,
 
-    /// Model override (e.g. claude-haiku-4-5)
+    /// Model override (e.g. claude-haiku-5-5)
     #[arg(long)]
     model: Option<String>,
 
@@ -487,7 +487,8 @@ async fn main() -> Result<()> {
         "claude" => {
             let cred = backend::claude::Credential::resolve(&session.env)?;
             backend::Backend::new_claude(
-                args.model.unwrap_or_else(|| "claude-haiku-4-5".into()),
+                args.model
+                    .unwrap_or_else(|| backend::claude::DEFAULT_MODEL.into()),
                 cred,
             )?
         }

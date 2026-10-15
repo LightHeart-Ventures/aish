@@ -2554,20 +2554,106 @@ fn unwrap_noexec_builtin(program: &str, args: &[String]) -> Option<(String, Vec<
     }
 }
 
+/// Human-readable JSON type name, for argv coercion diagnostics.
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Coerce a model-emitted `args` payload into a real argv.
+///
+/// The schema asks for an array of strings, but models routinely deviate, and
+/// the previous `as_array().filter_map(as_str).unwrap_or_default()` turned
+/// every deviation into SILENT ARGUMENT LOSS — the worst failure mode
+/// available here, because the command still runs, just not the one that was
+/// asked for:
+///
+/// * A stringified array (`args: "[\"--version\"]"`) failed `as_array()`, hit
+///   `unwrap_or_default()`, and collapsed to an EMPTY argv — so `git --version`
+///   exec'd as a bare `git`, which prints its usage block and exits non-zero.
+///   That is precisely the "git is broken / git won't respond to anything,
+///   even --version" report, and it also makes a working binary look
+///   "intercepted" because it never does what was asked.
+/// * A non-string element (`args: ["-n", 5]`) was dropped mid-argv by
+///   `filter_map`, so `git log -n 5` exec'd as `git log -n`.
+///
+/// Policy: coerce what is unambiguous, and ERROR on what is not. Never drop.
+/// An error is recoverable — the model is told to resend argv as an array and
+/// retries — whereas a silently truncated argv runs the wrong command and is
+/// then misdiagnosed as a broken binary.
+///
+/// - array → element-wise: strings as-is, numbers/bools stringified; a
+///   null/array/object element errors, naming its index.
+/// - string → a JSON-array payload is parsed and coerced element-wise;
+///   otherwise split on whitespace (the schema already documents argv as
+///   unquoted, unescaped tokens).
+/// - absent/null  → empty argv (a program with no arguments is legitimate).
+/// - anything else → error.
+///
+/// Pure + unit-tested.
+pub(crate) fn coerce_argv(raw: &serde_json::Value) -> Result<Vec<String>> {
+    fn element(v: &serde_json::Value, idx: usize) -> Result<String> {
+        match v {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            serde_json::Value::Number(n) => Ok(n.to_string()),
+            serde_json::Value::Bool(b) => Ok(b.to_string()),
+            other => anyhow::bail!(
+                "args[{idx}] is {} — every argv token must be a string; \
+resend args as a flat array of strings",
+                json_kind(other)
+            ),
+        }
+    }
+
+    fn all(items: &[serde_json::Value]) -> Result<Vec<String>> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, v)| element(v, i))
+            .collect()
+    }
+
+    match raw {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(items) => all(items),
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(Vec::new());
+            }
+            // A stringified JSON array is the common model slip; recover it
+            // losslessly instead of whitespace-splitting its punctuation into
+            // garbage tokens like `["--version"]`.
+            let as_json = if t.starts_with('[') {
+                serde_json::from_str::<serde_json::Value>(t).ok()
+            } else {
+                None
+            };
+            if let Some(serde_json::Value::Array(items)) = as_json {
+                return all(&items);
+            }
+            Ok(t.split_whitespace().map(String::from).collect())
+        }
+        other => anyhow::bail!(
+            "args must be an array of strings, got {} — pass argv as [\"a\", \"b\"]",
+            json_kind(other)
+        ),
+    }
+}
+
 /// Extract (program, args) from a tool call.
 fn parse_argv(call: &ToolCall) -> Result<(String, Vec<String>)> {
     let program = call.args["program"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing program"))?
         .to_string();
-    let args: Vec<String> = call.args["args"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let args: Vec<String> = coerce_argv(&call.args["args"])?;
     // Defend against the model echoing the binary into argv[0] (see
     // dedup_program_argv): `gh gh pr create` would otherwise fail as an unknown
     let args = dedup_program_argv(&program, args);
@@ -7211,6 +7297,91 @@ mod tests {
         // Absolute-path program + subcommand is likewise passed through intact.
         let (p, a) = parse_argv(&call("/usr/bin/git", &["status"], None)).unwrap();
         assert_eq!((p.as_str(), a), ("/usr/bin/git", v(&["status"])));
+    }
+
+    /// The second half of the "git is broken" false alarm. The PR #489 guard
+    /// above locks in the well-formed path; this locks in the MALFORMED paths,
+    /// which previously degraded to an empty/truncated argv instead of an
+    /// error. Silent argv loss is uniquely bad: the binary still runs, prints
+    /// its usage block, and gets reported as a broken or intercepted binary —
+    /// "git won't even answer --version".
+    #[test]
+    fn coerce_argv_never_silently_drops_arguments() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Well-formed argv is byte-for-byte identity.
+        assert_eq!(
+            coerce_argv(&json!(["log", "--oneline", "-n", "1"])).unwrap(),
+            v(&["log", "--oneline", "-n", "1"])
+        );
+
+        // Absent / null / empty => a legitimately empty argv, not an error.
+        assert_eq!(coerce_argv(&serde_json::Value::Null).unwrap(), v(&[]));
+        assert_eq!(coerce_argv(&json!([])).unwrap(), v(&[]));
+        assert_eq!(coerce_argv(&json!("   ")).unwrap(), v(&[]));
+
+        // THE REPORTED BUG: a stringified JSON array used to fail `as_array()`
+        // and fall through `unwrap_or_default()` to an EMPTY argv, so
+        // `git --version` exec'd as a bare `git` and printed usage.
+        assert_eq!(
+            coerce_argv(&json!("[\"--version\"]")).unwrap(),
+            v(&["--version"])
+        );
+        assert_eq!(
+            coerce_argv(&json!("[\"status\", \"-sb\"]")).unwrap(),
+            v(&["status", "-sb"])
+        );
+
+        // A bare string argv is split into tokens rather than discarded.
+        assert_eq!(
+            coerce_argv(&json!("log --oneline -n 1")).unwrap(),
+            v(&["log", "--oneline", "-n", "1"])
+        );
+        assert_eq!(coerce_argv(&json!("--version")).unwrap(), v(&["--version"]));
+
+        // Non-string elements used to be dropped MID-ARGV by `filter_map`,
+        // silently turning `git log -n 5` into `git log -n`. Coerce instead.
+        assert_eq!(coerce_argv(&json!(["-n", 5])).unwrap(), v(&["-n", "5"]));
+        assert_eq!(
+            coerce_argv(&json!(["--flag", true])).unwrap(),
+            v(&["--flag", "true"])
+        );
+
+        // Genuinely ambiguous shapes ERROR (recoverable: the model resends)
+        // rather than executing a truncated command.
+        for bad in [json!([null]), json!([["nested"]]), json!([{"k": "v"}])] {
+            let err = coerce_argv(&bad)
+                .expect_err("must not silently drop")
+                .to_string();
+            assert!(err.contains("args[0]"), "error must name the index: {err}");
+        }
+        let err = coerce_argv(&json!({"program": "git"}))
+            .expect_err("object argv must not be swallowed")
+            .to_string();
+        assert!(err.contains("array of strings"), "{err}");
+    }
+
+    /// End-to-end: the malformed shapes must reach the real argv through
+    /// `parse_argv`, not just through `coerce_argv` in isolation.
+    #[test]
+    fn parse_argv_recovers_stringified_argv() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let mut c = call("git", &[], None);
+        c.args["args"] = json!("[\"--version\"]");
+        let (p, a) = parse_argv(&c).unwrap();
+        assert_eq!((p.as_str(), a), ("git", v(&["--version"])));
+
+        let mut c = call("git", &[], None);
+        c.args["args"] = json!("status -sb");
+        let (p, a) = parse_argv(&c).unwrap();
+        assert_eq!((p.as_str(), a), ("git", v(&["status", "-sb"])));
+
+        // A missing `args` key is still a valid zero-argument invocation.
+        let mut c = call("ls", &[], None);
+        c.args.as_object_mut().unwrap().remove("args");
+        let (p, a) = parse_argv(&c).unwrap();
+        assert_eq!((p.as_str(), a), ("ls", v(&[])));
     }
 
     #[tokio::test]
