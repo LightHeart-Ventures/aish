@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Added
+- `:whatnext` (aliases `:next`, `:wn`) asks the model what to do next as an **input**, not a command. Where `:suggest` answers in the command register — one shell line, prefilled to accept — this builds a natural-language question out of the session (cwd, host OS, the last 10 command lines, a bounded 800-char slice of the last output, plus any focus typed after the invocation) and hands it to the model as a normal forced-model turn, so it can check repo/CI/board state with its full toolset and answer with a judgement — or just do the cheap reversible step itself. Nothing is dispatched as a command, so the suggest path's worst failure mode (a plausible-looking command invented because the contract demanded one line of shell) can't happen here.
+
 ## [0.55.0] - 2026-10-14
 
 ### Added
