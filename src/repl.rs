@@ -1389,6 +1389,21 @@ pub async fn run(
                     continue;
                 }
 
+                // "What next?" as an INPUT, not a command (`:whatnext`, aliases
+                // `:next` / `:wn`). The sibling `:suggest` above answers in the
+                // COMMAND register — one shell line, prefilled to accept. That's
+                // the wrong shape when the next move is a judgement call, and
+                // forcing it invents plausible-looking shell. So this builds the
+                // session context into a natural-language question and hands it
+                // to the model as a normal forced-model turn (`?`), where it has
+                // the full toolset to check state and answer — or just do the
+                // cheap reversible step. Nothing is dispatched as a command.
+                if let Some(focus) = crate::whatnext::parse_invocation(&line) {
+                    let input = crate::whatnext::build_from_session(&session, focus);
+                    injected = Some(crate::whatnext::injected_line(&input));
+                    continue;
+                }
+
                 if let Some(cmd) = line.strip_prefix(':') {
                     if handle_colon(cmd, &mut backend, &mut session, &mut pending_update).await {
                         break;
@@ -2986,6 +3001,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     (
         "webhook",
         "webhook broker client (status|reload|logs|test|replay)",
+    ),
+    (
+        "whatnext",
+        "ask the model what to do next from session context (aliases :next, :wn)",
     ),
     (
         "workers",
@@ -9950,6 +9969,7 @@ async fn handle_colon(
                  :model-detect                       re-detect + select the best local model for this machine\n\
                  :backend <claude|grok|openai|openrouter|local>  switch backend\n\
                  :mcp [list|status]                  list connected MCP servers\n\
+                 :mcp ping [name|all]                liveness-probe MCP server(s) — idempotent ping + latency\n\
                  :mcp reconnect [name|all]           restart MCP server(s)\n\
                  :mcp reload [name…]                 re-scan .mcp.json: add new + reconnect changed (config or env)\n\
                  :mcp add <name> <command|url> [args] connect + save an MCP server (~/.aish/.mcp.json)\n\
@@ -10006,6 +10026,7 @@ async fn handle_colon(
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
+                 :whatnext [focus]                   ask the model what to do next from session context — an answer, not a command (aliases :next, :wn)\n\
                  :alert <condition>                  monitor for a condition and surface it in the console when met (native file/PR/command probe,\n\
                                                      or a delegated agent for free-form conditions); distinct audible cue. :alert list, :alert clear <id|all>\n\
                  :activity [n|clear]                 recoverable tray of fired :alerts / notable events (last N) with severity-tiered badges; :activity clear\n\
@@ -11266,6 +11287,33 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
                 );
             }
         }
+        // Manual liveness probe. Same `ping` the call path fires on an idle
+        // server — handy to confirm a long-idle docker-backed server (whose
+        // container the daemon may have reaped) is still answering.
+        Some((&"ping", rest)) => {
+            let results = if rest.is_empty() || (rest.len() == 1 && rest[0] == "all") {
+                session.mcp.ping_all().await
+            } else {
+                let mut out = Vec::new();
+                for name in rest {
+                    match session.mcp.ping(name).await {
+                        Ok((alive, rtt)) => out.push(((*name).to_string(), alive, rtt)),
+                        Err(e) => println!("ping {name}: {e:#}"),
+                    }
+                }
+                out
+            };
+            if results.is_empty() {
+                println!("no MCP servers to ping");
+            }
+            for (name, alive, rtt) in results {
+                if alive {
+                    println!("  {name}: alive ({} ms)", rtt.as_millis());
+                } else {
+                    println!("  {name}: NOT RESPONDING — `:mcp reconnect {name}`");
+                }
+            }
+        }
         Some((&"reconnect", rest)) => {
             if rest.is_empty() || (rest.len() == 1 && rest[0] == "all") {
                 let results = session.mcp.reconnect_all().await;
@@ -11420,7 +11468,7 @@ async fn handle_mcp(args: Vec<&str>, session: &mut Session) {
         }
         Some((other, _)) => {
             println!(
-                "unknown :mcp subcommand '{other}' — usage: :mcp [list|reconnect|reload|add|remove|tools|test]"
+                "unknown :mcp subcommand '{other}' — usage: :mcp [list|ping|reconnect|reload|add|remove|tools|test]"
             )
         }
     }
