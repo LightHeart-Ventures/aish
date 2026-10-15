@@ -130,11 +130,28 @@ rather than letting redundant work run.
 | `AISH_CALL_BUDGET_SOFT` | 35 | 1–100000 | Cumulative tool calls in one turn before a one-shot soft advisory logs (`call-budget-guard` soft). Advisory only — never yields. |
 | `AISH_CALL_BUDGET_HARD` | 50 | 1–100000 | Cumulative tool calls in one turn before the turn gracefully yields to resume with fresh context (`call-budget-guard` hard / `CallBudgetExceeded`). Raise it for a genuinely-wide but legitimate turn — a large multi-file edit+build+test batch that can't be split — so it doesn't false-trip and drain the auto-recovery budget. Default behaviour is unchanged. |
 
+`AISH_CALL_BUDGET_SOFT` / `AISH_CALL_BUDGET_HARD` are resolved **session exports
+first, then the process environment**, so both of these work:
+
+```sh
+export AISH_CALL_BUDGET_HARD=100   # at the aish prompt, or a line in ~/.aishrc
+AISH_CALL_BUDGET_HARD=100 aish     # ambient, before aish starts
+```
+
+The last `export` of a name wins, and an unparseable or out-of-range value falls
+back to the default — a typo can neither uncap nor zero-cap the guard. The other
+knobs in this table are still read from the process environment only.
+
 ## Tests
 
 - `db::tests::failed_attempts_counts_only_matching_failed_runs`
 - `turn_audit::tests::synthesis_is_journaled_and_ignored_on_replay`
 - `coordinator::tests::clamp_usize_parses_clamps_and_falls_back`
+- `engine::tests::call_budget_honours_session_exports`
+- `engine::tests::call_budget_honours_a_lone_export`
+- `engine::tests::call_budget_last_export_wins`
+- `engine::tests::call_budget_rejects_junk_and_out_of_range_exports`
+- `engine::tests::call_budget_trims_whitespace`
 - `coordinator::tests::failed_retention_plan_keeps_recent_and_drops_old_and_excess` (#129 item 5)
 - `coordinator::tests::failed_retention_plan_is_idempotent_and_order_independent` (#129 item 5)
 - `coordinator::tests::reap_failed_runs_trims_failed_only_to_bound` (#129 item 5)

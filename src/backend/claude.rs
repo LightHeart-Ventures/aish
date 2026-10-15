@@ -5,6 +5,13 @@ use std::time::Duration;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
+/// Default Claude model for an interactive `aish` session (and the `haiku`
+/// shorthand of `:model` / `:batch model`). The newest Haiku generation on the
+/// Messages API — the cheapest/fastest tier that still drives the tool loop, so
+/// an interactive shell stays snappy; escalate to Sonnet/Opus per-turn with
+/// `:model sonnet` / `:model opus` or pin another id with `--model`.
+pub const DEFAULT_MODEL: &str = "claude-haiku-5-5";
+
 /// Retry bookkeeping shared by the buffered ([`ClaudeBackend::post_with_retry`])
 /// and streaming ([`ClaudeBackend::stream_with_retry`]) loops. Two INDEPENDENT
 /// budgets keep a rate limit and a flaky network from cannibalizing each other's
@@ -1533,8 +1540,11 @@ mod tests {
         let hist = vec![Msg::user("hi")];
         assert!(wants_thinking("claude-opus-4-9", &hist));
         assert!(wants_thinking("claude-sonnet-4-6", &hist));
-        // Haiku never takes adaptive thinking.
+        // Haiku never takes adaptive thinking — including the interactive
+        // default, which is a Haiku id by policy.
         assert!(!wants_thinking("claude-haiku-4-5", &hist));
+        assert!(DEFAULT_MODEL.contains("haiku"));
+        assert!(!wants_thinking(DEFAULT_MODEL, &hist));
         // A trailing ASSISTANT message is a prefill (truncation continuation) —
         // thinking must be suppressed or the API rejects the request.
         let prefill = vec![

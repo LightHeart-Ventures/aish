@@ -10773,7 +10773,7 @@ async fn handle_colon(
                 let id = match m {
                     "opus" => "claude-opus-5",
                     "sonnet" => "claude-sonnet-4-6",
-                    "haiku" => "claude-haiku-4-5",
+                    "haiku" => crate::backend::claude::DEFAULT_MODEL,
                     other => other,
                 };
                 backend.set_model(id.to_string());
@@ -11619,7 +11619,7 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
                 let id = match m {
                     "opus" => "claude-opus-5",
                     "sonnet" => "claude-sonnet-4-6",
-                    "haiku" => "claude-haiku-4-5",
+                    "haiku" => crate::backend::claude::DEFAULT_MODEL,
                     other => other,
                 };
                 session.batch_model = id.to_string();

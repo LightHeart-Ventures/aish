@@ -75,7 +75,7 @@ Design: [docs/design/voice-input.md](./docs/design/voice-input.md).
 - **No shell underneath.** `run_program` execs one binary with an argv array.
   Pipes, globs, redirection don't exist — the model chains tool calls and
   filters output itself. (`aish` refuses to exec `sh`/`bash`/etc.)
-- **Hybrid brain.** Claude API (`claude-opus-4-8` default) or fully-offline
+- **Hybrid brain.** Claude API (`claude-haiku-5-5` default) or fully-offline
   in-process inference via [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
   (Qwen3-1.7B GGUF default, lazy-loaded from the HF cache on first use with a
   download progress bar; swap via `AISH_LOCAL_MODEL_ID` — no rebuild).
