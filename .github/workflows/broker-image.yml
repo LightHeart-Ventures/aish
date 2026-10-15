@@ -34,10 +34,10 @@ jobs:
     name: build broker image (no push)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Docker builder (Blacksmith)
-        uses: useblacksmith/setup-docker-builder@v1
+        uses: useblacksmith/setup-docker-builder@v2
 
       - name: Build broker image
         uses: useblacksmith/build-push-action@v2

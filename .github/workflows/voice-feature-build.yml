@@ -38,7 +38,7 @@ jobs:
     # Gating as of TASK-367 — voice feature pipeline is complete.
     continue-on-error: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install native voice prerequisites
         run: |
