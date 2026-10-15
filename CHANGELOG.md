@@ -4,11 +4,14 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-10-15
+
 ### Added
 - `:whatnext` (aliases `:next`, `:wn`) asks the model what to do next as an **input**, not a command. Where `:suggest` answers in the command register — one shell line, prefilled to accept — this builds a natural-language question out of the session (cwd, host OS, the last 10 command lines, a bounded 800-char slice of the last output, plus any focus typed after the invocation) and hands it to the model as a normal forced-model turn, so it can check repo/CI/board state with its full toolset and answer with a judgement — or just do the cheap reversible step itself. Nothing is dispatched as a command, so the suggest path's worst failure mode (a plausible-looking command invented because the contract demanded one line of shell) can't happen here.
 
 ### Fixed
 - (PR #994) Shift-Tab back to the interactive slot **mid-turn** no longer lands on an empty screen. The slot-0 wrap closed the worker pane and repainted nothing, so hopping back while a turn was in flight looked like the conversation had been lost. The operator's conversation tail is now snapshotted at turn start (`interactive_tail_rows`) and replayed by `cycle_worker_live` through the same renderer the post-turn `:detach` path uses, so both return paths print the same block — and a `clear` the operator ran is still honored (cleared scrollback does not come back).
+- (PR #993) An idle or wedged stdio MCP server is now detected and recovered instead of eating a 120 s timeout. Each server tracks `last_ok` (the last time it answered *anything* — a JSON-RPC error reply still proves liveness); before a `tools/call` on a stdio server idle longer than 120 s, aish sends an idempotent `ping` with a 5 s budget and reconnects first when only a dead pipe or a timeout comes back. A `-32601 method not found` reply counts as alive, so servers that don't implement `ping` are unaffected, mutating calls are never retried after a timeout, and HTTP transports are excluded. Adds `:mcp ping [name|all]` to fire the same probe by hand with per-server latency.
 
 ## [0.55.0] - 2026-10-14
 
