@@ -4,8 +4,22 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Added
+- `:whatnext` (aliases `:next`, `:wn`) asks the model what to do next as an **input**, not a command. Where `:suggest` answers in the command register — one shell line, prefilled to accept — this builds a natural-language question out of the session (cwd, host OS, the last 10 command lines, a bounded 800-char slice of the last output, plus any focus typed after the invocation) and hands it to the model as a normal forced-model turn, so it can check repo/CI/board state with its full toolset and answer with a judgement — or just do the cheap reversible step itself. Nothing is dispatched as a command, so the suggest path's worst failure mode (a plausible-looking command invented because the contract demanded one line of shell) can't happen here.
+
+### Fixed
+- (PR #994) Shift-Tab back to the interactive slot **mid-turn** no longer lands on an empty screen. The slot-0 wrap closed the worker pane and repainted nothing, so hopping back while a turn was in flight looked like the conversation had been lost. The operator's conversation tail is now snapshotted at turn start (`interactive_tail_rows`) and replayed by `cycle_worker_live` through the same renderer the post-turn `:detach` path uses, so both return paths print the same block — and a `clear` the operator ran is still honored (cleared scrollback does not come back).
+
+## [0.55.0] - 2026-10-14
+
+### Added
+- `Home` / `End` now jump to the start / end of the **whole operator input** instead of the nearest newline, so reaching the edges of a multi-line (`Alt-Enter`) composition is one keypress instead of one per line. `Ctrl-A` / `Ctrl-E` keep the per-line moves, and `Up` / `Down` still walk the input's own lines before falling through to history recall at the first / last line.
+
 ### Changed
 - The permission prompt no longer advertises `then Enter`. The request line renders a bare `[y/n]` / `[y/n/a/d]`; the key-**plus**-Enter gate from 0.54.9 is unchanged — a keypress alone still submits nothing, and a bare Enter with nothing selected still does nothing, so the Enter that submitted the gated request still cannot answer it. The Enter requirement is now carried by the hint printed after an unrecognised answer, which is exactly when an operator needs to be told, instead of spending three words of ceremony on every request.
+
+### Fixed
+- Resizing the window at an idle prompt no longer leaves a dead prompt stranded on the old row. The input row is pinned at an absolute row, and `handle_resize` only runs *between* prompts, so a resize while the editor was blocked in `read_line` repainted every footer row except the one that moved. The footer heartbeat now detects the new geometry on its first paint and re-parks the resting prompt (and the caret) on the new input row — only while reading with a clean buffer, so it can't fight an in-progress edit.
 
 ## [0.54.9] - 2026-10-13
 

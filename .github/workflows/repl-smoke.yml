@@ -33,7 +33,7 @@ jobs:
     env:
       AGENT_TTY_VERSION: '0.5.0'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: |
@@ -71,7 +71,7 @@ jobs:
         run: cargo build --release --no-default-features --locked
 
       - name: Set up Node 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
 
@@ -103,7 +103,7 @@ jobs:
 
       - name: Upload REPL artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aish-repl-smoke-artifacts
           path: tests/repl/artifacts/*

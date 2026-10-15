@@ -620,12 +620,41 @@ fn effective_input_line() -> Option<String> {
     if let Some(s) = MIDTURN_INPUT.lock().ok().and_then(|g| g.clone()) {
         return Some(s);
     }
-    Some(
-        LAST_PROMPT
-            .lock()
-            .map(|p| p.clone())
-            .unwrap_or_else(|e| e.into_inner().clone()),
-    )
+    Some(cached_prompt())
+}
+
+/// The resting prompt, as cached by [`park_input_row`].
+fn cached_prompt() -> String {
+    LAST_PROMPT
+        .lock()
+        .map(|p| p.clone())
+        .unwrap_or_else(|e| e.into_inner().clone())
+}
+
+/// [`effective_input_line`], except a RESIZE overrides the "leave the row alone
+/// while reading" rule.
+///
+/// THE BUG THIS FIXES: the input row is pinned at an ABSOLUTE row (H-2), but the
+/// editor is blocked inside a read for nearly all of an idle shell's life — and
+/// `handle_resize` only runs BETWEEN prompts. So a window resize while parked at
+/// the prompt repainted the separator/message/statusline at the new bottom and
+/// deliberately skipped the input row, leaving the prompt (and the cursor)
+/// stranded on the OLD row: a dead prompt mid-screen on a grow, a prompt buried
+/// under the footer on a shrink, and a blank input row either way. It read as
+/// "aish doesn't redraw on resize".
+///
+/// The hazard the `None` exists for — fighting rustyline's own line render — is
+/// `input_dirty`, and the heartbeat already refuses to paint at all while that is
+/// set at the prompt. So when the geometry moved under a read with an EMPTY
+/// buffer, repainting the resting prompt on the NEW input row is both safe and
+/// the only thing that can heal it. The caller then leaves the cursor there (see
+/// [`footer_seq_resized`]) so rustyline's next render — `\r`, erase, prompt —
+/// lands on the right row.
+fn effective_input_line_resized(resized: bool) -> Option<String> {
+    if resized && READING_LINE.load(Ordering::Relaxed) && !INPUT_DIRTY.load(Ordering::Relaxed) {
+        return Some(cached_prompt());
+    }
+    effective_input_line()
 }
 
 /// Paint the operator's mid-turn prompt + type-ahead line into the footer's
@@ -1166,8 +1195,14 @@ fn paint_cached_footer_locked(home_body: bool, _boundary: &MutexGuard<'_, ()>) {
     // is what the footer heartbeat drives).
     crate::escalation::sweep();
     // Record the size we're painting at so the heartbeat can detect a later
-    // resize and refresh the footer to the new canvas dimensions on sight.
-    LAST_PAINTED_SIZE.store(pack_size(rows, cols), Ordering::Relaxed);
+    // resize and refresh the footer to the new canvas dimensions on sight. The
+    // comparison against the PREVIOUS paint is also what tells `footer_seq` this
+    // is the first paint at a new geometry: on a resize the absolute input row
+    // moved, so the parked prompt has to be re-painted (and the cursor re-homed)
+    // even though the editor is blocked inside a read and normally owns that row.
+    let packed = pack_size(rows, cols);
+    let prev = LAST_PAINTED_SIZE.swap(packed, Ordering::Relaxed);
+    let resized = prev != 0 && prev != packed;
     let (msg, bar) = LAST_FOOTER.lock().map(|l| l.clone()).unwrap_or_default();
     // The INPUT row is resolved inside `footer_seq` (type-ahead → cached prompt
     // → leave-alone-while-reading), so the status message row stays the status
@@ -1180,7 +1215,7 @@ fn paint_cached_footer_locked(home_body: bool, _boundary: &MutexGuard<'_, ()>) {
         // The screen was wiped: there is no transcript or stale tray to move.
         *INSTALLED_LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
-    let mut buf = footer_seq(rows, cols, &sep, &msg, &bar);
+    let mut buf = footer_seq_resized(rows, cols, &sep, &msg, &bar, resized);
     if home_body {
         // Override the restored cursor with an explicit home into the body so
         // the post-clear view grows up from the bottom.
@@ -1284,6 +1319,26 @@ pub fn footer_seq(
     status_msg: &str,
     statusline: &str,
 ) -> String {
+    footer_seq_resized(rows, cols, separator, status_msg, statusline, false)
+}
+
+/// [`footer_seq`], told whether this paint is the first one at a NEW terminal
+/// size.
+///
+/// `resized` is what makes a window resize self-heal while the editor is parked
+/// in a read: it promotes the input row from "leave it alone" to "repaint the
+/// resting prompt at the new H-2" (see [`effective_input_line_resized`]) and
+/// leaves the cursor on that row instead of letting DECRC restore it to the row
+/// the editor used to live on. Only the resize paint passes `true`; every other
+/// paint path keeps the editor's cursor untouched.
+pub fn footer_seq_resized(
+    rows: u16,
+    cols: u16,
+    separator: &str,
+    status_msg: &str,
+    statusline: &str,
+    resized: bool,
+) -> String {
     // Snapshot the pinned escalations ONCE — asking for only as many banners as
     // this window can hold — and hand them to the pure builder, so the rows we
     // reserve and the rows we paint agree even if a banner retires mid-paint.
@@ -1321,6 +1376,7 @@ pub fn footer_seq(
         }
         *installed = Some(layout);
     }
+    let input = effective_input_line_resized(resized);
     seq.push_str(&footer_seq_with(
         rows,
         cols,
@@ -1328,9 +1384,21 @@ pub fn footer_seq(
         status_msg,
         statusline,
         banners,
-        effective_input_line().as_deref(),
+        input.as_deref(),
         &hints,
     ));
+    // A resize paint that re-parked the prompt must also MOVE the cursor: the
+    // editor is blocked in a read and still believes its line lives on the old
+    // row, and `footer_seq_with`'s DECRC would put the caret right back there.
+    // Landing it just past the re-painted prompt makes the visible caret correct
+    // immediately and gives rustyline's next render the right row to erase.
+    if resized
+        && READING_LINE.load(Ordering::Relaxed)
+        && let (Some(row), Some(text)) = (layout.input_row, input.as_deref())
+    {
+        let col = visible_cols(&clip_visible(text, cols as usize)).saturating_add(1);
+        seq.push_str(&format!("\x1b[{row};{col}H"));
+    }
     seq
 }
 
@@ -1458,6 +1526,35 @@ pub fn footer_seq_with(
     }
     s.push_str("\x1b8"); // DECRC — restore cursor + attrs
     s
+}
+
+/// Visible width of a possibly-ANSI-colored string, in terminal columns: SGR/CSI
+/// escapes count zero, everything else by its unicode display width. Used to
+/// place the caret just past a re-painted prompt.
+fn visible_cols(s: &str) -> u16 {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if let Some(&n) = chars.peek() {
+                if n == '[' {
+                    chars.next();
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if ('\x40'..='\x7e').contains(&p) {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        width += UnicodeWidthChar::width(c).unwrap_or(0);
+    }
+    width.min(u16::MAX as usize) as u16
 }
 
 /// Clip a possibly-ANSI-colored string to at most `max` visible columns without
@@ -2539,6 +2636,77 @@ mod tests {
             "escalation_and_hint_layout_changes_reconcile_on_tty",
             CHILD,
             None,
+        );
+    }
+
+    /// REGRESSION: a window resize while the editor is parked at the prompt must
+    /// re-park the resting prompt — and the cursor — on the NEW input row.
+    ///
+    /// The input row is an ABSOLUTE row (H-2) and `handle_resize` only runs
+    /// BETWEEN prompts, so at an idle prompt the heartbeat's repaint is the only
+    /// thing that sees the new geometry. It used to deliberately skip the input
+    /// row while `reading_line`, which left the prompt and the caret stranded on
+    /// the old row: a dead prompt mid-screen (grow) or one buried under the
+    /// footer (shrink), with a blank input row either way — "aish doesn't redraw
+    /// on resize".
+    #[test]
+    fn resize_at_the_prompt_reparks_the_input_row() {
+        const CHILD: &str = "AISH_TEST_RESIZE_PROMPT_CHILD";
+        const PROMPT: &str = "resize> ";
+        if std::env::var_os(CHILD).is_some() {
+            let mut term = Terminal::detect().expect("PTY required");
+            term.init_scroll_region();
+            term.draw_footer("msg", "bar");
+            park_input_row(PROMPT);
+            // The editor is now blocked inside a read with an EMPTY buffer: the
+            // exact state an idle shell spends nearly all of its life in.
+            set_reading_line(true);
+            set_input_dirty(false);
+            // One paint at the ORIGINAL geometry, exactly as the idle heartbeat
+            // does, so the next paint can tell the size actually moved.
+            paint_cached_footer(false);
+            let before = FooterLayout::for_rows(24).input_row.expect("24-row input");
+            // Shrink the window under the read. No `handle_resize` call here —
+            // that only runs BETWEEN prompts, which is the whole point.
+            let size = libc::winsize {
+                ws_row: 18,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSWINSZ, &size) },
+                0
+            );
+            let after = FooterLayout::for_rows(18).input_row.expect("18-row input");
+            assert_ne!(before, after, "resize must move the absolute input row");
+            // Tell the parent where to look, then let the heartbeat's
+            // cursor-safe repaint run — the only paint available at an idle
+            // prompt.
+            print!("<<MARK:{after}:{}>>", PROMPT.len() + 1);
+            let _ = std::io::stdout().flush();
+            paint_cached_footer(false);
+            set_reading_line(false);
+            return;
+        }
+        let bytes = run_pty_test("resize_at_the_prompt_reparks_the_input_row", CHILD, None);
+        let output = String::from_utf8_lossy(&bytes);
+        let (_, tail) = output
+            .split_once("<<MARK:")
+            .expect("child marker missing from PTY output");
+        let (coords, tail) = tail.split_once(">>").expect("unterminated marker");
+        let (row, col) = coords.split_once(':').expect("malformed marker");
+        assert!(
+            tail.contains(&format!("\x1b[{row};1H\x1b[2K")),
+            "resize paint did not clear the NEW input row {row}: {tail:?}"
+        );
+        assert!(
+            tail.contains(PROMPT),
+            "resize paint did not re-park the prompt: {tail:?}"
+        );
+        assert!(
+            tail.contains(&format!("\x1b[{row};{col}H")),
+            "cursor was not re-homed past the prompt at {row};{col}: {tail:?}"
         );
     }
 

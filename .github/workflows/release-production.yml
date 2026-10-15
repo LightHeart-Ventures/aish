@@ -48,7 +48,7 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || '' }}
 
@@ -138,7 +138,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset: aish-x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # On tag push: checkout the tag. On dispatch: checkout main (tag doesn't exist yet).
           ref: ${{ github.event_name == 'push' && needs.verify-version.outputs.tag || 'main' }}
@@ -173,7 +173,7 @@ jobs:
 
       - name: Cache cargo + target (GitHub-hosted)
         if: runner.os != 'Linux'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -225,7 +225,7 @@ jobs:
       attestations: write
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
@@ -255,7 +255,7 @@ jobs:
       # shipping an unattested asset. Verified client-side by
       # `gh attestation verify` in src/update.rs (AISH_UPDATE_ATTESTATION).
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/aish-*

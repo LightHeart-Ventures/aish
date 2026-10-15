@@ -33,7 +33,7 @@ jobs:
       # adds this correctness risk.
       CARGO_INCREMENTAL: '0'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: |
@@ -113,7 +113,7 @@ jobs:
 
       - name: Upload test log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-output
           path: test-output.log
@@ -176,7 +176,7 @@ jobs:
       # unrelated checkouts that share a Cargo.lock hash.
       CARGO_INCREMENTAL: '0'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: |
