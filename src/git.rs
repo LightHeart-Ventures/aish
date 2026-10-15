@@ -67,6 +67,13 @@ pub(crate) fn current_branch(dir: &Path) -> Option<String> {
     (!b.is_empty() && b != "HEAD").then_some(b)
 }
 
+/// Whether the working tree at `dir` has uncommitted changes (tracked or
+/// untracked). `Some(true)` = dirty, `Some(false)` = clean, `None` when it
+/// can't be told (not a repo, git missing). Cheap `git status --porcelain`.
+pub(crate) fn is_dirty(dir: &Path) -> Option<bool> {
+    git_out(dir, &["status", "--porcelain"]).map(|out| !out.trim().is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // repo_key — a stable, filesystem-safe identifier for a checkout.
 // (Canonical home; `worker.rs` keeps its own separate copy for the worktree
