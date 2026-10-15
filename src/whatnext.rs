@@ -15,12 +15,22 @@
 //!
 //! So `:whatnext` (aliases `:next`, `:wn`) does NOT run a command and does not
 //! prefill one. It builds a natural-language INPUT out of the session so far —
-//! cwd, host OS, recent command lines, a bounded slice of the last output, plus
-//! any focus the operator typed after the invocation — and hands that to the
-//! model as a normal forced-model turn (the existing `?` escape hatch). The
-//! model answers with its full toolset: it can read files, check `gh`, query
-//! the board, and *then* say what's next — or just do the cheap reversible step
-//! itself.
+//! cwd, the LIVE repo context at that cwd, host OS, recent command lines, a
+//! bounded slice of the last output, plus any focus the operator typed after the
+//! invocation — and hands that to the model as a normal forced-model turn (the
+//! existing `?` escape hatch). The model answers with its full toolset: it can
+//! read files, check `gh`, query the board, and *then* say what's next — or just
+//! do the cheap reversible step itself.
+//!
+//! The repo context is load-bearing and must be probed *per invocation*. The
+//! only other repo signal the model has is the `Repo: owner/repo (branch …)`
+//! line baked into the system prompt ONCE at session start
+//! ([`crate::session::Session::repo_info`]). The moment the operator `cd`s into
+//! another checkout — a sibling repo, a worktree, or out of git entirely — that
+//! static line is stale, and a `:whatnext` that shipped only a bare cwd path let
+//! the model answer confidently about the *wrong repo*. So the input now carries
+//! the repo name, branch, worktree root and dirty state resolved from the
+//! session's current cwd, and says plainly that it supersedes the system prompt.
 //!
 //! Everything decision-shaped here is pure and unit-tested; `repl::run` owns
 //! the one-line wiring (build the input, park it in `injected`, let the normal
@@ -40,6 +50,25 @@ const RECENT_CONTEXT_LINES: usize = 10;
 /// Cap (chars) on the last-output snippet folded into the input, head-first,
 /// so one noisy command can't dominate the question.
 const LAST_OUTPUT_SNIPPET: usize = 800;
+
+/// The live git context at the session's current cwd — what repo the TUI is
+/// *actually* in right now, as opposed to the one it started in.
+///
+/// Deliberately plain data so [`build_input`] stays pure and directly testable;
+/// [`probe_repo`] does the `git` shelling.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RepoContext {
+    /// `owner/repo` from the GitHub `origin` remote when parseable, else the
+    /// worktree-root basename.
+    pub name: String,
+    /// Checked-out branch; `None` on a detached HEAD.
+    pub branch: Option<String>,
+    /// Worktree root — distinguishes a linked worktree (and a subdirectory
+    /// within the checkout) from the repo root itself.
+    pub root: Option<String>,
+    /// Uncommitted changes present; `None` when it couldn't be determined.
+    pub dirty: Option<bool>,
+}
 
 /// Recognise a `:whatnext` / `:next` / `:wn` invocation and return any trailing
 /// focus text (trimmed). A bare invocation returns `Some("")` — the common
@@ -62,12 +91,38 @@ pub fn parse_invocation(line: &str) -> Option<&str> {
     None
 }
 
+/// Render the repo-context block folded into the input. `None` renders an
+/// explicit "not inside a git repo" line rather than silence, so the model
+/// doesn't fall back on the stale `Repo:` line in its system prompt. Pure.
+fn render_repo(repo: Option<&RepoContext>) -> String {
+    let Some(r) = repo else {
+        return "- Repo: (current directory is not inside a git repo)\n".to_string();
+    };
+    let mut s = format!("- Repo: {}", r.name);
+    match r.branch.as_deref() {
+        Some(b) => s.push_str(&format!(" (branch {b})")),
+        None => s.push_str(" (detached HEAD)"),
+    }
+    match r.dirty {
+        Some(true) => s.push_str(" — uncommitted changes"),
+        Some(false) => s.push_str(" — clean working tree"),
+        None => {}
+    }
+    s.push('\n');
+    if let Some(root) = r.root.as_deref() {
+        s.push_str(&format!("- Repo root: {root}\n"));
+    }
+    s
+}
+
 /// Assemble the natural-language input handed to the model: the question first
-/// (so it survives any later truncation), then the grounding context — cwd, OS,
-/// recent commands oldest→newest, a bounded last-output slice, any focus — and
-/// finally the answer contract. Pure + deterministic so the shape is testable.
+/// (so it survives any later truncation), then the grounding context — cwd, the
+/// live repo at that cwd, OS, recent commands oldest→newest, a bounded
+/// last-output slice, any focus — and finally the answer contract. Pure +
+/// deterministic so the shape is testable.
 pub fn build_input(
     cwd: &Path,
+    repo: Option<&RepoContext>,
     recent: &[String],
     last_output: Option<&str>,
     focus: &str,
@@ -80,10 +135,11 @@ pub fn build_input(
         p.push('\n');
     }
     p.push_str(&format!(
-        "\nSession context:\n- Current directory: {}\n- Host OS: {}\n",
-        cwd.display(),
-        std::env::consts::OS
+        "\nSession context:\n- Current directory: {}\n",
+        cwd.display()
     ));
+    p.push_str(&render_repo(repo));
+    p.push_str(&format!("- Host OS: {}\n", std::env::consts::OS));
     if recent.is_empty() {
         p.push_str("- Recent commands: (none yet)\n");
     } else {
@@ -103,7 +159,10 @@ pub fn build_input(
         }
     }
     p.push_str(
-        "\nAnswer the question: name the most useful next move and why, briefly. \
+        "\nThe directory and repo above are LIVE as of this question — the session may have \
+changed directories since it started, so they supersede any `Repo:` line in your system prompt. \
+Answer about THIS repo and branch. \
+Name the most useful next move and why, briefly. \
 Check anything you need with your tools first — don't guess at repo/CI/board state. \
 Do the step yourself if it's cheap, safe, and reversible; otherwise say what to run. \
 If the honest answer is \"nothing — you're done here\", say that.",
@@ -111,9 +170,22 @@ If the honest answer is \"nothing — you're done here\", say that.",
     p
 }
 
+/// Probe the live git context at `cwd` (IO — shells `git` via [`crate::git`]).
+/// `None` outside a git repo, which [`render_repo`] reports explicitly.
+pub fn probe_repo(cwd: &Path) -> Option<RepoContext> {
+    let name = crate::git::repo_name(cwd)?;
+    Some(RepoContext {
+        name,
+        branch: crate::git::current_branch(cwd),
+        root: crate::git::toplevel(cwd),
+        dirty: crate::git::is_dirty(cwd),
+    })
+}
+
 /// Pull the live session context and build the input. Thin glue over
 /// [`build_input`] (which holds the testable shape): recent command lines from
-/// the history DB, the last command output, the cwd.
+/// the history DB, the last command output, the cwd, and the repo that cwd is
+/// actually in right now.
 pub fn build_from_session(session: &Session, focus: &str) -> String {
     let recent = session
         .db
@@ -121,7 +193,14 @@ pub fn build_from_session(session: &Session, focus: &str) -> String {
         .and_then(|db| db.recent_inputs(RECENT_CONTEXT_LINES).ok())
         .unwrap_or_default();
     let last_output = session.last_output();
-    build_input(&session.cwd, &recent, last_output.as_deref(), focus)
+    let repo = probe_repo(&session.cwd);
+    build_input(
+        &session.cwd,
+        repo.as_ref(),
+        &recent,
+        last_output.as_deref(),
+        focus,
+    )
 }
 
 /// Wrap the input so the REPL's normal dispatch routes it to the model instead
@@ -146,6 +225,15 @@ fn head_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn repo_ctx() -> RepoContext {
+        RepoContext {
+            name: "owner/repo".to_string(),
+            branch: Some("feat/x".to_string()),
+            root: Some("/tmp/work".to_string()),
+            dirty: Some(true),
+        }
+    }
 
     #[test]
     fn parse_invocation_recognises_the_family() {
@@ -179,6 +267,7 @@ mod tests {
         let recent = vec!["cd repo".to_string(), "cargo test".to_string()];
         let p = build_input(
             &PathBuf::from("/tmp/work"),
+            Some(&repo_ctx()),
             &recent,
             Some("test result: FAILED. 1 failed"),
             "",
@@ -191,13 +280,80 @@ mod tests {
         assert!(p.contains("- Last output:"));
         assert!(p.contains("1 failed"));
         // and the answer contract is an ANSWER, not a command line
-        assert!(p.contains("name the most useful next move"));
+        assert!(p.contains("Name the most useful next move"));
         assert!(p.contains("cheap, safe, and reversible"));
     }
 
     #[test]
+    fn build_input_grounds_the_live_repo_not_the_session_start_one() {
+        // The whole point: the model's system prompt names the repo the session
+        // STARTED in. After a `cd` that's stale, so the input must carry the
+        // repo at the CURRENT cwd and say it wins.
+        let p = build_input(
+            &PathBuf::from("/tmp/work/sub"),
+            Some(&repo_ctx()),
+            &[],
+            None,
+            "",
+        );
+        assert!(
+            p.contains("- Repo: owner/repo (branch feat/x) — uncommitted changes"),
+            "got: {p}"
+        );
+        assert!(p.contains("- Repo root: /tmp/work"), "got: {p}");
+        assert!(p.contains("supersede any `Repo:` line in your system prompt"));
+        assert!(p.contains("Answer about THIS repo and branch"));
+        // repo context sits with the rest of the grounding, before the contract
+        let repo_at = p.find("- Repo: owner/repo").expect("repo line");
+        let contract_at = p.find("Answer about THIS repo").expect("contract");
+        assert!(repo_at < contract_at, "repo grounding precedes contract");
+    }
+
+    #[test]
+    fn build_input_reports_clean_detached_and_rootless_repos() {
+        let detached = RepoContext {
+            name: "owner/repo".to_string(),
+            branch: None,
+            root: None,
+            dirty: Some(false),
+        };
+        let p = build_input(&PathBuf::from("/x"), Some(&detached), &[], None, "");
+        assert!(
+            p.contains("- Repo: owner/repo (detached HEAD) — clean working tree"),
+            "got: {p}"
+        );
+        assert!(!p.contains("- Repo root:"), "no root line without a root");
+
+        let unknown = RepoContext {
+            name: "local-repo".to_string(),
+            branch: Some("main".to_string()),
+            root: Some("/srv/local-repo".to_string()),
+            dirty: None,
+        };
+        let p = build_input(
+            &PathBuf::from("/srv/local-repo"),
+            Some(&unknown),
+            &[],
+            None,
+            "",
+        );
+        assert!(p.contains("- Repo: local-repo (branch main)\n"), "got: {p}");
+    }
+
+    #[test]
+    fn build_input_says_so_explicitly_outside_a_repo() {
+        // Silence here would let the model keep answering about the repo in its
+        // system prompt, so the absence is stated.
+        let p = build_input(&PathBuf::from("/tmp"), None, &[], None, "");
+        assert!(
+            p.contains("- Repo: (current directory is not inside a git repo)"),
+            "got: {p}"
+        );
+    }
+
+    #[test]
     fn build_input_handles_empty_context_and_includes_focus() {
-        let p = build_input(&PathBuf::from("/srv"), &[], None, "  the open PR  ");
+        let p = build_input(&PathBuf::from("/srv"), None, &[], None, "  the open PR  ");
         assert!(p.contains("- Recent commands: (none yet)"));
         assert!(!p.contains("- Last output:")); // no section without output
         assert!(p.contains("Focus on: the open PR"));
@@ -237,9 +393,9 @@ mod tests {
     #[test]
     fn long_last_output_is_bounded_in_the_input() {
         let noisy = "line\n".repeat(1000);
-        let p = build_input(&PathBuf::from("/x"), &[], Some(&noisy), "");
+        let p = build_input(&PathBuf::from("/x"), None, &[], Some(&noisy), "");
         assert!(p.contains('…'), "snippet truncated: {}", p.len());
         // question + context stays well clear of a runaway turn
-        assert!(p.len() < 2_000, "input stayed bounded: {}", p.len());
+        assert!(p.len() < 2_200, "input stayed bounded: {}", p.len());
     }
 }
