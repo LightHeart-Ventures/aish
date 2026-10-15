@@ -18,7 +18,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-tower = "0.4"
+tower = "0.5"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "json", "uuid", "chrono", "macros"] }
 dotenv = "0.15"
