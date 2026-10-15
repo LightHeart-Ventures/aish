@@ -2909,6 +2909,9 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "recoverable tray of fired :alerts / notable events (last N); clear",
     ),
     ("allow", "list / revoke always-allowed tools & dir grants"),
+    // SEC-2.4: operator side of the sensitive-path approval broker.
+    ("approvals", "pending sensitive-path approval requests"),
+    ("approve", "approve a parked sensitive-path request <id>"),
     (
         "attach",
         "watch + steer a coordinator, or `goal` to watch the goal",
@@ -2925,6 +2928,9 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     ("compact", "compact history, offload to memory"),
     ("config", "show aish's active configuration"),
     ("context", "show context-window usage"),
+    // SEC-2.4: the deny half of the approval broker — kept alphabetical, the
+    // catalog test enforces it.
+    ("deny", "deny a parked sensitive-path request <id>"),
     ("detach", "stop watching the attached coordinator"),
     ("dispatch", "launch a background coordinator"),
     (
@@ -10039,6 +10045,8 @@ async fn handle_colon(
                                                      context accumulates across iterations. :loop status, :loop stop\n\
                  :allow                              list always-allowed tools/commands + dir grants\n\
                  :allow remove <tool>|<perm>:<dir>   revoke a tool or a directory grant\n\
+                 :approvals                          pending sensitive-path requests from workers (SEC-2.4)\n\
+                 :approve <id> / :deny <id>          answer one — one-shot, never becomes a standing grant\n\
                  a at a prompt                       always-allow this tool (see :allow)\n\
                  d at a read/write/delete prompt     allow that permission for the whole dir, recursively\n\
                  Ctrl-O                              expand/collapse tool output (verbatim results ⇄ line-count summary)\n\
@@ -10060,6 +10068,44 @@ async fn handle_colon(
             }
             for line in &crate::jobs::format_listing(&jobs) {
                 println!("{line}");
+            }
+        }
+        // SEC-2.4: the operator half of the sensitive-path approval broker. A
+        // worker that needs one credential-path write parks the operation and
+        // asks; these are the only commands that can answer. Approval is
+        // one-shot — it authorises exactly the (op, path) shown and is consumed
+        // on read, so it can never become a standing 'a'/'d' grant.
+        Some("approvals") => {
+            let reqs = crate::approval::pending();
+            if reqs.is_empty() {
+                println!("no pending approval requests");
+            } else {
+                println!(
+                    "\x1b[1mpending approvals\x1b[0m \x1b[2m(:approve <id> · :deny <id>)\x1b[0m"
+                );
+                for r in &reqs {
+                    println!("  {}", r.row());
+                }
+            }
+        }
+        Some(cmd @ ("approve" | "deny")) => {
+            let allow = cmd == "approve";
+            match parts.next() {
+                Some(id) => match crate::approval::decide(id, allow) {
+                    Ok(r) => println!(
+                        "{} \x1b[2m{}\x1b[0m {} {}",
+                        if allow {
+                            "\x1b[32mapproved\x1b[0m"
+                        } else {
+                            "\x1b[31mdenied\x1b[0m"
+                        },
+                        r.id,
+                        r.op,
+                        r.target
+                    ),
+                    Err(e) => println!("\x1b[31m{e}\x1b[0m"),
+                },
+                None => println!("usage: :{cmd} <id>   \x1b[2m(:approvals lists pending)\x1b[0m"),
             }
         }
         // Opt-in worktree reclamation. DRY RUN unless `--apply` is passed, and

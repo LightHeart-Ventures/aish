@@ -136,9 +136,42 @@ fn gate_path(
     // and it confirms in EVERY mode — including yolo. Unattended runs refuse.
     let (prompt, sensitive) = match crate::sensitive::path_gate(session.mode, unattended, path) {
         crate::sensitive::Gate::Refuse { reason } => {
+            // SEC-2.4: an unattended run has no PROMPT, but it may still have
+            // an OPERATOR — a coordinator's console is one `📣` away. So the
+            // refusal becomes a QUESTION: park the op, ask, and block for a
+            // verdict. Fail-closed in every direction (`approval::escalate`
+            // returns `Unavailable` when no console is reachable, `TimedOut`
+            // when nobody answers), so the only path to `true` is an explicit
+            // `:approve`. The approval is one-shot — consumed on read, never
+            // persisted as an 'a'/'d' grant — so the NEXT sensitive write asks
+            // again, exactly like the interactive prompt it stands in for.
+            let outcome = crate::approval::escalate(
+                session.nested,
+                perm.as_str(),
+                &path.display().to_string(),
+                reason,
+            );
+            if outcome.approved() {
+                crate::tool_telemetry::record_gate(
+                    session,
+                    crate::tool_telemetry::CLASS_GATE_CONFIRM,
+                    "sensitive-path-operator-approved",
+                    tool_key,
+                );
+                return true;
+            }
+            crate::tool_telemetry::record_gate(
+                session,
+                crate::tool_telemetry::CLASS_GATE_REFUSE,
+                "sensitive-path-unattended",
+                tool_key,
+            );
             eprintln!(
-                "\x1b[31mrefused:\x1b[0m sensitive path ({reason}) — {} (unattended run)",
-                path.display()
+                "\x1b[31mrefused:\x1b[0m sensitive path ({reason}) — {} ({})",
+                path.display(),
+                outcome
+                    .refusal_tail()
+                    .unwrap_or_else(|| "unattended run".to_string())
             );
             return false;
         }

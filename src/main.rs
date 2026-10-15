@@ -2,6 +2,7 @@ mod activity_log;
 mod activity_summary;
 mod advisor;
 mod alert;
+mod approval;
 mod autosuggest;
 mod backend;
 mod batch;
