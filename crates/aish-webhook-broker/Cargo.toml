@@ -75,7 +75,7 @@ otel = [
 
 [dev-dependencies]
 tempfile = "3.8"
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
 # TASK-449 client⇄broker contract test (tests/client_contract.rs): drives the
