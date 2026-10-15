@@ -179,17 +179,39 @@ fn serial_chain_yield_depth() -> usize {
 /// `record` checks hard first, so the turn just yields hard-first and the soft
 /// advisory never fires. Same forgiving parse/clamp discipline as
 /// `AISH_SERIAL_CHAIN_YIELD_DEPTH`.
-fn call_budget() -> (usize, usize) {
-    fn resolve(var: &str, default: usize) -> usize {
-        std::env::var(var)
-            .ok()
+///
+/// Resolution order is **session exports first, then the process environment**
+/// — the same precedence `script::var_lookup` and `oracle::path_var` use. This
+/// is the whole point of taking `session_env` instead of reading
+/// `std::env::var` directly: an operator who raises the ceiling the obvious way
+/// — `export AISH_CALL_BUDGET_HARD=100` at the aish prompt, or an `export` line
+/// in `~/.aishrc` (both land in `Session::env`, never in the process env) —
+/// previously got NO effect and still yielded at the compile-time default. The
+/// knob only worked if it was set in the ambient env *before* aish started,
+/// which is exactly the case an operator inside the shell cannot reach.
+fn call_budget(session_env: &[(String, String)]) -> (usize, usize) {
+    fn resolve(session_env: &[(String, String)], var: &str, default: usize) -> usize {
+        session_env
+            .iter()
+            .rev() // last export wins
+            .find(|(k, _)| k == var)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(var).ok())
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| (1..=100_000).contains(&n))
             .unwrap_or(default)
     }
     (
-        resolve("AISH_CALL_BUDGET_SOFT", crate::loopguard::CALL_BUDGET_SOFT),
-        resolve("AISH_CALL_BUDGET_HARD", crate::loopguard::CALL_BUDGET_HARD),
+        resolve(
+            session_env,
+            "AISH_CALL_BUDGET_SOFT",
+            crate::loopguard::CALL_BUDGET_SOFT,
+        ),
+        resolve(
+            session_env,
+            "AISH_CALL_BUDGET_HARD",
+            crate::loopguard::CALL_BUDGET_HARD,
+        ),
     )
 }
 
@@ -605,7 +627,7 @@ async fn run_turn_inner(
     // orthogonal to the round/iteration budget and the serial-chain SHAPE guard.
     // A soft advisory logs at CALL_BUDGET_SOFT; the turn yields (resumably) once
     // the tally crosses CALL_BUDGET_HARD.
-    let (call_budget_soft, call_budget_hard) = call_budget();
+    let (call_budget_soft, call_budget_hard) = call_budget(&session.env);
     let mut call_budget_guard =
         crate::loopguard::CallBudgetGuard::with_budget(call_budget_soft, call_budget_hard);
 
@@ -2408,6 +2430,66 @@ fn validate_output_schema_in(plugins_dir: &std::path::Path, result: &mut ToolRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- call-budget operator override (session-export precedence) --------
+
+    /// The reported bug: `export AISH_CALL_BUDGET_HARD=100` at the aish prompt
+    /// (or in `~/.aishrc`) lands in `Session::env`, NOT the process env, so a
+    /// `std::env::var`-only resolver ignored it and the turn still yielded at
+    /// the compile-time default. Session exports must win.
+    #[test]
+    fn call_budget_honours_session_exports() {
+        let env = vec![
+            ("AISH_CALL_BUDGET_SOFT".to_string(), "70".to_string()),
+            ("AISH_CALL_BUDGET_HARD".to_string(), "100".to_string()),
+        ];
+        assert_eq!(call_budget(&env), (70, 100));
+    }
+
+    /// Only one knob exported ⇒ that one is honoured and the other keeps its
+    /// baseline (an operator raising just the hard ceiling is the common case).
+    #[test]
+    fn call_budget_honours_a_lone_export() {
+        let baseline_soft = call_budget(&[]).0;
+        let env = vec![("AISH_CALL_BUDGET_HARD".to_string(), "250".to_string())];
+        assert_eq!(call_budget(&env), (baseline_soft, 250));
+    }
+
+    /// `export` appends, so a re-export must win over the earlier value —
+    /// otherwise an operator correcting a typo would be silently stuck with it.
+    #[test]
+    fn call_budget_last_export_wins() {
+        let env = vec![
+            ("AISH_CALL_BUDGET_HARD".to_string(), "60".to_string()),
+            ("AISH_CALL_BUDGET_HARD".to_string(), "120".to_string()),
+        ];
+        assert_eq!(call_budget(&env).1, 120);
+    }
+
+    /// A typo can neither uncap nor zero-cap the guard: an unparseable or
+    /// out-of-range export falls through to the same baseline as no export at
+    /// all (compared against the live baseline so an ambient process-env
+    /// override in CI can't make this flaky).
+    #[test]
+    fn call_budget_rejects_junk_and_out_of_range_exports() {
+        let baseline = call_budget(&[]);
+        for bad in ["0", "-5", "abc", "", "100001"] {
+            let env = vec![("AISH_CALL_BUDGET_HARD".to_string(), bad.to_string())];
+            assert_eq!(
+                call_budget(&env),
+                baseline,
+                "`{bad}` must not be honoured as a budget"
+            );
+        }
+    }
+
+    /// Surrounding whitespace is forgiven (`export X=" 100 "` is a plausible
+    /// paste), matching the parse discipline of the sibling knobs.
+    #[test]
+    fn call_budget_trims_whitespace() {
+        let env = vec![("AISH_CALL_BUDGET_HARD".to_string(), "  100  ".to_string())];
+        assert_eq!(call_budget(&env).1, 100);
+    }
 
     // ---- quiet-summary rendering (auto-resume turns) ----------------------
 

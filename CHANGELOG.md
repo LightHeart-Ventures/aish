@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Fixed
+- `AISH_CALL_BUDGET_SOFT` / `AISH_CALL_BUDGET_HARD` are now honored when set the obvious way — `export AISH_CALL_BUDGET_HARD=100` at the aish prompt or an `export` line in `~/.aishrc`. Both land in the session's export table, never in the process environment, but the resolver only read `std::env::var`, so the knob silently did nothing and the turn still yielded at the compile-time default (50); raising the ceiling required setting it in the ambient env *before* aish started, which is exactly the case an operator inside the shell can't reach. Resolution is now session exports first (last export wins), then the process env — matching how `$VAR` and `PATH` already resolve. The clamp discipline is unchanged: an unparseable or out-of-range value falls back to the default, so a typo can neither uncap nor zero-cap the guard.
+
 ## [0.56.0] - 2026-10-15
 
 ### Added
