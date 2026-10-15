@@ -1551,6 +1551,17 @@ pub async fn run(
                         // captured activity yet gets an animated "thinking…" row, and
                         // the animator needs the output-gate + attach-cursor handles.
                         let cb_show = session.show_worker_output.clone();
+                        // Snapshot the operator's own conversation ONCE, here at
+                        // turn start, rendered to rows. A mid-turn Shift-Tab back
+                        // to slot 0 wipes the worker pane and needs something to
+                        // repaint — but it runs on the reader thread with no
+                        // access to `&Session` (the turn borrows it mutably), so
+                        // rendering at press time is impossible. Without this the
+                        // hop back landed on an empty screen ("we lost all
+                        // history"); now it replays exactly like `:detach` does
+                        // post-turn. Cheap: rendered once per turn, tailed to ~1
+                        // screen, shared by reference via `Arc`.
+                        let cb_tail = std::sync::Arc::new(interactive_tail_rows(&session));
                         let on_shift_tab: crate::keywatch::ShiftTabFn =
                             std::sync::Arc::new(move || {
                                 cycle_worker_live(
@@ -1560,6 +1571,7 @@ pub async fn run(
                                     &cb_durable,
                                     &cb_show,
                                     cb_goal.as_ref(),
+                                    &cb_tail,
                                 );
                             });
                         // Mid-turn type-ahead is normally enabled only when the pinned
@@ -6222,18 +6234,32 @@ fn render_interactive_history_tail(
 /// the prompt gap), `false` when there was nothing to replay or we're off a TTY
 /// (piped/non-interactive runs stay silent).
 fn backfill_interactive(session: &Session) -> bool {
-    use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() {
-        return false;
-    }
+    print_interactive_replay(&interactive_tail_rows(session))
+}
+
+/// The rows a return-to-interactive replay should print: a tail of the
+/// operator's own conversation, honoring a `clear` they ran on the interactive
+/// console (replay only history at/after the clear mark, so coming back to the
+/// prompt doesn't resurrect cleared scrollback — clamped, since history may have
+/// been compacted/truncated below the mark).
+///
+/// Pure (no IO) and shared by BOTH return paths so they can't drift:
+///   • post-turn  — [`backfill_interactive`], called from `cycle_worker` /`:detach`
+///   • mid-turn   — snapshotted at turn start and replayed by [`cycle_worker_live`],
+///     which has no `&Session` to render from (the in-flight turn borrows it).
+fn interactive_tail_rows(session: &Session) -> Vec<String> {
     const TAIL_LINES: usize = 40;
-    // Honor a `clear` the operator ran on the interactive console: replay only
-    // history at/after the clear mark, so returning to the prompt (`:detach` /
-    // Shift-Tab back to slot 0) doesn't resurrect the cleared scrollback.
-    // Clamp — history may have been compacted/truncated below the mark.
     let start = session.clear_mark.min(session.history.len());
-    let rows = render_interactive_history_tail(&session.history[start..], TAIL_LINES);
-    if rows.is_empty() {
+    render_interactive_history_tail(&session.history[start..], TAIL_LINES)
+}
+
+/// Print a pre-rendered interactive replay block (header + rows). Returns `true`
+/// when it printed anything (so the caller can arm the prompt gap), `false` when
+/// there was nothing to replay or we're off a TTY (piped/non-interactive runs
+/// stay silent).
+fn print_interactive_replay(rows: &[String]) -> bool {
+    use std::io::IsTerminal;
+    if rows.is_empty() || !std::io::stdout().is_terminal() {
         return false;
     }
     println!("{}", interactive_replay_header());
@@ -7280,6 +7306,7 @@ fn cycle_worker_live(
     durable: &Arc<Mutex<Option<crate::activity_log::DurableAttach>>>,
     show_worker_output: &Arc<AtomicBool>,
     goal: Option<&crate::goal::Handle>,
+    interactive_tail: &[String],
 ) {
     let goal_active = goal.is_some_and(|g| g.is_active());
     let workers_v: Vec<(String, bool, String)> = workers
@@ -7319,13 +7346,16 @@ fn cycle_worker_live(
         *review.lock().unwrap() = None;
         // Wrap back to the interactive session. Switch the view for real —
         // `close_attach_view` wipes the worker pane off the viewport (scrollback
-        // preserved) and re-anchors, mirroring the post-turn `:detach`. We can't
-        // replay the interactive history tail here (it lives behind `&Session`
-        // and the running turn is actively appending to it), so print a marker
-        // row instead: without it the operator would be left staring at a blank
-        // screen until the turn's next streamed line lands, with no confirmation
-        // the hop happened at all.
+        // preserved) and re-anchors, mirroring the post-turn `:detach`. Then
+        // replay the conversation tail snapshotted at turn start, so hopping back
+        // mid-turn lands on your history exactly like the post-turn `:detach`
+        // path and like worker-entry's pane replay — the reported "we lost all
+        // history" regression was this branch wiping the screen with nothing to
+        // repaint. The snapshot is taken by the caller (the running turn holds
+        // `&mut Session`, so we can't render here); it ends at turn start, hence
+        // the "replay" framing — the in-flight reply keeps streaming below.
         crate::terminal::close_attach_view();
+        print_interactive_replay(interactive_tail);
         println!(
             "\x1b[1;33m⇄ back to the interactive session\x1b[0m \x1b[2m(0/{} · turn still running; Shift-Tab to cycle)\x1b[0m",
             ids.len()
@@ -13741,6 +13771,7 @@ mod tests {
             &session.attached_durable,
             &session.show_worker_output,
             None,
+            &[],
         );
         assert!(session.attached.lock().unwrap().is_none());
         assert!(session.attached_durable.lock().unwrap().is_none());
@@ -14102,6 +14133,56 @@ mod tests {
         assert!(capped[0].contains("second question"), "{capped:?}");
 
         assert!(render_interactive_history_tail(&[], 40).is_empty());
+    }
+
+    /// Regression: a mid-turn Shift-Tab back to the interactive slot used to wipe
+    /// the worker pane and repaint NOTHING ("we lost all history"), because the
+    /// reader-thread callback has no `&Session` to render from. The fix snapshots
+    /// the conversation tail at turn start via `interactive_tail_rows` and hands
+    /// it to `cycle_worker_live`. Assert the snapshot carries real rows and still
+    /// honors a `clear` the operator ran (parity with the post-turn `:detach`
+    /// replay, which shares the same helper).
+    #[test]
+    fn interactive_tail_snapshot_feeds_midturn_replay() {
+        let mut session = Session::new().unwrap();
+        session.history = vec![
+            crate::backend::Msg::user("before the clear"),
+            crate::backend::Msg::user("after the clear"),
+        ];
+
+        // No clear mark → the whole tail replays.
+        let rows = interactive_tail_rows(&session);
+        let joined = rows.join("\n");
+        assert!(joined.contains("before the clear"), "{joined}");
+        assert!(joined.contains("after the clear"), "{joined}");
+
+        // `clear` sets the mark; the cleared scrollback must NOT come back.
+        session.clear_mark = 1;
+        let joined = interactive_tail_rows(&session).join("\n");
+        assert!(!joined.contains("before the clear"), "{joined}");
+        assert!(joined.contains("after the clear"), "{joined}");
+
+        // Mark past the end (history compacted below it) clamps instead of panicking.
+        session.clear_mark = 99;
+        assert!(interactive_tail_rows(&session).is_empty());
+
+        // Off a TTY the replay prints nothing and reports it didn't paint, so
+        // piped runs stay clean.
+        assert!(!print_interactive_replay(&["row".to_string()]));
+        assert!(!print_interactive_replay(&[]));
+
+        // And the mid-turn cycle accepts the snapshot (slot-0 wrap path).
+        *session.attached.lock().unwrap() = Some("w_remote".into());
+        cycle_worker_live(
+            &session.worker_jobs,
+            &session.attached,
+            &session.attach_review_announced,
+            &session.attached_durable,
+            &session.show_worker_output,
+            None,
+            &["💬 snapshot row".to_string()],
+        );
+        assert!(session.attached.lock().unwrap().is_none());
     }
 
     #[test]
