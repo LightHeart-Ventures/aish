@@ -5,7 +5,9 @@
 //!
 //! * **↑/↓** (or `k`/`j`) — move the selection between worker rows.
 //! * **Enter** — `:attach` the selected worker.
-//! * **Delete / `d`** — `:close` the selected worker.
+//! * **Delete / `d`** — arm a `[y/N]` confirmation; `y` then `:close`s the
+//!   selected worker, any other key cancels (closing is destructive, so it is
+//!   never a single keystroke away).
 //! * **Esc / `q`** — dismiss, leaving the prompt untouched.
 //!
 //! ## Design
@@ -84,6 +86,10 @@ pub enum Key {
     End,
     Enter,
     Delete,
+    /// `y`/`Y` — affirm an armed confirmation. Ignored outside a confirmation.
+    Confirm,
+    /// `n`/`N` — decline an armed confirmation. Ignored outside a confirmation.
+    Cancel,
     Dismiss,
 }
 
@@ -355,6 +361,8 @@ pub fn parse_modal_keys(mut state: u8, bytes: &[u8]) -> (u8, Vec<Key>) {
                         b'G' => keys.push(Key::End),
                         0x02 => keys.push(Key::PageUp),   // Ctrl-b
                         0x06 => keys.push(Key::PageDown), // Ctrl-f
+                        b'y' | b'Y' => keys.push(Key::Confirm),
+                        b'n' | b'N' => keys.push(Key::Cancel),
                         b'q' => keys.push(Key::Dismiss),
                         _ => {}
                     }
@@ -376,6 +384,36 @@ pub fn pending_esc_dismiss(state: &mut u8) -> Option<Key> {
     } else {
         None
     }
+}
+
+/// How an armed close-confirmation resolves for a given keypress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// Operator affirmed (`y`/`Y`) — close the selected worker.
+    Close,
+    /// Anything else — disarm and go back to browsing. Deliberately
+    /// default-deny: Enter, Del/`d`, arrows, Esc all CANCEL rather than
+    /// confirm, so a double-tap of `d` can never close a worker by accident.
+    Cancel,
+}
+
+/// Resolve a keypress while the close-confirmation is armed. Pure →
+/// unit-tested; the only affirmative key is [`Key::Confirm`] (`y`/`Y`).
+pub fn resolve_confirm(key: Key) -> ConfirmOutcome {
+    match key {
+        Key::Confirm => ConfirmOutcome::Close,
+        _ => ConfirmOutcome::Cancel,
+    }
+}
+
+/// The confirmation line painted in place of the key-hint footer while a close
+/// is armed. Pure → unit-tested so the `[y/N]` wording stays stable.
+pub fn confirm_prompt(row: &WorkerRow) -> String {
+    format!(
+        "  ⚠ close {} ({})?  [y/N]  — y confirms · any other key cancels",
+        row.id,
+        row.status.trim()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +555,7 @@ fn pad(s: &str, width: usize) -> String {
 /// previous call, used to erase stale rows when the tray shrinks. Without a
 /// footer region (piped stdout / terminal too short) it falls back to the
 /// legacy in-place redraw. Returns the number of rows actually painted.
-fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
+fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize, confirm: Option<&str>) -> usize {
     let color = crate::style::colors_enabled();
 
     // Column widths from the id/status/runtime cells (task/result flow at the end).
@@ -674,14 +712,24 @@ fn render(rows: &[WorkerRow], sel: usize, prev_lines: usize) -> usize {
         }
     }
 
-    // Footer hint.
-    let hint =
-        "  ↑/↓ move · PgUp/PgDn page · g/G top/end · Enter attach · Del/d close · Esc/q dismiss";
-    lines.push(if color {
-        format!("\x1b[2m{hint}\x1b[0m")
+    // Footer: either the key hints, or — while a close is armed — the
+    // confirmation prompt. The prompt REPLACES the hint row (rather than adding
+    // one) so the tray height, and therefore the body scroll grant, is
+    // unchanged when the confirmation arms.
+    if let Some(prompt) = confirm {
+        lines.push(if color {
+            format!("\x1b[1;33m{prompt}\x1b[0m")
+        } else {
+            prompt.to_string()
+        });
     } else {
-        hint.to_string()
-    });
+        let hint = "  ↑/↓ move · PgUp/PgDn page · g/G top/end · Enter attach · Del/d close · Esc/q dismiss";
+        lines.push(if color {
+            format!("\x1b[2m{hint}\x1b[0m")
+        } else {
+            hint.to_string()
+        });
+    }
 
     let n = lines.len();
     // Preferred path: hand the rows to the footer's hint-tray zone. The tray is
@@ -756,17 +804,32 @@ pub fn run(rows: &[WorkerRow], initial_sel: usize) -> ModalAction {
     let mut state: u8 = 0;
     let mut queue: VecDeque<Key> = VecDeque::new();
     let mut prev_lines = 0usize;
+    // Armed close-confirmation: Del/`d` sets it, the NEXT keypress resolves it
+    // (`y` closes, anything else disarms). Closing a worker is destructive and
+    // irreversible from the modal, so it never rides on a single keystroke.
+    let mut confirming = false;
     let action = loop {
-        prev_lines = render(rows, sel, prev_lines);
+        let prompt = confirming.then(|| confirm_prompt(&rows[sel]));
+        prev_lines = render(rows, sel, prev_lines, prompt.as_deref());
         let Some(key) = read_key(&mut state, &mut queue) else {
             break ModalAction::Dismiss;
         };
+        if confirming {
+            match resolve_confirm(key) {
+                ConfirmOutcome::Close => break ModalAction::Close(rows[sel].id.clone()),
+                ConfirmOutcome::Cancel => {
+                    confirming = false;
+                    continue;
+                }
+            }
+        }
         match key {
             Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End => {
                 sel = move_selection(sel, rows.len(), key)
             }
             Key::Enter => break ModalAction::Attach(rows[sel].id.clone()),
-            Key::Delete => break ModalAction::Close(rows[sel].id.clone()),
+            Key::Delete => confirming = true,
+            Key::Confirm | Key::Cancel => {} // no-op outside a confirmation
             Key::Dismiss => break ModalAction::Dismiss,
         }
     };
@@ -864,8 +927,9 @@ mod tests {
 
     #[test]
     fn plain_text_ignored() {
-        // Filler with no command bytes (avoids j/k/d/q which are live shortcuts).
-        let (_, keys) = parse_modal_keys(0, b"abc xyz");
+        // Filler with no command bytes (avoids j/k/d/q plus the y/n
+        // confirmation keys, all of which are live shortcuts).
+        let (_, keys) = parse_modal_keys(0, b"abc xzw");
         assert!(keys.is_empty());
     }
 
@@ -1083,5 +1147,59 @@ mod tests {
         assert_eq!(move_selection(7, 20, Key::Home), 0);
         assert_eq!(move_selection(7, 20, Key::End), 19);
         assert_eq!(move_selection(7, 0, Key::End), 0);
+    }
+
+    #[test]
+    fn y_and_n_parse_to_confirm_and_cancel() {
+        let (s, keys) = parse_modal_keys(0, b"yYnN");
+        assert_eq!(s, 0);
+        assert_eq!(
+            keys,
+            vec![Key::Confirm, Key::Confirm, Key::Cancel, Key::Cancel]
+        );
+    }
+
+    #[test]
+    fn delete_still_parses_so_confirmation_is_the_only_new_gate() {
+        // Del/`d` is unchanged at the parse layer — the confirmation lives in
+        // `run`, so the key map stays stable for callers/tests.
+        let (_, keys) = parse_modal_keys(0, b"d\x7f");
+        assert_eq!(keys, vec![Key::Delete, Key::Delete]);
+    }
+
+    #[test]
+    fn resolve_confirm_closes_only_on_y() {
+        assert_eq!(resolve_confirm(Key::Confirm), ConfirmOutcome::Close);
+        // Default-deny: every other key — including a second Del/`d`, Enter,
+        // and Esc/q — cancels rather than closes.
+        for key in [
+            Key::Cancel,
+            Key::Delete,
+            Key::Enter,
+            Key::Dismiss,
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Home,
+            Key::End,
+        ] {
+            assert_eq!(resolve_confirm(key), ConfirmOutcome::Cancel, "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn confirm_prompt_names_the_worker_and_defaults_to_no() {
+        let prompt = confirm_prompt(&wr("w_abc123", None));
+        assert!(prompt.contains("w_abc123"), "prompt: {prompt}");
+        assert!(prompt.contains("[y/N]"), "prompt: {prompt}");
+        assert!(prompt.contains("cancels"), "prompt: {prompt}");
+    }
+
+    #[test]
+    fn confirm_keys_do_not_move_the_selection() {
+        // Stray y/n outside a confirmation are inert, not navigation.
+        assert_eq!(move_selection(4, 20, Key::Confirm), 4);
+        assert_eq!(move_selection(4, 20, Key::Cancel), 4);
     }
 }
