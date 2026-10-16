@@ -10317,7 +10317,8 @@ async fn handle_colon(
 
             // TASK-313: on an interactive TTY, drive this session's live workers
             // through a keyboard modal picker (↑/↓ select · Enter attach · Del/d
-            // close · Esc/q dismiss). `:workers all`, a non-TTY stdout, or an
+            // close, which arms a `[y/N]` confirmation first · Esc/q dismiss).
+            // `:workers all`, a non-TTY stdout, or an
             // empty live set fall through to the static markdown table below —
             // the graceful-degradation requirement. The modal only acts on the
             // in-memory workers `attach_worker`/`close_worker` understand, so it
