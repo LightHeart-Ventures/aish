@@ -3888,6 +3888,25 @@ pub fn resume_in_place(
     // collide with the prior thread's.
     let run_id = new_worker_id();
     let id = job.id.clone();
+
+    // RE-PIN the escalation banner. A resumed worker is a RUNNING worker, and the
+    // tray's contract is "every live worker has a row" — but by the time an
+    // operator types a follow-up, the previous thread's banner has already been
+    // retired: it reached a terminal state and `escalation::sweep` dropped it once
+    // `DWELL` elapsed. Without this the worker comes back to life in `:workers`
+    // with NO tray row at all, which is the reported bug — five live workers, one
+    // banner, the four resumed (`↻N`) ones invisible in the tray.
+    //
+    // Pinned under the worker's VISIBLE id, not the fresh thread `run_id`:
+    // `repl::refresh_escalation_status_from` matches pinned ids against
+    // `WorkerJob::id`, so a banner keyed on the thread id would never receive a
+    // status row. The hint is the worker's ORIGINAL task, matching the `:workers`
+    // Task column, rather than the resume prompt (which carries the prior run's
+    // result blob and would render as noise). `pin` refreshes an existing row in
+    // place — clearing the stale ✅/⚠️ verdict and restarting the clock — so
+    // resuming a worker whose banner is still inside its dwell window updates
+    // that row instead of stacking a duplicate.
+    crate::escalation::pin(&id, &job.task);
     tokio::spawn(run_worker(jobs.clone(), job, run_id, task, spec));
     (id, thread)
 }
