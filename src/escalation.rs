@@ -517,6 +517,62 @@ mod tests {
         L.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A RESUMED worker must get its tray row back. `worker::resume_in_place`
+    /// re-pins under the worker's visible id, and this locks in the two store
+    /// behaviours that depends on: re-pinning an id whose banner was already
+    /// retired RE-CREATES a live row, and re-pinning one that is still dwelling
+    /// on a terminal verdict REFRESHES that row in place (verdict cleared, no
+    /// duplicate). Without both, a worker continued by a follow-up shows up in
+    /// `:workers` with no banner — five live workers, one tray row.
+    #[test]
+    fn repinning_restores_a_retired_banner_and_clears_a_dwelling_verdict() {
+        let _g = lock();
+        let probe = |id: &str| {
+            let banners = BANNERS.lock().unwrap_or_else(|e| e.into_inner());
+            banners
+                .iter()
+                .find(|b| b.id == id)
+                .map(|b| (b.terminal_at.is_some(), b.failed, b.task.clone()))
+        };
+        let count = || {
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|b| b.id.starts_with("w_resume"))
+                .count()
+        };
+        let drop_resume_banners = || {
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|b| !b.id.starts_with("w_resume"));
+        };
+        drop_resume_banners();
+
+        // Retired banner (sweep dropped it after DWELL) → re-pin re-creates it,
+        // live, with the worker's original task hint.
+        push_banner("w_resume1", "fix the thing");
+        drop_resume_banners();
+        assert_eq!(probe("w_resume1"), None);
+        push_banner("w_resume1", "fix the thing");
+        assert_eq!(
+            probe("w_resume1"),
+            Some((false, false, "fix the thing".to_string()))
+        );
+
+        // Still-dwelling failure verdict → re-pin refreshes in place: one row,
+        // animating again, no stale ⚠️.
+        push_banner("w_resume2", "fix the other thing");
+        note_terminal("w_resume2", true);
+        assert_eq!(probe("w_resume2").map(|p| (p.0, p.1)), Some((true, true)));
+        push_banner("w_resume2", "fix the other thing");
+        assert_eq!(probe("w_resume2").map(|p| (p.0, p.1)), Some((false, false)));
+        assert_eq!(count(), 2, "re-pin must refresh, not stack a duplicate");
+
+        drop_resume_banners();
+    }
+
     #[test]
     fn heart_pulses_without_changing_width_colour_or_head_identity() {
         let at = |ms| render(ms, "w_1", "build it", "coordinating", None, Some(0), true);
