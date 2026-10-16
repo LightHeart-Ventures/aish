@@ -237,15 +237,6 @@ fn selection_key(b: u8) -> Option<char> {
     }
 }
 
-/// How long a freshly-drawn prompt deliberately ignores the keyboard.
-///
-/// A permission gate interrupts whatever the operator was doing, so keystrokes
-/// already in flight — most often the Enter that submitted the very request
-/// being gated — would land on the new prompt and answer it before it was read.
-/// One second of enforced silence, with the input queue flushed on both sides of
-/// it, makes the answer a deliberate act instead of an accident.
-const PROMPT_INPUT_GRACE: Duration = Duration::from_millis(1000);
-
 /// Upper bound on keystrokes one prompt will consume. A human never gets near
 /// it; the cap stops a wedged tty from spinning the reader forever.
 const MAX_CONFIRM_KEYS: usize = 4096;
@@ -260,11 +251,22 @@ fn flush_tty_input() {
     }
 }
 
-/// Hold the keyboard off for [`PROMPT_INPUT_GRACE`]: flush what is already
-/// buffered, sleep, then flush whatever arrived while we slept.
-fn settle_input() {
-    flush_tty_input();
-    std::thread::sleep(PROMPT_INPUT_GRACE);
+/// Drop whatever was queued on the tty **before** the prompt was drawn.
+///
+/// A permission gate interrupts whatever the operator was doing, so bytes
+/// already sitting in the keyboard queue — most often the Enter that submitted
+/// the very request being gated — are not an answer to a question that did not
+/// exist when they were typed, and must not be read as one.
+///
+/// It is a single flush at draw time and nothing more. There is deliberately no
+/// pause: a timed window that keeps discarding after the prompt is on screen
+/// cannot tell an in-flight keystroke from a deliberate answer, so it eats the
+/// operator's real reply — which the cooked tty has *already echoed*, making the
+/// swallowed answer look accepted. What stops a queued byte from committing a
+/// decision is the two-step gate in [`read_answer`], not a stopwatch: a lone
+/// Enter with nothing selected is ignored, a selection key only selects, and
+/// every unadvertised byte is dropped.
+fn discard_preprompt_input() {
     flush_tty_input();
 }
 
@@ -347,8 +349,9 @@ fn read_answer(on_tty: bool) -> Answer {
 /// call and persists the tool/command so it never prompts again.
 ///
 /// The prompt does not auto-submit. Answering takes a selection key **and**
-/// Enter, and the keyboard is held off for [`PROMPT_INPUT_GRACE`] after the
-/// prompt is drawn so in-flight keystrokes cannot answer it. Only the advertised
+/// Enter; the queue is flushed once as the prompt is drawn so keystrokes that
+/// predate the question cannot answer it, and every keystroke after that point
+/// counts — the first one included. Only the advertised
 /// keys are accepted; anything else is ignored rather than being folded into a
 /// silent refusal, and **Ctrl-C cancels the call** — which needs the explicit
 /// byte check in [`read_key_tty`], because aish ignores SIGINT process-wide and
@@ -373,11 +376,11 @@ pub fn confirm_tty(prompt: &str) -> tools::Decision {
     for _ in 0..MAX_CONFIRM_RETRIES {
         print!("\x1b[33mrun?\x1b[0m {body} \x1b[33m{opts}\x1b[0m ");
         std::io::stdout().flush().ok();
-        // Draw first, then go deaf for a beat: the operator sees what they are
-        // being asked before the gate will take an answer, and whatever was
-        // already in the keyboard queue is discarded rather than consumed.
+        // Draw first, then drop what was already queued: bytes typed before the
+        // question existed are not an answer to it. Everything typed from here
+        // on IS the answer and is read — including the very first keystroke.
         if on_tty && std::mem::take(&mut first_ask) {
-            settle_input();
+            discard_preprompt_input();
         }
         match read_answer(on_tty) {
             Answer::Decided(d) => return crate::sensitive::clamp_decision(sensitive, d),
@@ -12137,13 +12140,30 @@ mod tests {
     }
 
     #[test]
-    fn the_input_grace_is_long_enough_to_outlast_an_in_flight_keystroke() {
-        // The gate interrupts whatever the operator was typing, so the pause has
-        // to be perceptible — a few ms would still swallow the submit-Enter into
-        // the answer. One second is the specified beat; never zero.
-        assert!(PROMPT_INPUT_GRACE >= Duration::from_millis(1000));
-        // ...and not so long the prompt feels wedged.
-        assert!(PROMPT_INPUT_GRACE <= Duration::from_secs(2));
+    fn the_first_keystroke_after_the_prompt_is_an_answer_not_a_casualty() {
+        // Regression: the gate used to flush the tty, sleep 1s, then flush
+        // again — so an operator who answered promptly had the answer DISCARDED
+        // after the cooked tty had already echoed it. It looked accepted, it
+        // did nothing, and only the second y+Enter worked (the reported "yy").
+        //
+        // The guard against a stray in-flight answer is structural, not timed,
+        // which is why no discard window is needed after the prompt is drawn:
+        // Enter is not a selection, so a queued Enter commits nothing...
+        assert_eq!(selection_key(b'\r'), None);
+        assert_eq!(selection_key(b'\n'), None);
+        // ...and a selection key only SELECTS — committing still takes a
+        // deliberate Enter, so even a queued 'y' cannot decide on its own.
+        // What that first keystroke must never be is thrown away: every
+        // advertised key is a selection, and the commit path (which feeds the
+        // held key straight to parse_answer) honours it.
+        for (byte, key) in [(b'y', 'y'), (b'n', 'n'), (b'a', 'a'), (b'd', 'd')] {
+            let selected = selection_key(byte).expect("advertised key must select");
+            assert_eq!(selected, key);
+            assert!(
+                matches!(parse_answer(&selected.to_string()), Answer::Decided(_)),
+                "a selection held from the first keystroke must commit to a decision"
+            );
+        }
     }
 
     #[test]
