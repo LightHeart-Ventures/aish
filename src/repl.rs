@@ -5902,13 +5902,15 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 *session.attached_durable.lock().unwrap() = None;
                 crate::terminal::open_attach_view();
                 *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
-                println!(
-                    "\x1b[1;33m⇄ attached to the goal\x1b[0m — streaming its turns live. \x1b[2mtype a line to steer it (or :tell goal <msg>); :goal clear to stop it, :detach to stop watching.\x1b[0m"
-                );
+                // The announcement is NOT printed here — it is handed to the
+                // backfill, which renders it AS the pane's top frame. One row for
+                // "you are now attached", instead of a banner plus a frame row
+                // that repeated the id and said the same thing again.
+                let banner = "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m(streaming live; type to steer it, :goal clear to stop it, :detach to stop)\x1b[0m";
                 // TASK-301: replay the goal's history the same way a worker's is
                 // replayed — header + input row + activity tail — so goal and
                 // worker attach UIs are uniform (a goal is a specialized worker).
-                backfill_goal_attached(g);
+                backfill_goal_attached(g, banner);
             }
             Some(_) => println!("the goal has already finished — `:goal` for its final status"),
             None => println!("no goal set — `:goal <condition>` to start one (requires :batch on)"),
@@ -5972,10 +5974,10 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 // re-announce the same finish on the next loop tick.
                 *session.attach_review_announced.lock().unwrap() = Some(run_id.clone());
                 *session.attached_durable.lock().unwrap() = None;
-                println!(
-                    "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m — review mode: replaying its work below. \x1b[2mType a message to resume it, or :detach to stop.\x1b[0m"
+                let banner = format!(
+                    "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m(review mode: type a message to resume it, :detach to stop)\x1b[0m"
                 );
-                backfill_attached(run_id, session);
+                backfill_attached(run_id, session, &banner);
                 print_attached_result(run_id, session);
             } else if *durable {
                 // LIVE SUBWORKER (or another session's live run). Its stderr pipe
@@ -5985,10 +5987,10 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 // the durable activity log instead: backfill what was recorded,
                 // then the presenter tick tails it from the cursor we anchor here.
                 *session.attach_review_announced.lock().unwrap() = None;
-                println!(
-                    "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m(durable tail — run owned by another process)\x1b[0m — replaying its recorded activity, then following it live; what you type is steered to it. \x1b[2m:detach to stop.\x1b[0m"
+                let banner = format!(
+                    "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m(durable tail — owned by another process; type to steer it, :detach to stop)\x1b[0m"
                 );
-                let tail = backfill_attached_durable_tail(run_id, session);
+                let tail = backfill_attached_durable_tail(run_id, session, &banner);
                 *session.attached_durable.lock().unwrap() =
                     Some(crate::activity_log::DurableAttach {
                         run_id: run_id.clone(),
@@ -5997,13 +5999,13 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
             } else {
                 *session.attach_review_announced.lock().unwrap() = None;
                 *session.attached_durable.lock().unwrap() = None;
-                println!(
-                    "\x1b[1;33m⇄ attached to {short}\x1b[0m — streaming its activity live; what you type is steered to it. \x1b[2m:detach to stop.\x1b[0m"
+                let banner = format!(
+                    "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m(streaming live; type to steer it, :detach to stop)\x1b[0m"
                 );
                 // Replay the input + activity captured so far, THEN the live
                 // stream continues (the worker's forwarder now sees this session
                 // as attached and forwards every subsequent line).
-                backfill_attached(run_id, session);
+                backfill_attached(run_id, session, &banner);
             }
         }
         many => {
@@ -6021,18 +6023,29 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
 /// On `:attach`, replay the attached coordinator's input + activity captured
 /// so far (its bounded transcript) so the operator sees the full context
 /// BEFORE the live stream continues. A no-op when the worker can't be found.
-fn backfill_attached(run_id: &str, session: &Session) {
-    if !backfill_attached_live(
+///
+/// `banner` is the caller's attach announcement. Callers do NOT print it — it is
+/// rendered here AS the pane's top frame (`pane_attach_header`), so entering a
+/// pane costs ONE row instead of an announcement plus a near-identical frame.
+fn backfill_attached(run_id: &str, session: &Session, banner: &str) {
+    if backfill_attached_live(
         run_id,
         &session.worker_jobs,
         &session.show_worker_output,
         &session.attached,
+        banner,
     ) {
-        // Subworker / cross-session review: not one of THIS session's in-mem
-        // workers, so there's no live transcript to replay — surface the durable
-        // header + task from the coordinator store so an attach still shows what
-        // the worker is/was doing (its result follows via print_attached_result).
-        backfill_attached_durable(run_id, session);
+        return;
+    }
+    // Subworker / cross-session review: not one of THIS session's in-mem
+    // workers, so there's no live transcript to replay — surface the durable
+    // header + task from the coordinator store so an attach still shows what
+    // the worker is/was doing (its result follows via print_attached_result).
+    if !backfill_attached_durable(run_id, session, banner) {
+        // NEITHER backfill found the run, so neither rendered the frame that now
+        // carries the announcement. Print it bare: folding the announcement into
+        // the pane frame must never make an attach silent.
+        println!("{banner}");
     }
 }
 
@@ -6048,6 +6061,7 @@ fn backfill_attached_live(
     worker_jobs: &crate::worker::WorkerJobs,
     show_worker_output: &Arc<AtomicBool>,
     attached: &Arc<Mutex<Option<String>>>,
+    banner: &str,
 ) -> bool {
     let job = worker_jobs
         .lock()
@@ -6058,8 +6072,7 @@ fn backfill_attached_live(
     let Some(job) = job else {
         return false;
     };
-    let short = crate::batch::short_id(run_id);
-    println!("{}", crate::worker::pane_replay_header(short));
+    println!("{}", crate::worker::pane_attach_header(banner));
     // The task is the coordinator's "input" — the START of the conversation. It's
     // rendered set-apart (a 💬 glyph + bold) by `pane_input_row` so it's obvious
     // this row is the prompt the coordinator was given, not one of its own
@@ -6117,15 +6130,12 @@ fn backfill_attached_live(
 
 /// Replay the active `:goal` loop's history the SAME way `backfill_attached`
 /// replays a worker's — a goal is essentially a specialized worker, so its
-/// `:attach goal` / Shift-Tab UI is rendered identically: a `pane_replay_header`,
+/// `:attach goal` / Shift-Tab UI is rendered identically: a `pane_attach_header`,
 /// the goal condition as the set-apart `pane_input_row` (the goal's "input"),
 /// then the captured activity tail as `pane_row`s under the same `[goal]` gutter
 /// the live stream uses. Keeps goal and worker attach output visually uniform.
-fn backfill_goal_attached(g: &crate::goal::GoalLoop) {
-    // Label matches the goal's live stderr stream label (`GOAL_STREAM_LABEL`)
-    // so replay rows and the live rows that follow share one `[goal]` gutter.
-    let label = GOAL_ATTACH_ID;
-    println!("{}", crate::worker::pane_replay_header(label));
+fn backfill_goal_attached(g: &crate::goal::GoalLoop, banner: &str) {
+    println!("{}", crate::worker::pane_attach_header(banner));
     // The goal CONDITION is the "input" — the START of the pursuit. Rendered
     // set-apart (💬 + bold) by `pane_input_row`, exactly like a worker's task.
     println!(
@@ -6158,7 +6168,7 @@ fn backfill_goal_attached(g: &crate::goal::GoalLoop) {
 }
 
 /// Header printed once above the return-to-interactive backfill — the symmetric
-/// counterpart to `crate::worker::pane_replay_header`. Brackets the "conversation
+/// counterpart to `crate::worker::pane_attach_header`. Brackets the "conversation
 /// so far" replay block that reprints the operator's own chat when they `:detach`
 /// / Shift-Tab back to the interactive prompt. Pure — unit-tested.
 fn interactive_replay_header() -> String {
@@ -6428,22 +6438,26 @@ fn print_attached_result(run_id: &str, session: &Session) {
 /// task (its "input") from the shared store. No transcript rows are available
 /// off-process, so this is header + prompt only; the final result is appended by
 /// `print_attached_result`'s own durable fallback.
-fn backfill_attached_durable(run_id: &str, session: &Session) {
+///
+/// Returns `false` when the run isn't in the store — the caller then owes the
+/// operator the bare announcement, because nothing here rendered the frame that
+/// carries it.
+fn backfill_attached_durable(run_id: &str, session: &Session, banner: &str) -> bool {
     let Some(store) = &session.coordinator_store else {
-        return;
+        return false;
     };
     let Ok(rows) = store.load_all() else {
-        return;
+        return false;
     };
     let Some(r) = rows.iter().find(|r| r.run_id == *run_id) else {
-        return;
+        return false;
     };
-    let short = crate::batch::short_id(run_id);
-    println!("{}", crate::worker::pane_replay_header(short));
+    println!("{}", crate::worker::pane_attach_header(banner));
     println!(
         "{}",
         crate::worker::pane_input_row(crate::worker::PANE_NO_LABEL, &r.task)
     );
+    true
 }
 
 /// The rows a DURABLE-TAIL attach should render for its backfill, given every
@@ -6477,8 +6491,13 @@ fn durable_backfill_rows(rows: Vec<String>) -> Vec<String> {
 fn backfill_attached_durable_tail(
     run_id: &str,
     session: &Session,
+    banner: &str,
 ) -> crate::activity_log::ActivityTail {
-    backfill_attached_durable(run_id, session);
+    if !backfill_attached_durable(run_id, session, banner) {
+        // No store row, but the tail rows below still need a top frame — and the
+        // frame is what carries the attach announcement.
+        println!("{}", crate::worker::pane_attach_header(banner));
+    }
     // Backfill + anchor in ONE read so a row written *during* the attach can be
     // neither lost nor double-printed.
     let (rows, tail) = crate::activity_log::backfill_with_cursor(run_id);
@@ -7235,14 +7254,17 @@ fn cycle_worker(session: &mut Session) -> bool {
             .as_ref()
             .map(|g| g.condition.clone())
             .unwrap_or_default();
-        println!(
+        // Not printed here: the announcement is handed to the backfill, which
+        // renders it AS the pane's top border. Cycling costs ONE row instead of
+        // an announcement row plus a frame row that repeated the same id.
+        let banner = format!(
             "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · type to steer it, :goal clear to stop it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
             ids.len(),
             attach_task_suffix(&task)
         );
         if let Some(g) = &session.goal {
-            backfill_goal_attached(g);
+            backfill_goal_attached(g, &banner);
         }
         return true;
     }
@@ -7256,19 +7278,19 @@ fn cycle_worker(session: &mut Session) -> bool {
         // doesn't re-announce the finish, replay its work, then show its result.
         // A typed line resumes it (see `send_to_attached` → `resume_coordinator`).
         *session.attach_review_announced.lock().unwrap() = Some(run_id.clone());
-        println!(
+        let banner = format!(
             "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
             ids.len(),
             task_suffix
         );
-        backfill_attached(&run_id, session);
+        backfill_attached(&run_id, session, &banner);
         print_attached_result(&run_id, session);
     } else {
         // Live worker: clear any stale review marker so a later finish is
         // announced exactly once (mirrors `attach_worker`'s live branch).
         *session.attach_review_announced.lock().unwrap() = None;
-        println!(
+        let banner = format!(
             "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
             ids.len(),
@@ -7279,7 +7301,7 @@ fn cycle_worker(session: &mut Session) -> bool {
         // forwarder now sees this session as attached and forwards every
         // subsequent line, so the operator gets the full session transcript
         // first and live output after, instead of only future output.
-        backfill_attached(&run_id, session);
+        backfill_attached(&run_id, session, &banner);
     }
     true
 }
@@ -7379,13 +7401,14 @@ fn cycle_worker_live(
         *attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
         *review.lock().unwrap() = None;
         crate::terminal::open_attach_view();
-        println!(
+        // Folded into the replay frame (see `pane_attach_header`) — one row.
+        let banner = format!(
             "\x1b[1;33m⇄ attached to the goal\x1b[0m \x1b[2m({}/{} · watch-only; Shift-Tab to cycle, :detach to stop)\x1b[0m",
             next_idx,
             ids.len()
         );
         if let Some(g) = goal {
-            backfill_goal_attached(g);
+            backfill_goal_attached(g, &banner);
         }
         return;
     }
@@ -7397,30 +7420,37 @@ fn cycle_worker_live(
     // tail below it land on a fresh screen instead of piling under the pane we
     // just left (the "displays the next worker but doesn't switch screens" bug).
     crate::terminal::open_attach_view();
-    if terminal {
+    // The banner is BUILT here but printed by the backfill below, which renders
+    // it as the replay frame's top border — one row for "attached + replay",
+    // instead of two rows saying the same thing.
+    let banner = if terminal {
         *review.lock().unwrap() = Some(run_id.clone());
-        println!(
+        format!(
             "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
             ids.len(),
             task_suffix
-        );
+        )
     } else {
         *review.lock().unwrap() = None;
-        println!(
+        format!(
             "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop){}\x1b[0m",
             next_idx,
             ids.len(),
             task_suffix
-        );
-    }
+        )
+    };
     // Replay the input + activity captured so far so the switched-to screen
     // actually SHOWS that worker, then its live stream continues below. The
     // finished-coordinator result pane (`print_attached_result`) and the
     // durable-store replay still need `&Session`, so they stay on the post-turn
     // path — this covers every worker live in THIS session, which is the whole
     // mid-turn rotation.
-    backfill_attached_live(&run_id, workers, show_worker_output, attached);
+    if !backfill_attached_live(&run_id, workers, show_worker_output, attached, &banner) {
+        // Not an in-session worker, so no frame was rendered — and the frame is
+        // what now carries the announcement. Never let a cycle land silently.
+        println!("{banner}");
+    }
 }
 
 /// `:close [worker-id]` — remove a coordinator from THIS session: drop it from

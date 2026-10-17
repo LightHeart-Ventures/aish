@@ -533,7 +533,7 @@ const PANE_BORDER: &str = "\x1b[36m┃\x1b[0m";
 
 /// The GREEN left border for a worker's LIVE stream once you've `:attach`ed to
 /// it. It marks NEW output produced AFTER the attach point, distinguishing fresh
-/// activity from the cyan "output to date" replay (`pane_replay_header` + the
+/// activity from the cyan "output to date" replay (`pane_attach_header` + the
 /// backfilled tail) that precedes it. Same glyph, different colour — so the
 /// stream reads as one continuous column that flips cyan → green at the live edge.
 const PANE_BORDER_LIVE: &str = "\x1b[32m┃\x1b[0m";
@@ -1119,12 +1119,23 @@ pub fn pane_close() -> String {
     "\x1b[36m┗━ coordinator output \x1b[0m\x1b[2m(:output off)\x1b[0m\x1b[36m ━━━━━━━━━━━━━━━\x1b[0m".to_string()
 }
 
-/// Header printed once above an `:attach` backfill: it brackets the
-/// "output to date" replay block that precedes the now-live coordinator
-/// stream. Pure — unit-tested.
-pub fn pane_replay_header(short: &str) -> String {
+/// The pane's TOP frame for an `:attach` / Shift-Tab entry — the attach
+/// ANNOUNCEMENT *is* the frame.
+///
+/// Entering a worker pane used to print TWO near-duplicate rows for one event:
+/// a yellow `⇄ attached to w_x (1/1 · Shift-Tab to cycle, :detach to stop)`
+/// announcement, then a cyan `┏━ w_x — output to date (replay; live activity
+/// follows)` frame that repeated the id and re-stated "you are now watching
+/// this". They are now ONE row: the announcement sits *inside* the top border,
+/// with a compact dim `replay, then live` tail standing in for the old
+/// "output to date" label. The border colour still carries the cyan→green
+/// replay/live distinction the rows below it use.
+///
+/// `banner` is the already-colorized announcement; it must END in a reset so
+/// the cyan border resumes cleanly. Pure — unit-tested.
+pub fn pane_attach_header(banner: &str) -> String {
     format!(
-        "\x1b[36m\u{250f}\u{2501} {short} \u{2014} output to date \x1b[0m\x1b[2m(replay; live activity follows)\x1b[0m\x1b[36m \u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\x1b[0m"
+        "\x1b[36m\u{250f}\u{2501} \x1b[0m{banner}\x1b[36m \u{2501} \x1b[0m\x1b[2mreplay, then live\x1b[0m\x1b[36m \u{2501}\u{2501}\x1b[0m"
     )
 }
 
@@ -5917,19 +5928,32 @@ mod tests {
     }
 
     #[test]
-    fn pane_replay_header_brackets_output_to_date() {
-        let h = pane_replay_header("w_a7k3m2pQ");
+    fn pane_attach_header_folds_the_banner_into_the_frame() {
+        // The attach announcement is passed THROUGH the frame, so the pane opens
+        // with one row instead of an announcement row + a near-duplicate frame row.
+        let banner = "\x1b[1;33m⇄ attached to w_a7k3m2pQ\x1b[0m \x1b[2m(1/1 · Shift-Tab to cycle, :detach to stop)\x1b[0m";
+        let h = pane_attach_header(banner);
         assert!(
             h.contains('\u{250f}'),
-            "replay header has a top-left corner: {h}"
+            "attach header has a top-left corner: {h}"
         );
         assert!(
-            h.contains("w_a7k3m2pQ"),
-            "replay header names the coordinator: {h}"
+            h.contains("⇄ attached to w_a7k3m2pQ"),
+            "attach header carries the announcement: {h}"
         );
         assert!(
-            h.contains("output to date"),
-            "replay header labels the block: {h}"
+            h.contains("Shift-Tab to cycle"),
+            "attach header keeps the keybinding hint: {h}"
+        );
+        assert!(
+            h.contains("replay, then live"),
+            "attach header still marks the block as replay-then-live: {h}"
+        );
+        // The id appears exactly ONCE — the duplication this consolidation removes.
+        assert_eq!(
+            h.matches("w_a7k3m2pQ").count(),
+            1,
+            "attach header must not repeat the coordinator id: {h}"
         );
     }
 
