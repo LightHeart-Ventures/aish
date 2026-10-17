@@ -7543,10 +7543,30 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     // outlived the worker indefinitely. No-op when the worker never escalated.
     let was_pinned = crate::escalation::unpin(&run_id);
 
-    // Detach if we just closed the worker we were attached to.
+    // Detach if we just closed the worker we were attached to — and RESTORE the
+    // interactive screen exactly the way `:detach` does. Clearing
+    // `session.attached` alone drops the attachment in STATE but leaves the
+    // worker pane on SCREEN: no spinner quiesce, no durable-tail stop, no
+    // `close_attach_view` re-anchor, and no interactive replay — so the operator
+    // lands back on the interactive prompt with the closed worker's output still
+    // up and their own conversation stranded in scrollback (the reported "`:close`
+    // doesn't repaint the interactive screen" bug). `:close` is a strict superset
+    // of `:detach`, so it must run the same return-to-interactive sequence.
     if attached.as_deref() == Some(run_id.as_str()) {
+        // Stop any live "thinking…" spinner first so it can't erase the next
+        // prompt (and restore the cursor it hid) — the same race `:detach` and
+        // `cycle_worker` guard against.
+        crate::worker::quiesce_thinking_spinners();
+        // Stop any durable tail, or the presenter keeps printing the closed
+        // run's rows above the interactive prompt.
+        *session.attached_durable.lock().unwrap() = None;
         *session.attached.lock().unwrap() = None;
         *session.attach_review_announced.lock().unwrap() = None;
+        // Tear the worker view down (re-anchor the primary buffer) and replay a
+        // tail of the operator's own conversation, so the interactive screen comes
+        // back whole instead of as a bare prompt.
+        crate::terminal::close_attach_view();
+        backfill_interactive(session);
     }
 
     let short = crate::batch::short_id(&run_id);
