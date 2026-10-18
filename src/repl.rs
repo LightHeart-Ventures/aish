@@ -2555,6 +2555,18 @@ fn refresh_escalation_status_from(
         // `cached_summary` throttles its store lookup, which matters here: this
         // runs on the footer paint path, i.e. on every heartbeat repaint, once
         // per pinned banner.
+        // The banner's HEAD row was seeded at launch with the raw task brief
+        // (all the parent knew then) and hard-clips to `TASK_HINT_MAX`, which
+        // for a long brief shows only its preamble — "Review the Atum board
+        // cards currently in column col_rev…". Swap in the worker's model-written
+        // TITLE once the coordinator subprocess has stamped it on the durable
+        // row. Idempotent and cheap: `cached_title` is the same throttled
+        // read-through the status row below uses, and `set_task` ignores an
+        // empty label, so a run with no title keeps the clipped brief.
+        let title = store.and_then(|s| crate::activity_summary::cached_title(s, &run_id));
+        if let Some(t) = title.as_deref() {
+            crate::escalation::set_task(&id, t);
+        }
         let summary = store.and_then(|s| crate::activity_summary::cached_summary(s, &run_id));
         let activity = summary.or(last);
         let text = match activity {
@@ -5242,10 +5254,16 @@ pub(crate) fn workers_listing_ctx(ctx: &OpsCtx, show_all: bool) -> String {
     // written by the coordinator SUBPROCESS, so the parent's `WorkerJob` never
     // holds it. `cached_summary` throttles the lookup so this stays cheap on a
     // repaint path.
+    // Fallback CHAIN, best to worst: live summary → stable title → clipped
+    // brief. The title is the better fallback because it was written to name the
+    // assignment in one phrase, where the clip just truncates mid-sentence; the
+    // clip survives as the last resort for pre-migration rows and credential-less
+    // runs.
     let doing = |run_id: &str, task: &str| -> String {
-        ctx.coordinator_store
-            .as_ref()
+        let store = ctx.coordinator_store.as_ref();
+        store
             .and_then(|s| crate::activity_summary::cached_summary(s, run_id))
+            .or_else(|| store.and_then(|s| crate::activity_summary::cached_title(s, run_id)))
             .map(|s| s.replace('|', "\\|"))
             .unwrap_or_else(|| one_line(task))
     };
@@ -5407,13 +5425,15 @@ pub(crate) fn workers_listing_ctx(ctx: &OpsCtx, show_all: bool) -> String {
                         crate::style::styled_status(&r.phase),
                         started_cell,
                         runtime_cell,
-                        // The durable row already carries the summary — no store
-                        // round-trip needed for these.
-                        match r
-                            .activity_summary
-                            .as_deref()
+                        // The durable row already carries BOTH labels — no store
+                        // round-trip needed for these. Same best→worst chain as
+                        // the live rows: current summary → stable title →
+                        // clipped brief, skipping any that is blank.
+                        match [r.activity_summary.as_deref(), r.title.as_deref()]
+                            .into_iter()
+                            .flatten()
                             .map(str::trim)
-                            .filter(|s| !s.is_empty())
+                            .find(|s| !s.is_empty())
                         {
                             Some(s) => s.replace('|', "\\|"),
                             None => one_line(&r.task),
@@ -5766,11 +5786,18 @@ fn collect_worker_rows(session: &Session) -> Vec<crate::workers_modal::WorkerRow
                 // static table's `Doing` cell — the summary is written by the
                 // coordinator SUBPROCESS, so it has to be read through the
                 // durable store (throttled by `cached_summary`).
-                task: session
-                    .coordinator_store
-                    .as_ref()
-                    .and_then(|s| crate::activity_summary::cached_summary(s, &w.run_id()))
-                    .unwrap_or_else(|| one_line(&w.task)),
+                task: {
+                    // Same best→worst chain as the static table's `doing`:
+                    // live summary → stable title → clipped brief.
+                    let store = session.coordinator_store.as_ref();
+                    let rid = w.run_id();
+                    store
+                        .and_then(|s| crate::activity_summary::cached_summary(s, &rid))
+                        .or_else(|| {
+                            store.and_then(|s| crate::activity_summary::cached_title(s, &rid))
+                        })
+                        .unwrap_or_else(|| one_line(&w.task))
+                },
                 result_cell: w.result_cell(),
                 parent_id: None,
                 depth: 0,
@@ -5878,13 +5905,14 @@ fn durable_worker_row(
         status: r.phase.clone(),
         started_cell,
         runtime_cell,
-        // The durable row already carries the activity summary — no store
-        // round-trip needed (see `crate::activity_summary`).
-        task: r
-            .activity_summary
-            .as_deref()
+        // The durable row already carries both labels — no store round-trip
+        // needed (see `crate::activity_summary`): current summary → stable
+        // title → clipped brief.
+        task: [r.activity_summary.as_deref(), r.title.as_deref()]
+            .into_iter()
+            .flatten()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .find(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| one_line(&r.task)),
         result_cell,

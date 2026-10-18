@@ -99,7 +99,7 @@ pub const FRAME_MS: u64 = 220;
 pub const DWELL: Duration = Duration::from_secs(45);
 
 /// Max visible width of the task hint on the escalation row.
-const TASK_HINT_MAX: usize = 56;
+pub(crate) const TASK_HINT_MAX: usize = 56;
 
 /// Max visible width of the composed status row (the terminal clip in
 /// `footer_seq` is the hard backstop; this keeps the row from crowding out the
@@ -282,6 +282,31 @@ pub fn set_status(id: &str, status: &str) {
         && let Some(b) = banners.iter_mut().find(|b| b.id == id)
     {
         b.status = status.to_string();
+    }
+}
+
+/// Replace coordinator `id`'s HEAD-row label — the banner's name for the work.
+///
+/// [`pin`] seeds it with the raw task brief because that is all the parent knows
+/// at launch; the model-written TITLE (see
+/// [`crate::activity_summary::summarize_title`]) is stamped onto the durable row
+/// a moment later BY THE COORDINATOR SUBPROCESS, so the parent has to swap it in
+/// once it appears. The REPL does that from its footer-refresh pass
+/// (`repl::refresh_escalation_status`), which is already reading the store for
+/// the status row.
+///
+/// No-op when `id` isn't pinned (same ID-scoping rule as [`set_status`]: a
+/// retired worker must never write into another banner's row), and no-op on an
+/// empty label so a failed title write can't blank out the brief we already
+/// have.
+pub fn set_task(id: &str, task: &str) {
+    if task.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut banners) = BANNERS.lock()
+        && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+    {
+        b.task = task.to_string();
     }
 }
 
