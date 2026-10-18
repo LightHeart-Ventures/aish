@@ -1395,6 +1395,14 @@ read) — a fresh read is cheaper than a wrong assertion, so verify unprompted; 
 - Memory: remember() durable facts (projects, preferences, lessons); recall() proactively on context.\n\
 - Match the ask (correctness, not style): short question → short answer; they'll follow up if they want more. The failure mode isn't length, it's mismatch — answering a bigger question than asked or padding with adjacent info. Gut check: if they could reasonably follow up to get this, don't preempt it.\n- Output: shell-like. Use markdown tables for ANY list >1 item (columns that matter, sorted \
 deliberately). Flag costs/optimizations.\n\
+- Choice popup (let the operator PICK): when the next step depends on the user choosing among \
+concrete options, emit exactly ONE fenced block whose info string is `choice` — keys `mode:` \
+(one | many | compare), `question:`, then an `options:` list of `- id:` / `label:` / optional \
+`summary:`. ids are stable, lowercase and hyphenated; labels are what the human reads. mode one = \
+single pick, many = multi-select, compare = options as attribute columns with a single pick. aish \
+renders it as a selectable popup and feeds the chosen id(s) straight back as your next input, so \
+STOP after the block and wait for the answer. NEVER use a choice block for a free-text question, \
+and never for something you can decide yourself — just ask plainly or decide.\n\
 \n\
 Advanced Directives:\n\
 - Repo mode / .repospec.json habit: the FIRST time you work in a repo, before touching code, \
@@ -1640,6 +1648,32 @@ mod tests {
             format!("tool_{n}"),
             ToolResult::text(format!("id{n}"), "x".repeat(64), false),
         )
+    }
+
+    /// FR-431: every agent inherits the choice-block contract from the aish
+    /// system prompt — not from per-agent prompts — so the popup renderer and
+    /// the model agree on one wire format.
+    #[test]
+    fn system_prompt_documents_the_choice_block() {
+        let session = Session::new().unwrap();
+        let prompt = session.system_prompt(false);
+
+        assert!(
+            prompt.contains("Choice popup"),
+            "system prompt is missing the choice-popup rule"
+        );
+        assert!(prompt.contains("`choice`"), "missing the fence info string");
+        for key in ["mode:", "question:", "options:", "- id:", "label:"] {
+            assert!(prompt.contains(key), "choice rule omits key {key}");
+        }
+        assert!(
+            prompt.contains("one | many | compare"),
+            "choice rule omits the mode enum"
+        );
+        assert!(
+            prompt.contains("NEVER use a choice block for a free-text question"),
+            "choice rule omits the free-text prohibition"
+        );
     }
 
     /// ISS-409752: the reveal buffer is the one accumulator compaction can't

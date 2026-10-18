@@ -6,6 +6,7 @@ mod approval;
 mod autosuggest;
 mod backend;
 mod batch;
+mod choice;
 mod codebase_memory;
 mod container;
 mod context;
