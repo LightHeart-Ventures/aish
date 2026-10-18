@@ -1745,6 +1745,21 @@ pub async fn run(
                         next_input = dir;
                         continue 'resume;
                     }
+                    // An agent-requested CHOICE popup (FR-431). The reply asked
+                    // the operator a structured question, so open the popup and
+                    // feed the selected option id(s) back into THIS turn over
+                    // the very channel auto-recovery just used above —
+                    // `next_input` + `continue 'resume` — rather than inventing
+                    // a second way to return operator input to a live agent.
+                    // Esc answers nothing: we fall through and the raw text is
+                    // printed, which is also what a malformed block does.
+                    if let Some(spec) = reply.as_deref().and_then(crate::choice::first_choice)
+                        && let Some(answer) =
+                            crate::choice::prompt_choice(spec, crate::escalation::ROWS_PER_BANNER)
+                    {
+                        next_input = answer;
+                        continue 'resume;
+                    }
                     break 'resume;
                 }
                 if aborted {
