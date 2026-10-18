@@ -343,25 +343,36 @@ pub enum Key {
     Toggle,
     Confirm,
     Cancel,
+    /// A printable character. Whether it MOVES the cursor or lands in the reply
+    /// line is context, not decoding: see [`ChoiceState::apply`].
+    Char(char),
+    /// Backspace / DEL — edits the reply line.
+    Backspace,
     Other,
 }
 
 /// Decode a keystroke from the bytes a raw tty hands over.
 ///
 /// `bytes` is one keypress: a single byte, or an ESC-introduced sequence.
-/// Only the advertised keys map to anything.
+/// Printable ASCII decodes to [`Key::Char`] — including `j`/`k`/space, which
+/// the popup still treats as movement/toggle while the reply line is empty.
+/// Keeping that decision in [`ChoiceState::apply`] rather than here is what
+/// lets the operator type a reply that STARTS with any letter once they have
+/// begun typing, instead of losing three characters to the key map forever.
 pub fn decode_key(bytes: &[u8]) -> Key {
     match bytes {
         [0x1b] => Key::Cancel,
         // CSI / SS3 arrows. Anything else ESC-introduced is inert.
         [0x1b, b'[', b'A', ..] | [0x1b, b'O', b'A', ..] => Key::Up,
         [0x1b, b'[', b'B', ..] | [0x1b, b'O', b'B', ..] => Key::Down,
-        [b'k'] | [b'K'] => Key::Up,
-        [b'j'] | [b'J'] => Key::Down,
-        [b' '] => Key::Toggle,
         [b'\r'] | [b'\n'] => Key::Confirm,
         // Ctrl-C / Ctrl-D cancel, same as the confirm prompt.
         [0x03] | [0x04] => Key::Cancel,
+        // DEL / Ctrl-H edit the reply line; Tab toggles in `many` mode so the
+        // space bar is free to be a literal space once typing starts.
+        [0x7f] | [0x08] => Key::Backspace,
+        [b'\t'] => Key::Toggle,
+        [c] if (0x20..0x7f).contains(c) => Key::Char(*c as char),
         _ => Key::Other,
     }
 }
@@ -376,6 +387,8 @@ pub struct ChoiceState {
     top: usize,
     /// How many option rows the terminal can show at once (>=1).
     window: usize,
+    /// Free-text the operator typed on the always-present reply line.
+    reply: String,
 }
 
 impl ChoiceState {
@@ -387,7 +400,14 @@ impl ChoiceState {
             checked: vec![false; n],
             top: 0,
             window: n.max(1),
+            reply: String::new(),
         }
+    }
+
+    /// What the operator has typed on the reply line so far.
+    #[allow(dead_code)] // part of the popup's public surface; used by tests today
+    pub fn reply(&self) -> &str {
+        &self.reply
     }
 
     #[allow(dead_code)] // part of the popup's public surface; used by tests today
@@ -470,14 +490,42 @@ impl ChoiceState {
                 }
                 Outcome::Ignored
             }
+            // Printable keys. While the reply line is still EMPTY the legacy
+            // selection keys win (j/k move, space toggles); the moment the
+            // operator has typed anything, every printable is literal text.
+            Key::Char(c) => {
+                if self.reply.is_empty() {
+                    match c {
+                        'j' | 'J' if n > 0 => return self.apply(Key::Down),
+                        'k' | 'K' if n > 0 => return self.apply(Key::Up),
+                        ' ' if self.spec.mode.multi() => return self.apply(Key::Toggle),
+                        _ => {}
+                    }
+                }
+                self.reply.push(c);
+                Outcome::Redraw
+            }
+            Key::Backspace => {
+                if self.reply.pop().is_some() {
+                    Outcome::Redraw
+                } else {
+                    Outcome::Ignored
+                }
+            }
             Key::Confirm => {
                 let ids = self.selected_ids();
-                // `many` with nothing ticked is not an answer — keep waiting,
-                // the same way a bare Enter at the confirm prompt does nothing.
-                if ids.is_empty() {
+                // Nothing ticked AND nothing typed is not an answer — keep
+                // waiting, the same way a bare Enter at the confirm prompt
+                // does nothing. A typed reply alone IS an answer: that is the
+                // point of the reply line.
+                if ids.is_empty() && self.reply.trim().is_empty() {
                     return Outcome::Ignored;
                 }
-                Outcome::Confirmed(answer_json(self.spec.mode, &ids))
+                Outcome::Confirmed(answer_json_with_reply(
+                    self.spec.mode,
+                    &ids,
+                    self.reply.trim(),
+                ))
             }
             Key::Cancel => Outcome::Cancelled,
             _ => Outcome::Ignored,
@@ -536,6 +584,14 @@ impl ChoiceState {
             rows.push(dim(&format!("  ... {remaining} more")));
         }
         rows.push(dim(&clip(self.hint(), width)));
+        // The reply line, ALWAYS present and always last — so in tray mode it
+        // sits flush above the horizontal rule, right where the operator's
+        // own input line is. Empty it reads as a blank row with a caret.
+        let mut line = String::from("> ");
+        line.push_str(&self.reply);
+        line.push('_');
+        let clipped = clip(&line, width);
+        rows.push(if color { hi(&clipped) } else { clipped });
         rows
     }
 
@@ -543,9 +599,9 @@ impl ChoiceState {
     /// nothing — that is the contract the confirm prompt set.
     pub fn hint(&self) -> &'static str {
         if self.spec.mode.multi() {
-            "up/down or j/k move - space toggles - enter confirms - esc cancels"
+            "up/down move - space/tab toggles - type to reply - enter confirms - esc cancels"
         } else {
-            "up/down or j/k move - enter confirms - esc cancels"
+            "up/down move - type to reply - enter confirms - esc cancels"
         }
     }
 
@@ -553,11 +609,29 @@ impl ChoiceState {
     #[allow(dead_code)] // reserved-row accounting for callers that pre-measure
     pub fn height(&self) -> usize {
         let visible = self.window.min(self.spec.options.len());
-        // question + options + hint, plus the scroll affordances when clipped.
-        2 + visible
+        // question + options + hint + reply, plus the scroll affordances when
+        // clipped.
+        CHROME_ROWS
+            + visible
             + usize::from(self.top > 0)
             + usize::from(self.top + visible < self.spec.options.len())
     }
+}
+
+/// Non-option rows every popup paints: the question, the hint, and the
+/// always-present reply line.
+pub const CHROME_ROWS: usize = 3;
+
+/// JSON answer plus the operator's typed reply, when they typed one. The
+/// `choice` key keeps its exact old shape so existing consumers are unaffected;
+/// `reply` is additive and omitted when empty.
+pub fn answer_json_with_reply(mode: ChoiceMode, ids: &[String], reply: &str) -> String {
+    let base = answer_json(mode, ids);
+    if reply.is_empty() {
+        return base;
+    }
+    let body = base.strip_suffix('}').unwrap_or(&base);
+    format!("{body},\"reply\":\"{}\"}}", escape(reply))
 }
 
 /// JSON answer for a confirmed popup: an object with a single `choice` key,
@@ -607,9 +681,9 @@ pub fn popup_budget(body_rows: u16) -> usize {
 }
 
 /// Option rows the popup can show for a `body_rows`-tall body: the budget less
-/// the question row and the hint row.
+/// the chrome (question row, hint row, and the always-present reply line).
 pub fn option_window(body_rows: u16) -> usize {
-    popup_budget(body_rows).saturating_sub(2)
+    popup_budget(body_rows).saturating_sub(CHROME_ROWS)
 }
 
 /// Body rows available above the footer for the CURRENT terminal height, via
@@ -703,8 +777,36 @@ pub fn prompt_choice(spec: ChoiceSpec, want_banner_rows: u16) -> Option<String> 
         return None;
     }
     let (rows, cols) = term_size()?;
-    let body = body_rows_for(rows, want_banner_rows);
     let mut state = ChoiceState::new(spec);
+
+    // Preferred path: hand the popup to the footer's hint tray. The layout
+    // solver seats that tray BELOW the pinned escalation banners and flush
+    // ABOVE the horizontal rule, so the menu lands where the operator expects
+    // it — bottom-anchored, under the escalations — and growing it pushes the
+    // banner stack UP rather than painting over the footer. Falls through to
+    // the inline paint below when there is no footer region to hang it on.
+    if let Some(cap) = crate::terminal::tray_capacity_full() {
+        state.set_window(cap.saturating_sub(CHROME_ROWS).max(1));
+        if crate::terminal::set_hint_tray(state.render(cols, true)) {
+            let answer = loop {
+                let Some(key) = read_choice_key() else {
+                    break None;
+                };
+                match state.apply(key) {
+                    Outcome::Ignored => continue,
+                    Outcome::Redraw => {
+                        crate::terminal::set_hint_tray(state.render(cols, true));
+                    }
+                    Outcome::Confirmed(answer) => break Some(answer),
+                    Outcome::Cancelled => break None,
+                }
+            };
+            crate::terminal::clear_hint_tray();
+            return answer;
+        }
+    }
+
+    let body = body_rows_for(rows, want_banner_rows);
     let window = option_window(body);
     if window == 0 {
         // Degraded window: print the list once, inline, and take no keys —
@@ -852,18 +954,92 @@ trailing text
 
     #[test]
     fn only_advertised_keys_decode() {
-        assert_eq!(decode_key(b"k"), Key::Up);
-        assert_eq!(decode_key(b"j"), Key::Down);
+        // Control keys decode to intents...
         assert_eq!(decode_key(b"\x1b[A"), Key::Up);
         assert_eq!(decode_key(b"\x1b[B"), Key::Down);
         assert_eq!(decode_key(b"\x1bOA"), Key::Up);
-        assert_eq!(decode_key(b" "), Key::Toggle);
+        assert_eq!(decode_key(b"\t"), Key::Toggle);
         assert_eq!(decode_key(b"\r"), Key::Confirm);
         assert_eq!(decode_key(b"\x1b"), Key::Cancel);
         assert_eq!(decode_key(&[0x03]), Key::Cancel);
-        for junk in [&b"x"[..], b"Z", b"1", b"\x1b[C", b"\x1b[D", b"\t", &[0x7f]] {
+        assert_eq!(decode_key(&[0x7f]), Key::Backspace);
+        // ...and every printable is text at this layer. j/k/space only MEAN
+        // movement in `apply`, and only while the reply line is empty.
+        assert_eq!(decode_key(b"k"), Key::Char('k'));
+        assert_eq!(decode_key(b"j"), Key::Char('j'));
+        assert_eq!(decode_key(b" "), Key::Char(' '));
+        assert_eq!(decode_key(b"Z"), Key::Char('Z'));
+        for junk in [&b"\x1b[C"[..], b"\x1b[D", &[0x01], &[0x1b, b'[', b'Z']] {
             assert_eq!(decode_key(junk), Key::Other, "{junk:?} must be inert");
         }
+    }
+
+    #[test]
+    fn reply_line_is_always_rendered_last_and_answers_alone() {
+        let mut st = state("one", 2);
+        // Always present, even untouched: a caret row under the hint.
+        let rows = st.render(80, false);
+        assert_eq!(rows.last().unwrap().trim(), "> _", "got {:?}", rows.last());
+        assert!(rows[rows.len() - 2].contains("type to reply"));
+
+        // Typing lands in the reply line once the operator starts a word.
+        for c in "ok".chars() {
+            assert_eq!(st.apply(Key::Char(c)), Outcome::Redraw);
+        }
+        assert_eq!(st.reply(), "ok");
+        assert!(st.render(80, false).last().unwrap().contains("> ok_"));
+
+        // Backspace edits it; an empty line swallows nothing.
+        assert_eq!(st.apply(Key::Backspace), Outcome::Redraw);
+        assert_eq!(st.reply(), "o");
+        st.apply(Key::Backspace);
+        assert_eq!(st.apply(Key::Backspace), Outcome::Ignored);
+
+        // A typed reply rides along with the choice...
+        st.apply(Key::Char('h'));
+        st.apply(Key::Char('i'));
+        assert_eq!(
+            st.apply(Key::Confirm),
+            Outcome::Confirmed("{\"choice\":\"o0\",\"reply\":\"hi\"}".to_string())
+        );
+
+        // ...and in `many` mode a reply alone is a valid answer, while an
+        // empty popup with nothing typed still ignores Enter.
+        let mut st = state("many", 2);
+        assert_eq!(st.apply(Key::Confirm), Outcome::Ignored);
+        st.apply(Key::Char('n'));
+        st.apply(Key::Char('o'));
+        assert_eq!(
+            st.apply(Key::Confirm),
+            Outcome::Confirmed("{\"choice\":[],\"reply\":\"no\"}".to_string())
+        );
+    }
+
+    #[test]
+    fn selection_keys_win_only_while_the_reply_is_empty() {
+        let mut st = state("many", 3);
+        // Empty reply: j/k move, space toggles — the old muscle memory.
+        st.apply(Key::Char('j'));
+        assert_eq!(st.cursor(), 1);
+        st.apply(Key::Char('k'));
+        assert_eq!(st.cursor(), 0);
+        st.apply(Key::Char(' '));
+        assert_eq!(st.selected_ids(), vec!["o0".to_string()]);
+        assert!(st.reply().is_empty(), "movement keys are not text");
+
+        // Once typing starts, every printable is literal — including j/k and
+        // spaces, so the operator can write a sentence.
+        st.apply(Key::Char('n'));
+        for c in "o j k".chars() {
+            st.apply(Key::Char(c));
+        }
+        assert_eq!(st.reply(), "no j k");
+        assert_eq!(st.cursor(), 0, "cursor must not have moved");
+        // Arrows and Tab still work regardless of what has been typed.
+        st.apply(Key::Down);
+        assert_eq!(st.cursor(), 1);
+        st.apply(Key::Toggle);
+        assert_eq!(st.selected_ids(), vec!["o0".to_string(), "o1".to_string()]);
     }
 
     fn state(mode: &str, n: usize) -> ChoiceState {
@@ -928,7 +1104,13 @@ trailing text
         assert!(rows[0].contains("q"), "question row first");
         assert!(rows[1].starts_with("> [x] O0"), "got {:?}", rows[1]);
         assert!(rows[2].starts_with("  [ ] O1"), "got {:?}", rows[2]);
-        assert!(rows.last().unwrap().contains("space toggles"));
+        // The hint sits directly above the always-present reply line.
+        assert!(
+            rows[rows.len() - 2].contains("space/tab toggles"),
+            "got {:?}",
+            rows
+        );
+        assert_eq!(rows.last().unwrap().trim(), "> _");
         for row in &rows {
             assert!(row.is_ascii(), "no non-ascii in {row:?}");
         }
@@ -945,15 +1127,15 @@ trailing text
         st.set_window(3);
         assert_eq!(
             st.height(),
-            2 + 3 + 1,
-            "window + question + hint + more-row"
+            CHROME_ROWS + 3 + 1,
+            "window + question + hint + reply + more-row"
         );
         for _ in 0..5 {
             st.apply(Key::Down);
         }
         let rows = st.render(80, false);
         // Never more rows than the window plus chrome.
-        assert!(rows.len() <= 3 + 4, "got {} rows", rows.len());
+        assert!(rows.len() <= 3 + CHROME_ROWS + 2, "got {} rows", rows.len());
         assert!(
             rows.iter().any(|r| r.contains("above")),
             "scrolled window must say what is off-screen: {rows:?}"
@@ -976,7 +1158,7 @@ trailing text
                 b == 0 || b < body as usize,
                 "budget {b} must leave body rows at {body}"
             );
-            assert_eq!(option_window(body), b.saturating_sub(2));
+            assert_eq!(option_window(body), b.saturating_sub(CHROME_ROWS));
         }
         let st = state("one", 3);
         assert!(st.fits_inline_only(2));
