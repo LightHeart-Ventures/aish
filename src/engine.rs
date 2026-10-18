@@ -1440,18 +1440,35 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
         return;
     };
     let dropped = commit_compaction(session, &plan);
-    // Route through the serialised prompt-preserving printer, not a raw
-    // `eprintln!`. A raw write lands at the cursor, which both trampled the live
-    // prompt and tore any in-flight in-place animation — in the reported output
-    // this notice is the visible wedge that split the quiet-summary line into a
-    // 🔍 pair above it and a 🔎 pair below it. Falls back to stderr when no
-    // printer is installed (piped / headless / non-interactive).
-    let notice = format!(
-        "\x1b[2maish: {} tripped — compacted {dropped} earlier message(s) to memory\x1b[0m",
+    // Surface on the SecondStatusLine flash slot (most-recent wins) instead of
+    // printing above the prompt — matching how the `mcp: ready` notice,
+    // worker-done notices, and fired-`:alert` badges are moved onto the footer.
+    // Even routed through the prompt-preserving printer, a body write here landed
+    // mid-turn and tore any in-flight in-place animation: in the reported output
+    // this notice was the visible wedge that split the quiet-summary line into a
+    // 🔍 pair above it and a 🔎 pair below it. The footer has no such hazard.
+    let plain = format!(
+        "aish: {} tripped — compacted {dropped} earlier message(s) to memory",
         trigger.label()
     );
-    if !crate::tools::print_above_prompt(format!("{notice}\n")) {
-        eprintln!("{notice}");
+    if let Ok(mut f) = session.flash.lock() {
+        *f = Some(format!("\x1b[2m{plain}\x1b[0m"));
+    }
+    // Also append to the recoverable `:activity` tray so the notice is still
+    // inspectable after the flash slot is overwritten by the next message
+    // (info tier, source "context").
+    if let Some(act) = &session.activity_store {
+        let _ = act.record(
+            crate::style::Severity::Info.as_str(),
+            "context compacted",
+            &plain,
+            "context",
+        );
+    }
+    // No footer to flash onto (piped / headless / non-interactive) — keep the
+    // notice visible on stderr so a coordinator log still records the trip.
+    if !crate::terminal::footer_active() {
+        eprintln!("\x1b[2m{plain}\x1b[0m");
     }
 }
 
