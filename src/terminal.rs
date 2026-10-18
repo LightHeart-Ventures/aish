@@ -108,14 +108,25 @@ pub struct FooterLayout {
     /// Rows granted to the pinned escalation block — always a whole multiple of
     /// [`crate::escalation::ROWS_PER_BANNER`].
     pub banner_rows: u16,
-    /// Blank row separating pinned tray output from the scrolling text.
-    /// Always present while any tray item is visible.
+    /// Row separating pinned tray output from the scrolling text above it, and
+    /// always present while any tray item is visible. Painted as a horizontal
+    /// RULE (the same glyph run as [`Self::sep_row`]) so the pinned block reads
+    /// as a framed panel — a rule above the trays, a rule below them — instead
+    /// of floating in the transcript. Named `spacer` because that is the row's
+    /// JOB (and it was blank originally); the arithmetic is unchanged by what
+    /// the paint puts in it.
     pub spacer_row: Option<u16>,
     /// Rows granted to the `:`-command HINT TRAY, which stacks directly above
     /// the rule and directly BELOW the escalation block. `0` whenever no
     /// `:`-palette is open (the overwhelmingly common case) or a short window
     /// shed it. See [`set_hint_tray`].
     pub hint_rows: u16,
+    /// Screen row of the horizontal rule BETWEEN the two trays — escalation
+    /// banners above it, the `:`-command hint tray below it. `Some` only when
+    /// BOTH trays are visible, because that is the only time there is anything
+    /// to divide: it costs a row exactly when it has a job to do, and it
+    /// disappears for free the moment either tray empties.
+    pub tray_sep_row: Option<u16>,
     /// Screen row of the horizontal rule, or `None` when it was shed.
     pub sep_row: Option<u16>,
     /// Screen row of the status message, or `None` when it was shed.
@@ -160,6 +171,10 @@ impl FooterLayout {
         // half a banner must never become reservable.
         let mut banner_rows = want_banner_rows - (want_banner_rows % per);
         let (mut sep, mut msg, mut bar, mut input) = (true, true, true, true);
+        // The rule BETWEEN the trays is pure decoration, so it is the very first
+        // thing a short window gives up — a row of tray CONTENT always outranks
+        // a row that merely divides it.
+        let mut tray_sep = true;
         // Budget = every row except the body rows we refuse to give up.
         let budget = rows.saturating_sub(MIN_BODY_ROWS);
         let height = loop {
@@ -169,13 +184,18 @@ impl FooterLayout {
                 + u16::from(msg)
                 + u16::from(bar)
                 + u16::from(input)
-                + u16::from(banner_rows > 0 || hint_rows > 0);
+                + u16::from(banner_rows > 0 || hint_rows > 0)
+                // The rule BETWEEN the trays: charged only while both are
+                // non-empty, so it is free in every single-tray case.
+                + u16::from(tray_sep && banner_rows > 0 && hint_rows > 0);
             if h <= budget {
                 break h;
             }
             // Shed strictly in priority order. `input` is last, and shedding it
             // yields h == 0, which fits any budget — so the loop terminates.
-            if hint_rows > 0 {
+            if tray_sep && banner_rows > 0 && hint_rows > 0 {
+                tray_sep = false;
+            } else if hint_rows > 0 {
                 hint_rows -= 1;
             } else if banner_rows > 0 {
                 banner_rows -= per;
@@ -235,17 +255,36 @@ impl FooterLayout {
                         rows.saturating_sub(height.saturating_sub(1)).max(1)
                             + u16::from(banner_rows > 0 || hint_rows > 0)
                             + banner_rows
+                            + u16::from(tray_sep && banner_rows > 0 && hint_rows > 0)
                     ),
             "hint tray must pack flush between the banners and the rule ({rows} rows)"
         );
         let spacer_row =
             (banner_rows > 0 || hint_rows > 0).then_some(rows.saturating_sub(height) + 1);
+        // The between-trays rule sits directly under the banner block, which
+        // itself starts one row below the top rule. Derived from `spacer_row`
+        // rather than counted from the bottom so it can only ever land inside
+        // the block the solver just reserved.
+        let tray_sep_row = match spacer_row {
+            Some(top) if tray_sep && banner_rows > 0 && hint_rows > 0 => {
+                Some(top + banner_rows + 1)
+            }
+            _ => None,
+        };
+        // Both rules bracket the pinned block: the top rule is the first row the
+        // footer owns, and the tray rule (when charged) sits strictly between
+        // the two trays — never on top of either.
+        debug_assert!(
+            tray_sep_row.is_none_or(|r| Some(r) > spacer_row && sep_row.is_some_and(|s| r < s)),
+            "tray rule must land strictly between the two rules ({rows} rows)"
+        );
         Self {
             rows,
             height,
             spacer_row,
             banner_rows,
             hint_rows,
+            tray_sep_row,
             sep_row,
             msg_row,
             bar_row,
@@ -461,13 +500,15 @@ pub fn tray_capacity_full() -> Option<usize> {
     if !plan.enabled() {
         return None;
     }
-    // `FOOTER_ROWS + 1` is the footer proper plus the spacer row the solver puts
+    // `FOOTER_ROWS + 1` is the footer proper plus the top rule the solver puts
     // above a non-empty banner/tray block; `banner_rows` is the escalation stack
-    // we must not sit on top of.
+    // we must not sit on top of; the final row is the divider rule the solver
+    // charges between the two trays, which exists exactly when banners do.
     let fits = rows
         .saturating_sub(MIN_BODY_ROWS)
         .saturating_sub(FOOTER_ROWS + 1)
-        .saturating_sub(plan.banner_rows);
+        .saturating_sub(plan.banner_rows)
+        .saturating_sub(u16::from(plan.banner_rows > 0));
     Some(fits.max(1) as usize)
 }
 
@@ -1481,8 +1522,17 @@ pub fn footer_seq_with(
             clip_visible(worker, max)
         ));
     }
+    // TOP rule — the lid of the pinned block. Same glyph run as the bottom
+    // rule, so the trays read as a framed panel between two rules instead of
+    // text floating at the end of the transcript. It occupies the row the layout
+    // already reserved as the tray spacer, so framing the block costs nothing.
     if let Some(row) = layout.spacer_row {
-        s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K{sep}"));
+    }
+    // BETWEEN-TRAYS rule — present only when both trays are up, dividing the
+    // escalation banners above from the `:`-hint tray below.
+    if let Some(row) = layout.tray_sep_row {
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K{sep}"));
     }
     // The `:`-command hint tray: directly BELOW the escalation block and
     // directly ABOVE the rule, so the menu reads as the last thing the body said
@@ -3894,10 +3944,19 @@ mod tests {
         assert_eq!(b.hint_rows, 3);
         assert_eq!(b.hint_top_row(), Some(b.sep_row.unwrap() - 3));
         assert_eq!(b.input_row, Some(22));
+        // Two visible trays → a rule between them, charged inside the block:
+        // 14 spacer, 15-16 banners, 17 RULE, 18-20 tray, 21 rule.
+        assert_eq!(b.tray_sep_row, Some(b.top_row() + 1 + b.banner_rows));
         assert_eq!(
             b.hint_top_row(),
-            Some(b.top_row() + 1 + b.banner_rows),
-            "tray must hang directly off the bottom of the banner block"
+            b.tray_sep_row.map(|r| r + 1),
+            "tray must hang directly off the rule under the banner block"
+        );
+        // ...and a single visible tray never pays for a divider.
+        assert_eq!(FooterLayout::solve_with(24, 0, 2).tray_sep_row, None);
+        assert_eq!(
+            FooterLayout::solve_with(24, crate::escalation::ROWS_PER_BANNER, 0).tray_sep_row,
+            None
         );
     }
 
@@ -3916,18 +3975,22 @@ mod tests {
             assert_eq!(l.hint_rows, hints, "40 rows is roomy enough for {hints}");
             assert_eq!(l.banner_rows, per, "a tray must never cost a banner");
             // Banner block starts one row below the spacer at `top_row()`.
+            // A second visible tray also buys the rule BETWEEN them, so the
+            // block rises by the tray rows PLUS that one divider row.
             assert_eq!(
                 l.top_row() + 1,
-                base.top_row() + 1 - hints,
-                "banner block must rise exactly {hints} row(s)"
+                base.top_row() + 1 - (hints + 1),
+                "banner block must rise exactly {} row(s)",
+                hints + 1
             );
             // ...and the tray fills precisely the gap that opened up, ending on
             // the rule, which itself has not moved.
-            assert_eq!(l.hint_top_row(), Some(l.top_row() + 1 + l.banner_rows));
+            assert_eq!(l.tray_sep_row, Some(l.top_row() + 1 + l.banner_rows));
+            assert_eq!(l.hint_top_row(), l.tray_sep_row.map(|r| r + 1));
             assert_eq!(l.sep_row, base.sep_row, "the rule is the fixed anchor");
             assert_eq!(l.input_row, base.input_row);
             // The rows came from the transcript, not from another footer zone.
-            assert_eq!(l.body_bottom, base.body_bottom - hints);
+            assert_eq!(l.body_bottom, base.body_bottom - (hints + 1));
         }
     }
 
@@ -4132,8 +4195,11 @@ mod tests {
                             && !line.contains("hint")
                     );
                 }
+                // The row that used to be a blank spacer now carries the TOP
+                // rule — the lid of the pinned block — so it must hold the rule
+                // glyph and never tray text.
                 if let Some(row) = after.spacer_row {
-                    assert!(screen.line(row).trim().is_empty());
+                    assert_eq!(screen.line(row).trim(), "----");
                 }
                 assert_eq!(
                     screen.row,
@@ -4157,8 +4223,19 @@ mod tests {
                     let layout = FooterLayout::solve_with(rows, banners, hints);
                     if layout.banner_rows > 0 || layout.hint_rows > 0 {
                         assert_eq!(layout.spacer_row, Some(layout.body_bottom + 1));
-                        let first = layout.sep_row.unwrap() - layout.hint_rows - layout.banner_rows;
+                        // The tray rule, when charged, is part of the pinned
+                        // block and so shifts the first tray row down by one.
+                        let first = layout.sep_row.unwrap()
+                            - layout.hint_rows
+                            - layout.banner_rows
+                            - u16::from(layout.tray_sep_row.is_some());
                         assert_eq!(first, layout.body_bottom + 2);
+                        if let Some(rule) = layout.tray_sep_row {
+                            // Strictly between the trays: last banner row, rule,
+                            // first hint row.
+                            assert_eq!(rule, layout.body_bottom + 2 + layout.banner_rows);
+                            assert!(layout.banner_rows > 0 && layout.hint_rows > 0);
+                        }
                     } else {
                         assert_eq!(layout.spacer_row, None);
                     }
