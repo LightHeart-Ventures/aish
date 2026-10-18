@@ -1063,6 +1063,17 @@ plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n
         .and_then(|s| crate::activity_summary::ActivityTracker::attach(session, s, run_id, &input));
     session.activity = tracker;
     if let Some(t) = session.activity.as_mut() {
+        // Two DIFFERENT strings, written back to back from the same task brief
+        // and the same lightweight backend, because the operator needs both
+        // halves of "which worker is this" and "what is it doing":
+        //   · the TITLE names the whole assignment and never changes, so it can
+        //     serve as the operator's handle on this worker (the `:workers` row
+        //     and the escalation banner's head row);
+        //   · the SUMMARY says what it's doing right now and is refreshed every
+        //     round (the status row / `Doing` cell).
+        // Title first: it's the cell that was showing a hard-clipped brief, so
+        // it's the one worth having before the row first paints.
+        t.refresh_title().await;
         t.refresh_startup().await;
     }
 
@@ -3577,6 +3588,7 @@ mod tests {
             tool_calls: 0,
             kind: None,
             activity_summary: None,
+            title: None,
         }
     }
 

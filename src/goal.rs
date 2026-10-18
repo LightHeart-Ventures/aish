@@ -1932,6 +1932,7 @@ mod tests {
             tool_calls: 0,
             kind: None,
             activity_summary: None,
+            title: None,
         }
     }
 

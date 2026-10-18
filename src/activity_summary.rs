@@ -300,6 +300,138 @@ pub async fn summarize(backend: &Backend, task: &str, recent: Option<&str>) -> O
     sanitize(&turn.text, budget)
 }
 
+// ── Worker title ───────────────────────────────────────────────────────────
+//
+// The HEAD row of an escalation banner names WHICH worker this is:
+// `🚀 w_f9GUaOAU · <title>`. That `<title>` used to be the raw task brief
+// hard-clipped at a character count, so the banner read:
+//
+//   🚀 w_f9GUaOAU · Review the Atum board cards currently in column col_rev…
+//
+// — half the row spent re-reading the opening of a brief the operator WROTE,
+// cut off one token before the only part that identifies it (the board id).
+//
+// A title is a DIFFERENT job from the status row beneath it. The status row
+// answers "what is it doing right now" and is expected to change on every
+// refresh; the title answers "which assignment is this" and must stay STABLE
+// for the worker's whole life, because it is the handle the operator tracks it
+// by across `:workers`, the Shift-Tab rotation, and the tray. So it is written
+// ONCE, from the task brief alone, at worker start — same cheap model, same
+// budget discipline as [`summarize`] — and never refreshed: a title that
+// rewrites itself mid-run is a worse title.
+
+/// Floor for the title budget. Below this a title cannot carry a subject plus
+/// its target, so a very narrow terminal clips at the render site instead of
+/// degrading the title itself into a bare noun.
+pub const TITLE_MIN_BUDGET: usize = 20;
+
+/// Ceiling for the title budget.
+///
+/// Held just under `escalation::TASK_HINT_MAX` (56) so a stored title always
+/// survives the banner's own defensive clip INTACT — a model-written title the
+/// renderer then has to ellipsize is exactly the failure this replaces.
+pub const TITLE_MAX_BUDGET: usize = 52;
+
+/// The character allowance for a worker title at `term_width`, derived from the
+/// escalation head row's real chrome and clamped to
+/// [`TITLE_MIN_BUDGET`]`..=`[`TITLE_MAX_BUDGET`]. Pure.
+///
+/// Only the head row is considered: unlike an activity summary (one string
+/// shared by three surfaces, hence the `min` in [`budget`]), the title's
+/// width-critical consumer is the banner head, and `:workers` renders it in a
+/// column that is strictly wider.
+pub fn title_budget(term_width: usize) -> usize {
+    term_width
+        .saturating_sub(ESCALATION_HEAD_CHROME)
+        .clamp(TITLE_MIN_BUDGET, TITLE_MAX_BUDGET)
+}
+
+/// [`title_budget`] at the live terminal width.
+pub fn current_title_budget() -> usize {
+    title_budget(crate::md::term_width())
+}
+
+/// The title writer's system prompt, budget-interpolated so the hard limit the
+/// model is told matches the limit [`sanitize_title`] enforces. Pure.
+///
+/// Deliberately asks for a NOUN PHRASE, not the verb-led fragment
+/// [`summarizer_system`] asks for: the two rows of a banner sit one above the
+/// other, and two verb-led lines read as one garbled sentence.
+pub fn title_system(budget: usize) -> String {
+    format!(
+        "You write a SHORT TITLE naming a background agent worker's assignment, like a tab \
+label. It renders in a terminal row next to the worker's id, so it must fit.\n\n\
+Rules:\n\
+- Output ONLY the title. No prose, no preamble, no quotes, no markdown, no code fences, \
+no bullet, no trailing period.\n\
+- HARD LIMIT: {budget} characters. Shorter is better — aim for {aim}.\n\
+- A noun phrase, not a sentence and not a command: \"col_review board audit\", \
+\"aish worker titles\", \"CI fix on feat/retry\".\n\
+- Keep the IDENTIFYING tokens — repo, branch, PR, card, board id, file, module. Those are \
+what the operator scans for; drop ordinary words before dropping an identifier.\n\
+- Name the WHOLE assignment, not the first step and not the current step.\n\
+- No filler. Never \"task to\", \"request to\", \"working on\", \"the agent\", \"please\".\n\
+- Do not start with a verb in the imperative (\"Review …\", \"Fix …\") — name the thing \
+(\"review of …\", \"CI fix …\").",
+        aim = budget.saturating_sub(budget / 4).max(TITLE_MIN_BUDGET),
+    )
+}
+
+/// Assemble the title writer's user message from the task brief. Pure +
+/// deterministic so the prompt shape is unit-testable.
+pub fn build_title_prompt(task: &str, budget: usize) -> String {
+    let mut p = String::with_capacity(TASK_CONTEXT_MAX + 160);
+    p.push_str("ASSIGNMENT:\n");
+    p.push_str(&clip_chars(task.trim(), TASK_CONTEXT_MAX));
+    p.push_str(&format!(
+        "\n\nTitle naming this assignment (max {budget} chars):"
+    ));
+    p
+}
+
+/// Turn the model's raw reply into one clean title within `budget`, or `None`
+/// when it returned nothing usable. Pure.
+///
+/// Delegates the shared cleanup (fences, bullets, quotes, whitespace, trailing
+/// period, word-boundary clip) to [`sanitize`], then applies the two
+/// title-specific strips: a `Title:` label the model may prepend, and a
+/// trailing colon left over from one. Also rejects the summarizer's
+/// [`STARTUP_FALLBACK`] sentinel — "starting up" is a fine STATUS but a useless
+/// title, and the caller falling back to the clipped brief beats it.
+pub fn sanitize_title(raw: &str, budget: usize) -> Option<String> {
+    let stripped = raw
+        .trim_start()
+        .strip_prefix("Title:")
+        .or_else(|| raw.trim_start().strip_prefix("TITLE:"))
+        .unwrap_or(raw);
+    let mut s = sanitize(stripped, budget)?;
+    if let Some(rest) = s.strip_suffix(':') {
+        s = rest.trim_end().to_string();
+    }
+    if s.is_empty() || s.eq_ignore_ascii_case(STARTUP_FALLBACK) {
+        return None;
+    }
+    Some(s)
+}
+
+/// Write a worker's stable title from its task brief.
+///
+/// Issues a SINGLE tool-less [`Backend::complete`] call at the live
+/// [`current_title_budget`]. Best-effort by design, exactly like [`summarize`]:
+/// any error, refusal, or unusable reply yields `None` and every surface keeps
+/// clipping the raw brief as it did before — a title writer hiccup must never
+/// fail or stall the worker's real work.
+pub async fn summarize_title(backend: &Backend, task: &str) -> Option<String> {
+    let budget = current_title_budget();
+    let system = title_system(budget);
+    let prompt = build_title_prompt(task, budget);
+    let turn = backend
+        .complete(&system, &[Msg::user(prompt)], &[])
+        .await
+        .ok()?;
+    sanitize_title(&turn.text, budget)
+}
+
 // ── Mid-round tracker ───────────────────────────────────────────────────────
 //
 // See the "Why mid-round is the load-bearing one" note at the top of the module:
@@ -466,6 +598,22 @@ impl ActivityTracker {
         self.write(summarize(&self.backend, &task, Some(synthesis)).await?)
     }
 
+    /// Write the worker's stable TITLE from the task brief — called ONCE, at
+    /// startup, alongside [`Self::refresh_startup`]. Returns the title when one
+    /// was written.
+    ///
+    /// Deliberately has no throttle and no refresh counterpart: the title names
+    /// the assignment, which does not change, and the operator needs it to hold
+    /// still to use it as a handle (see the module's "Worker title" note).
+    /// Best-effort — a failure leaves the row's title `NULL` and the surfaces
+    /// fall back to clipping the brief.
+    pub async fn refresh_title(&mut self) -> Option<String> {
+        let task = self.task.clone();
+        let title = summarize_title(&self.backend, &task).await?;
+        let _ = self.store.set_title(&self.run_id, &title);
+        Some(title)
+    }
+
     /// Stamp the durable row. Best-effort — a store write error is swallowed.
     fn write(&self, sum: String) -> Option<String> {
         let _ = self.store.set_activity_summary(&self.run_id, &sum);
@@ -500,6 +648,38 @@ fn cache() -> &'static SummaryCache {
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Titles get their OWN cache rather than sharing one keyed by a composite:
+/// they have a different lifetime (written once, then immutable) and a miss
+/// means something different (fall back to the clipped brief vs. "no summary
+/// yet"), so keeping them separate keeps both lookups a plain `run_id` get.
+fn title_cache() -> &'static SummaryCache {
+    static CACHE: std::sync::OnceLock<SummaryCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Read-through [`POLL_INTERVAL`] cache around one durable-store lookup.
+///
+/// Caches the NEGATIVE result too, on purpose: the common case on a
+/// pre-migration row (or a run whose title writer failed) is a permanent
+/// `None`, and without that a repaint-driven caller would re-query SQLite on
+/// every frame forever.
+fn poll(
+    c: &'static SummaryCache,
+    run_id: &str,
+    fetch: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let now = std::time::Instant::now();
+    let mut guard = c.lock().unwrap();
+    if let Some((at, val)) = guard.get(run_id)
+        && now.duration_since(*at) < POLL_INTERVAL
+    {
+        return val.clone();
+    }
+    let fresh = fetch();
+    guard.insert(run_id.to_string(), (now, fresh.clone()));
+    fresh
+}
+
 /// The cached activity summary for `run_id`, refreshed from `store` at most once
 /// per [`POLL_INTERVAL`]. `None` when the run has no summary yet (pre-migration
 /// row, summarizer disabled, or the first round hasn't landed) — callers then
@@ -508,22 +688,26 @@ pub fn cached_summary(
     store: &crate::coordinator_store::CoordinatorStore,
     run_id: &str,
 ) -> Option<String> {
-    let now = std::time::Instant::now();
-    let mut guard = cache().lock().unwrap();
-    if let Some((at, val)) = guard.get(run_id)
-        && now.duration_since(*at) < POLL_INTERVAL
-    {
-        return val.clone();
-    }
-    let fresh = store.activity_summary(run_id);
-    guard.insert(run_id.to_string(), (now, fresh.clone()));
-    fresh
+    poll(cache(), run_id, || store.activity_summary(run_id))
 }
 
-/// Drop a run's cached summary — called when a worker is closed so a long-lived
-/// session's cache can't grow without bound.
+/// The cached worker TITLE for `run_id`, refreshed from `store` at most once per
+/// [`POLL_INTERVAL`]. `None` when the run has no title (a row written before the
+/// migration, or a run whose title writer found no credential / failed) —
+/// callers then fall back to clipping the task brief, which is the pre-title
+/// behaviour.
+pub fn cached_title(
+    store: &crate::coordinator_store::CoordinatorStore,
+    run_id: &str,
+) -> Option<String> {
+    poll(title_cache(), run_id, || store.title(run_id))
+}
+
+/// Drop a run's cached summary AND title — called when a worker is closed so a
+/// long-lived session's caches can't grow without bound.
 pub fn forget_cached(run_id: &str) {
     cache().lock().unwrap().remove(run_id);
+    title_cache().lock().unwrap().remove(run_id);
 }
 
 #[cfg(test)]
@@ -797,5 +981,109 @@ boundary and both status surfaces";
             "{}",
             p.len()
         );
+    }
+
+    // ── Titles ──────────────────────────────────────────────────────────────
+    //
+    // The bug these cover: the banner head row showed a mid-word clip of the
+    // raw brief ("Review the Atum board cards currently in column col_rev…"),
+    // so the operator could not tell two workers apart at a glance.
+
+    #[test]
+    fn title_budget_is_clamped_at_both_ends() {
+        // A narrow terminal can't go below the floor...
+        assert_eq!(title_budget(0), TITLE_MIN_BUDGET);
+        assert_eq!(title_budget(20), TITLE_MIN_BUDGET);
+        // ...and a wide one can't exceed the escalation banner's own clip.
+        assert_eq!(title_budget(400), TITLE_MAX_BUDGET);
+        // In between it tracks the real chrome.
+        let w = 50;
+        assert_eq!(title_budget(w), w - ESCALATION_HEAD_CHROME);
+    }
+
+    #[test]
+    fn title_budget_never_exceeds_the_banner_clip() {
+        // Whatever the width, a stored title must survive the escalation
+        // banner's defensive clip intact — otherwise we re-introduce the
+        // ellipsis we set out to remove.
+        for w in [0usize, 1, 40, 66, 80, 120, 200, 1000] {
+            let b = title_budget(w);
+            assert!(b <= crate::escalation::TASK_HINT_MAX, "width {w} -> {b}");
+            assert!(b <= TITLE_MAX_BUDGET, "width {w} -> {b}");
+            assert!(b >= TITLE_MIN_BUDGET, "width {w} -> {b}");
+        }
+    }
+
+    #[test]
+    fn sanitize_title_strips_a_label_and_trailing_punctuation() {
+        assert_eq!(
+            sanitize_title("Title: col_review board audit", 52).as_deref(),
+            Some("col_review board audit")
+        );
+        assert_eq!(
+            sanitize_title("TITLE: aish worker titles", 52).as_deref(),
+            Some("aish worker titles")
+        );
+        assert_eq!(
+            sanitize_title("aish worker titles.", 52).as_deref(),
+            Some("aish worker titles")
+        );
+        assert_eq!(
+            sanitize_title("\"aish worker titles\"", 52).as_deref(),
+            Some("aish worker titles")
+        );
+        // A colon left over from a label the model half-dropped.
+        assert_eq!(
+            sanitize_title("col_review board audit:", 52).as_deref(),
+            Some("col_review board audit")
+        );
+    }
+
+    #[test]
+    fn sanitize_title_rejects_junk_and_the_startup_sentinel() {
+        assert_eq!(sanitize_title("", 52), None);
+        assert_eq!(sanitize_title("   \n ", 52), None);
+        // "starting up" is a fine STATUS but a useless TITLE — the caller's
+        // clipped-brief fallback beats it.
+        assert_eq!(sanitize_title(STARTUP_FALLBACK, 52), None);
+        assert_eq!(sanitize_title("Starting Up", 52), None);
+    }
+
+    #[test]
+    fn sanitize_title_honours_the_budget() {
+        let long = "a review of every Atum board card currently parked in col_review for b_ed1a";
+        for budget in [TITLE_MIN_BUDGET, 30, TITLE_MAX_BUDGET] {
+            let t = sanitize_title(long, budget).expect("non-empty");
+            assert!(
+                t.chars().count() <= budget,
+                "budget {budget} -> {:?} ({} chars)",
+                t,
+                t.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn title_system_states_the_budget_it_is_held_to() {
+        let s = title_system(40);
+        assert!(s.contains("HARD LIMIT: 40 characters"), "{s}");
+        // Noun-phrase instruction is the whole point of a separate prompt:
+        // two verb-led rows stacked read as one garbled sentence.
+        assert!(s.contains("noun phrase"), "{s}");
+    }
+
+    #[test]
+    fn build_title_prompt_carries_the_brief_and_the_limit() {
+        let p = build_title_prompt("  Review the Atum board cards in col_review  ", 44);
+        assert!(p.contains("ASSIGNMENT:"), "{p}");
+        assert!(
+            p.contains("Review the Atum board cards in col_review"),
+            "{p}"
+        );
+        assert!(p.contains("max 44 chars"), "{p}");
+
+        // Oversized briefs are clipped, not passed whole to the model.
+        let huge = build_title_prompt(&"t".repeat(5_000), 44);
+        assert!(huge.len() < TASK_CONTEXT_MAX + 512, "{}", huge.len());
     }
 }

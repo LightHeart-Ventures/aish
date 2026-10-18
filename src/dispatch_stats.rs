@@ -304,6 +304,7 @@ mod tests {
             task: "t".into(),
             kind: None,
             activity_summary: None,
+            title: None,
             phase: phase.into(),
             result: None,
             error: None,

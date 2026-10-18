@@ -105,6 +105,12 @@ pub struct CoordinatorRow {
     /// a row written before the migration, or when no Claude credential was
     /// resolvable — readers then fall back to clipping [`Self::task`].
     pub activity_summary: Option<String>,
+    /// Short stable noun phrase naming this worker's whole assignment, written
+    /// once at worker start (see [`crate::activity_summary::summarize_title`]).
+    /// `None` for a row written before the migration, or when no Claude
+    /// credential was resolvable — readers then fall back to clipping
+    /// [`Self::task`], which is what every surface did before titles existed.
+    pub title: Option<String>,
 }
 
 /// Cumulative cost/effort counters for a run, persisted ATOMICALLY with the
@@ -447,6 +453,17 @@ impl CoordinatorStore {
             "ALTER TABLE coordinator_runs ADD COLUMN activity_summary TEXT",
             [],
         );
+        // Stable per-worker TITLE (`activity_summary::summarize_title`): a short
+        // noun phrase naming the whole assignment, written ONCE at worker start
+        // so `:workers` and the escalation banner's head row can name the work
+        // instead of hard-clipping the first sentence of the task brief. Kept in
+        // its own column rather than overwriting `task`, because the verbatim
+        // brief stays load-bearing (it is the coordinator's pinned source of
+        // truth and the `background_status` "full task briefs" section).
+        // Additive `ADD COLUMN` — the duplicate-column error is swallowed once
+        // present, so the migration is idempotent, and pre-migration rows read
+        // back NULL (callers fall back to clipping the brief).
+        let _ = conn.execute("ALTER TABLE coordinator_runs ADD COLUMN title TEXT", []);
         // Worker-run cost/effort metrics captured from the coordinator session
         // totals at terminal exit: cumulative prompt/completion tokens, agentic
         // turns, and tool-call count. Additive `ADD COLUMN` with a constant
@@ -766,6 +783,47 @@ impl CoordinatorStore {
             .filter(|s| !s.trim().is_empty())
     }
 
+    /// Stamp the run's stable TITLE (see
+    /// [`crate::activity_summary::summarize_title`]). Written once, at worker
+    /// start; never refreshed, because the title is the operator's handle on the
+    /// worker and a handle that moves is worse than a clipped one.
+    ///
+    /// Last-write-wins on its own column, so it can never clobber a concurrent
+    /// heartbeat, phase, or summary write — and like the summary it is
+    /// deliberately OUTSIDE the terminal `finish_run` transaction: a label is
+    /// cosmetic and must never interfere with the run's real bookkeeping.
+    pub fn set_title(&self, run_id: &str, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coordinator_runs SET title = ?2 WHERE run_id = ?1",
+            rusqlite::params![run_id, title],
+        )?;
+        Ok(())
+    }
+
+    /// Read back one run's title. `None` when the row is absent, pre-migration,
+    /// or the title writer found no credential — callers then clip the task
+    /// brief, which is the pre-title behaviour.
+    ///
+    /// Single-column point lookup on the primary key, polled by the PARENT for a
+    /// live worker whose title was written by its coordinator SUBPROCESS. Callers
+    /// throttle — see [`crate::activity_summary::cached_title`].
+    pub fn title(&self, run_id: &str) -> Option<String> {
+        self.conn
+            .lock()
+            .ok()?
+            .query_row(
+                "SELECT title FROM coordinator_runs WHERE run_id = ?1",
+                rusqlite::params![run_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+    }
+
     pub fn heartbeat(&self, run_id: &str) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE coordinator_runs SET heartbeat_at = current_timestamp WHERE run_id = ?1",
@@ -893,7 +951,7 @@ impl CoordinatorStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT run_id, task, phase, result, error, session_id, session_name, created_at, heartbeat_at, \
-                    tokens_in, tokens_out, turns, tool_calls, parent_run_id, kind, activity_summary
+                    tokens_in, tokens_out, turns, tool_calls, parent_run_id, kind, activity_summary, title
              FROM coordinator_runs ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -914,6 +972,7 @@ impl CoordinatorStore {
                 parent_run_id: r.get(13)?,
                 kind: r.get(14)?,
                 activity_summary: r.get(15)?,
+                title: r.get(16)?,
             })
         })?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
