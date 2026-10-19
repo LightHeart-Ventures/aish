@@ -22,6 +22,13 @@
 //! * `mode: compare` — the options are laid out as rows of attributes
 //!   (`summary` + any extra `key: value` pairs) with a single selection.
 //!
+//! Every popup also carries a free-text REPLY ROW as its last entry. It is a
+//! row like any other — same caret and marker columns as the options, so it
+//! lines up under them — markered `{ }` when idle and `{*}` when it holds the
+//! answer in play, and up/down park on it the same way they park on an
+//! option. Landing on it deselects the options in the single-select modes:
+//! the operator's own words become the answer.
+//!
 //! Esc cancels and returns NO answer. Only the advertised keys act — every
 //! other byte is dropped on the floor, matching the confirm prompt's
 //! two-step discipline (`read_answer` in `repl.rs`).
@@ -453,7 +460,18 @@ impl ChoiceState {
         popup_budget(body_rows) == 0
     }
 
+    /// True when the cursor is parked on the free-text reply row — the last
+    /// seat in the ring, past the final option.
+    pub fn on_reply_row(&self) -> bool {
+        self.cursor >= self.spec.options.len()
+    }
+
     fn scroll_into_view(&mut self) {
+        // The reply row lives OUTSIDE the scrolling option window (it is
+        // chrome, always painted last), so parking on it must not scroll.
+        if self.on_reply_row() {
+            return;
+        }
         if self.cursor < self.top {
             self.top = self.cursor;
         }
@@ -468,18 +486,22 @@ impl ChoiceState {
     /// Apply one decoded key.
     pub fn apply(&mut self, key: Key) -> Outcome {
         let n = self.spec.options.len();
+        // The reply row is the last seat in the ring: `n` options plus the
+        // free-text row, so up/down land ON the operator's own answer the
+        // same way they land on an option instead of skipping past it.
+        let ring = n + 1;
         match key {
-            Key::Up if n > 0 => {
+            Key::Up => {
                 self.cursor = if self.cursor == 0 {
-                    n - 1
+                    ring - 1
                 } else {
                     self.cursor - 1
                 };
                 self.scroll_into_view();
                 Outcome::Redraw
             }
-            Key::Down if n > 0 => {
-                self.cursor = (self.cursor + 1) % n;
+            Key::Down => {
+                self.cursor = (self.cursor + 1) % ring;
                 self.scroll_into_view();
                 Outcome::Redraw
             }
@@ -490,11 +512,13 @@ impl ChoiceState {
                 }
                 Outcome::Ignored
             }
-            // Printable keys. While the reply line is still EMPTY the legacy
-            // selection keys win (j/k move, space toggles); the moment the
-            // operator has typed anything, every printable is literal text.
+            // Printable keys. While the reply line is still EMPTY *and* the
+            // cursor is parked on an option, the legacy selection keys win
+            // (j/k move, space toggles); the moment the operator has typed
+            // anything — or has moved onto the reply row, where literal text
+            // is the whole point — every printable is text.
             Key::Char(c) => {
-                if self.reply.is_empty() {
+                if self.reply.is_empty() && !self.on_reply_row() {
                     match c {
                         'j' | 'J' if n > 0 => return self.apply(Key::Down),
                         'k' | 'K' if n > 0 => return self.apply(Key::Up),
@@ -583,15 +607,28 @@ impl ChoiceState {
         if remaining > 0 {
             rows.push(dim(&format!("  ... {remaining} more")));
         }
+        // The reply row, ALWAYS present and always the last seat — rendered
+        // in the SAME `caret marker text` shape as an option so it lines up
+        // with them instead of hanging off on its own `>` line. Its marker is
+        // `{ }` / `{*}`: brace-shaped to read as free text rather than a
+        // fixed choice, selectable exactly like `( )` / `[ ]`.
+        let here = self.on_reply_row();
+        let marker = if here { "{*}" } else { "{ }" };
+        let caret = if here { ">" } else { " " };
+        let mut line = String::new();
+        let _ = write!(line, "{caret} {marker} ");
+        if self.reply.is_empty() && !here {
+            // Untouched and unfocused: name itself, dimmed, so the row reads
+            // as an offer rather than an empty mystery.
+            line.push_str(REPLY_PLACEHOLDER);
+            rows.push(dim(&clip(&line, width)));
+        } else {
+            line.push_str(&self.reply);
+            line.push('_');
+            let clipped = clip(&line, width);
+            rows.push(if here { hi(&clipped) } else { clipped });
+        }
         rows.push(dim(&clip(self.hint(), width)));
-        // The reply line, ALWAYS present and always last — so in tray mode it
-        // sits flush above the horizontal rule, right where the operator's
-        // own input line is. Empty it reads as a blank row with a caret.
-        let mut line = String::from("> ");
-        line.push_str(&self.reply);
-        line.push('_');
-        let clipped = clip(&line, width);
-        rows.push(if color { hi(&clipped) } else { clipped });
         rows
     }
 
@@ -619,8 +656,12 @@ impl ChoiceState {
 }
 
 /// Non-option rows every popup paints: the question, the hint, and the
-/// always-present reply line.
+/// always-present reply row.
 pub const CHROME_ROWS: usize = 3;
+
+/// What the empty, unfocused reply row says about itself. Short enough to sit
+/// inside the option column without wrapping on a narrow terminal.
+const REPLY_PLACEHOLDER: &str = "type to reply";
 
 /// JSON answer plus the operator's typed reply, when they typed one. The
 /// `choice` key keeps its exact old shape so existing consumers are unaffected;
@@ -977,17 +1018,26 @@ trailing text
     #[test]
     fn reply_line_is_always_rendered_last_and_answers_alone() {
         let mut st = state("one", 2);
-        // Always present, even untouched: a caret row under the hint.
+        // Always present, even untouched: an option-shaped `{ }` row that sits
+        // in the same column as the real options, directly above the hint.
         let rows = st.render(80, false);
-        assert_eq!(rows.last().unwrap().trim(), "> _", "got {:?}", rows.last());
-        assert!(rows[rows.len() - 2].contains("type to reply"));
+        assert!(
+            rows.last()
+                .unwrap()
+                .contains("type to reply - enter confirms")
+        );
+        assert_eq!(
+            reply_row(&rows).trim_end(),
+            "  { } type to reply",
+            "got {rows:?}"
+        );
 
-        // Typing lands in the reply line once the operator starts a word.
+        // Typing lands in the reply row once the operator starts a word.
         for c in "ok".chars() {
             assert_eq!(st.apply(Key::Char(c)), Outcome::Redraw);
         }
         assert_eq!(st.reply(), "ok");
-        assert!(st.render(80, false).last().unwrap().contains("> ok_"));
+        assert_eq!(reply_row(&st.render(80, false)).trim_end(), "  { } ok_");
 
         // Backspace edits it; an empty line swallows nothing.
         assert_eq!(st.apply(Key::Backspace), Outcome::Redraw);
@@ -1042,6 +1092,11 @@ trailing text
         assert_eq!(st.selected_ids(), vec!["o0".to_string(), "o1".to_string()]);
     }
 
+    /// The reply row is the second-to-last row: options, reply, hint.
+    fn reply_row(rows: &[String]) -> &str {
+        &rows[rows.len() - 2]
+    }
+
     fn state(mode: &str, n: usize) -> ChoiceState {
         let mut body = format!("mode: {mode}\nquestion: q\noptions:\n");
         for i in 0..n {
@@ -1062,12 +1117,45 @@ trailing text
             st.apply(Key::Confirm),
             Outcome::Confirmed("{\"choice\":\"o1\"}".to_string())
         );
-        // Wrap-around in both directions.
+        // Wrap-around in both directions, THROUGH the reply row — it is the
+        // last seat in the ring, so Up from the first option lands on it.
         let mut st = state("one", 3);
         assert_eq!(st.apply(Key::Up), Outcome::Redraw);
-        assert_eq!(st.cursor(), 2);
+        assert!(st.on_reply_row(), "up from the top parks on the reply row");
         assert_eq!(st.apply(Key::Down), Outcome::Redraw);
         assert_eq!(st.cursor(), 0);
+        assert_eq!(st.apply(Key::Up), Outcome::Redraw);
+        assert_eq!(st.apply(Key::Up), Outcome::Redraw);
+        assert_eq!(st.cursor(), 2, "and the option above it is the last one");
+    }
+
+    #[test]
+    fn the_reply_row_is_selectable_like_any_option() {
+        let mut st = state("one", 2);
+        // Park on it: the marker fills in and the caret moves down with it.
+        st.apply(Key::Up);
+        assert!(st.on_reply_row());
+        let rows = st.render(80, false);
+        assert_eq!(reply_row(&rows).trim_end(), "> {*} _", "got {rows:?}");
+        assert!(rows[1].starts_with("  ( ) O0"), "no option is marked now");
+        assert!(rows[2].starts_with("  ( ) O1"), "got {:?}", rows[2]);
+
+        // Typing shows up in place, and j/k/space stay literal text here
+        // because the reply row is where free text belongs.
+        for c in "no j k".chars() {
+            st.apply(Key::Char(c));
+        }
+        assert_eq!(st.reply(), "no j k");
+        assert!(st.on_reply_row(), "typing must not move the cursor");
+        assert_eq!(reply_row(&st.render(80, false)).trim_end(), "> {*} no j k_");
+
+        // Space/tab is not a toggle on this row, and Enter answers with the
+        // text alone — no option id, because none was picked.
+        assert_eq!(st.apply(Key::Toggle), Outcome::Ignored);
+        assert_eq!(
+            st.apply(Key::Confirm),
+            Outcome::Confirmed("{\"choice\":\"\",\"reply\":\"no j k\"}".to_string())
+        );
     }
 
     #[test]
@@ -1104,13 +1192,13 @@ trailing text
         assert!(rows[0].contains("q"), "question row first");
         assert!(rows[1].starts_with("> [x] O0"), "got {:?}", rows[1]);
         assert!(rows[2].starts_with("  [ ] O1"), "got {:?}", rows[2]);
-        // The hint sits directly above the always-present reply line.
+        // The reply row sits with the options, directly above the hint, and
+        // wears the same `caret marker text` shape they do.
         assert!(
-            rows[rows.len() - 2].contains("space/tab toggles"),
-            "got {:?}",
-            rows
+            rows.last().unwrap().contains("space/tab toggles"),
+            "{rows:?}"
         );
-        assert_eq!(rows.last().unwrap().trim(), "> _");
+        assert_eq!(reply_row(&rows).trim_end(), "  { } type to reply");
         for row in &rows {
             assert!(row.is_ascii(), "no non-ascii in {row:?}");
         }
