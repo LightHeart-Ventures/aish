@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Added
+- **Mid-turn queued lines are now pinned in the escalation tray** until they actually run. A line typed while a turn is in flight already printed a one-shot `⏳ queued → what is the status of ISS-414652` receipt into the body and parked the line in the REPL's type-ahead queue — but that receipt scrolls away under the turn's own output, leaving the operator with no on-screen evidence that the thing they typed is still coming (and no way to tell "queued" from "swallowed"). `escalation` gains a second row `Kind` alongside the coordinator banners: `pin_queued` (called from `keywatch`'s mid-turn branch) adds a static `⏳ queued · <line>` / `↳ 8s · 1 of 2 — runs when this turn ends` pair, and the REPL retires it with `unpin_oldest_queued` as it dequeues that line to run — FIFO on both sides, so row N disappears exactly as line N starts executing. Queued rows are deliberately **static**: no heart, no pulse, and excluded from `animating()` so a queue parked at the prompt can't hold the shell in the ~4.5 fps repaint loop to animate nothing. They are also skipped by `pinned_ids` and every coordinator-scoped mutator (`set_status`, `set_task`, `set_beat`, `note_terminal`, `unpin`), because there is no worker behind them to refresh — and they are evicted **last** when the tray hits `MAX_PINNED`, since their row is the only remaining evidence that an un-run input exists. Row ids come from a private monotonic counter rather than queue position (positions are reused as the queue drains, and a reused id would refresh an unrelated row in place), so typing the same text twice yields two rows.
+
 ## [0.58.0] - 2026-10-18
 
 ### Added

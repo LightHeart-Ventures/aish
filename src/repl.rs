@@ -1063,7 +1063,18 @@ pub async fn run(
         // (nobody typed it), so it renders as a single animated "Reviewing and
         // summarizing result" line instead of the full play-by-play.
         let mut quiet_summary_turn = false;
-        let outcome = match injected.take().or_else(|| typeahead.pop_front()) {
+        // Type-ahead dequeue retires that line's escalation-tray row: the row
+        // means "still waiting", and this line is about to RUN. FIFO on both
+        // sides (the queue and the tray store), so row N drops as line N starts.
+        // `injected` lines never had a row, so they skip the unpin.
+        let dequeued = injected.take().or_else(|| {
+            let line = typeahead.pop_front();
+            if line.is_some() {
+                crate::escalation::unpin_oldest_queued();
+            }
+            line
+        });
+        let outcome = match dequeued {
             Some(l) => ReadOutcome::Line(l),
             // Auto-resume drain: when the last fanned-out coordinator of this
             // session has finished, the presenter armed a coalesced resume (see

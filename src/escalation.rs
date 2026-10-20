@@ -54,6 +54,28 @@
 //! Each banner uses its own elapsed clock and durable heartbeat timestamp.
 //! Plain output keeps the heart without animation escape sequences.
 //!
+//! QUEUED MID-TURN LINES. The tray tracks a SECOND kind of pending work: a
+//! line the operator submitted WHILE a turn was in flight. `keywatch` prints a
+//! one-shot `⏳ queued → …` receipt into the body and parks the line in the
+//! REPL's type-ahead queue, but that receipt scrolls away under the turn's own
+//! output exactly like the escalation launch notice did — leaving the operator
+//! with no on-screen evidence that the thing they typed is still coming. So
+//! each queued line also gets a [`Kind::Queued`] tray row ([`pin_queued`]) that
+//! survives until the line is DEQUEUED for execution
+//! ([`unpin_oldest_queued`], FIFO — the same order the REPL drains them):
+//!
+//! ```text
+//!   ⏳ queued · what is the status of ISS-414652
+//!      ↳ 8s · 1 of 2 — runs when this turn ends
+//! ```
+//!
+//! Queued rows are deliberately STATIC (no heart, no pulse): nothing is running
+//! for them yet, so animating them would imply liveness that does not exist —
+//! and it keeps them out of [`animating`], so a queue parked at the prompt can't
+//! defeat the footer heartbeat's idle gate. They are also excluded from
+//! [`pinned_ids`] and every coordinator-scoped mutator, because there is no
+//! worker behind them to refresh.
+//!
 //! LIFECYCLE. [`pin`] on escalation, [`set_status`] on every footer paint (the
 //! REPL owns the worker list, so it composes each status row), [`note_terminal`]
 //! when a coordinator finishes, and each banner self-retires [`DWELL`] after
@@ -87,8 +109,17 @@ pub const MAX_PINNED: usize = 32;
 /// [`crate::activity_summary::ESCALATION_HEAD_CHROME`] budgets for.
 pub const LIVE_GLYPH: &str = "🚀";
 
-/// Static prefix for a finished banner's status row.
+/// Static prefix for a finished banner's status row — and for a queued line's,
+/// which has nothing running behind it to animate.
 pub const IDLE_PREFIX: &str = "↳";
+
+/// The head-row glyph for a QUEUED mid-turn line. Matches the hourglass the
+/// body receipt (`keywatch::print_midturn_queued`) prints, so the operator can
+/// tie the tray row to the line that acknowledged their keystroke.
+pub const QUEUED_GLYPH: &str = "⏳";
+
+/// The head-row label for a queued line (where an escalation shows its `w_…`).
+pub const QUEUED_LABEL: &str = "queued";
 
 /// Pulse frame cadence; the footer repaint task uses this same interval.
 pub const FRAME_MS: u64 = 220;
@@ -106,10 +137,29 @@ pub(crate) const TASK_HINT_MAX: usize = 56;
 /// `↳` prefix on a narrow window).
 pub const STATUS_MAX: usize = 110;
 
+/// What a tray row is tracking.
+///
+/// The tray holds two kinds of PENDING work, and the distinction is load-bearing
+/// rather than cosmetic: a [`Kind::Escalation`] has a live coordinator behind it
+/// (so it animates, carries a liveness heart, and is refreshed from the worker
+/// list), while a [`Kind::Queued`] line has nothing running yet (so it is static
+/// and is skipped by every coordinator-scoped mutator). Mixing them in one store
+/// is what lets a single footer block show everything the operator is waiting on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// A background coordinator launched by `run_in_background`.
+    Escalation,
+    /// A line the operator submitted mid-turn, parked in the REPL's type-ahead
+    /// queue until the current turn ends.
+    Queued,
+}
+
 /// One pinned escalation. Many can be live at once — see the STACKING note in
 /// the module docs — so every field is per-banner and every mutator is keyed by
 /// [`Banner::id`].
 struct Banner {
+    /// Which flavour of pending work this row tracks — see [`Kind`].
+    kind: Kind,
     /// Coordinator run id (`w_…`) — rendered short, and the key the REPL uses to
     /// find the live worker when it refreshes the status row.
     id: String,
@@ -169,6 +219,7 @@ fn push_banner(id: &str, task: &str) {
         return;
     };
     let fresh = Banner {
+        kind: Kind::Escalation,
         id: id.to_string(),
         task: task.to_string(),
         pinned_at: Instant::now(),
@@ -177,7 +228,10 @@ fn push_banner(id: &str, task: &str) {
         status: "queued — waiting for the coordinator to start".into(),
         beat: None,
     };
-    if let Some(slot) = banners.iter_mut().find(|b| b.id == id) {
+    if let Some(slot) = banners
+        .iter_mut()
+        .find(|b| b.kind == Kind::Escalation && b.id == id)
+    {
         // Same coordinator: its durable heartbeat is still valid evidence, so
         // keep it rather than flashing the hollow "no claim" heart on a retry.
         let beat = slot.beat;
@@ -185,15 +239,112 @@ fn push_banner(id: &str, task: &str) {
         return;
     }
     banners.push(fresh);
-    // Bound the store. Evict the oldest FINISHED banner first so a burst of
-    // fan-out never retires a coordinator that is still working.
+    // Bound the store. Evict the oldest FINISHED escalation first so a burst of
+    // fan-out never retires a coordinator that is still working, then the
+    // oldest live escalation, and only then the oldest row of any kind. Queued
+    // lines are evicted LAST because their row is the only remaining on-screen
+    // evidence that an un-run input exists.
     while banners.len() > MAX_PINNED {
         let victim = banners
             .iter()
-            .position(|b| b.terminal_at.is_some())
+            .position(|b| b.kind == Kind::Escalation && b.terminal_at.is_some())
+            .or_else(|| banners.iter().position(|b| b.kind == Kind::Escalation))
             .unwrap_or(0);
         banners.remove(victim);
     }
+}
+
+/// Pin a tray row for a line the operator submitted MID-TURN, returning the
+/// internal row id so a caller can drop that exact row later if it wants to.
+///
+/// The REPL's type-ahead queue is FIFO and so is this store, so the normal
+/// retirement path is [`unpin_oldest_queued`] (called as each line is dequeued
+/// for execution) — no id bookkeeping required at the call site.
+///
+/// Ids are minted from a private monotonic counter rather than the line's queue
+/// POSITION: positions are reused as the queue drains, and a reused id would
+/// refresh an unrelated still-pinned row in place instead of adding a new one.
+/// Every queued submission therefore gets its own row, even when the operator
+/// types the same text twice.
+pub fn pin_queued(line: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = format!(
+        "q#{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let row = id.clone();
+    crate::terminal::repaint_escalation_around(|| {
+        let Ok(mut banners) = BANNERS.lock() else {
+            return;
+        };
+        banners.push(Banner {
+            kind: Kind::Queued,
+            id,
+            task: line.to_string(),
+            pinned_at: Instant::now(),
+            terminal_at: None,
+            failed: false,
+            status: String::new(),
+            beat: None,
+        });
+        while banners.len() > MAX_PINNED {
+            let victim = banners
+                .iter()
+                .position(|b| b.kind == Kind::Escalation && b.terminal_at.is_some())
+                .or_else(|| banners.iter().position(|b| b.kind == Kind::Escalation))
+                .unwrap_or(0);
+            banners.remove(victim);
+        }
+    });
+    row
+}
+
+/// Retire the OLDEST queued row — the one whose line the REPL is about to run —
+/// reporting whether a row was actually dropped.
+///
+/// FIFO to match the type-ahead queue's own drain order, so row N always
+/// disappears as line N starts executing. A no-op when nothing is queued, which
+/// is what makes it safe to call unconditionally from the drain path (lines that
+/// predate this tray, or arrived by some other route, simply have no row).
+pub fn unpin_oldest_queued() -> bool {
+    crate::terminal::repaint_escalation_around(|| {
+        let Ok(mut banners) = BANNERS.lock() else {
+            return false;
+        };
+        match banners.iter().position(|b| b.kind == Kind::Queued) {
+            Some(i) => {
+                banners.remove(i);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// Retire EVERY queued row, leaving escalation banners alone — the wholesale
+/// counterpart to [`unpin_oldest_queued`], for a caller that DISCARDS the
+/// type-ahead queue in one go (lines that will never run must not leave rows
+/// behind). The REPL has no such discard path today, so this is currently
+/// exercised only by tests; it stays test-gated until a caller needs it, so the
+/// shipped binary carries no unreachable code.
+#[cfg(test)]
+pub fn clear_queued() {
+    crate::terminal::repaint_escalation_around(|| {
+        if let Ok(mut banners) = BANNERS.lock() {
+            banners.retain(|b| b.kind != Kind::Queued);
+        }
+    });
+}
+
+/// How many queued lines currently have a tray row — the number a caller would
+/// reconcile against the REPL's own queue length. Test-gated for the same
+/// reason as [`clear_queued`]: nothing in the shipped REPL reads it yet.
+#[cfg(test)]
+pub fn queued_count() -> usize {
+    BANNERS
+        .lock()
+        .map(|b| b.iter().filter(|b| b.kind == Kind::Queued).count())
+        .unwrap_or(0)
 }
 
 /// Remove coordinator `id`'s banner from the tray RIGHT NOW, reporting whether
@@ -217,7 +368,7 @@ pub fn unpin(id: &str) -> bool {
             return false;
         };
         let before = banners.len();
-        banners.retain(|b| b.id != id);
+        banners.retain(|b| !(b.kind == Kind::Escalation && b.id == id));
         banners.len() != before
     })
 }
@@ -253,23 +404,41 @@ pub fn row_count() -> u16 {
     (count().min(MAX_VISIBLE) as u16) * ROWS_PER_BANNER
 }
 
-/// True while at least one pinned banner is still ANIMATING (pinned and not yet
-/// terminal). The footer heartbeat consults this to bypass its idle gate and
-/// repaint on the [`FRAME_MS`] cadence — motion is the "still working" signal,
-/// so it must keep ticking while the shell sits idle at the prompt.
+/// True while at least one pinned banner is still ANIMATING (an ESCALATION,
+/// pinned and not yet terminal). The footer heartbeat consults this to bypass
+/// its idle gate and repaint on the [`FRAME_MS`] cadence — motion is the "still
+/// working" signal, so it must keep ticking while the shell sits idle at the
+/// prompt.
+///
+/// Queued rows are excluded on purpose: they are static, so a queue parked at
+/// the prompt would otherwise hold the shell in the ~4.5 fps repaint loop
+/// forever to animate nothing.
 pub fn animating() -> bool {
     BANNERS
         .lock()
-        .map(|banners| banners.iter().any(|b| b.terminal_at.is_none()))
+        .map(|banners| {
+            banners
+                .iter()
+                .any(|b| b.kind == Kind::Escalation && b.terminal_at.is_none())
+        })
         .unwrap_or(false)
 }
 
 /// Every pinned coordinator's run id, NEWEST FIRST. The REPL walks these to
 /// locate each live worker whose status it then feeds back via [`set_status`].
+///
+/// Queued rows are omitted — there is no worker behind them to look up.
 pub fn pinned_ids() -> Vec<String> {
     BANNERS
         .lock()
-        .map(|banners| banners.iter().rev().map(|b| b.id.clone()).collect())
+        .map(|banners| {
+            banners
+                .iter()
+                .rev()
+                .filter(|b| b.kind == Kind::Escalation)
+                .map(|b| b.id.clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -279,7 +448,9 @@ pub fn pinned_ids() -> Vec<String> {
 /// banner's.
 pub fn set_status(id: &str, status: &str) {
     if let Ok(mut banners) = BANNERS.lock()
-        && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+        && let Some(b) = banners
+            .iter_mut()
+            .find(|b| b.kind == Kind::Escalation && b.id == id)
     {
         b.status = status.to_string();
     }
@@ -304,7 +475,9 @@ pub fn set_task(id: &str, task: &str) {
         return;
     }
     if let Ok(mut banners) = BANNERS.lock()
-        && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+        && let Some(b) = banners
+            .iter_mut()
+            .find(|b| b.kind == Kind::Escalation && b.id == id)
     {
         b.task = task.to_string();
     }
@@ -317,7 +490,9 @@ pub fn set_task(id: &str, task: &str) {
 /// `repl::refresh_escalation_beats`) because the beat only moves every 30s.
 pub fn set_beat(id: &str, beat: Option<i64>) {
     if let Ok(mut banners) = BANNERS.lock()
-        && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+        && let Some(b) = banners
+            .iter_mut()
+            .find(|b| b.kind == Kind::Escalation && b.id == id)
     {
         b.beat = beat;
     }
@@ -329,7 +504,9 @@ pub fn set_beat(id: &str, beat: Option<i64>) {
 /// id-scoped, so a worker finishing can never stamp another banner's verdict.
 pub fn note_terminal(id: &str, failed: bool) {
     if let Ok(mut banners) = BANNERS.lock()
-        && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+        && let Some(b) = banners
+            .iter_mut()
+            .find(|b| b.kind == Kind::Escalation && b.id == id)
     {
         b.failed = failed;
         b.terminal_at.get_or_insert_with(Instant::now);
@@ -478,6 +655,47 @@ pub fn render(
     (top, bottom)
 }
 
+/// Build ONE queued line's two rows. Pure, like [`render`], and deliberately
+/// STATIC: nothing is executing for this line yet, so there is no heart and no
+/// pulse to imply otherwise — just the hourglass, the operator's own text, and
+/// its place in the queue.
+///
+/// `position`/`total` are 1-based FIFO coordinates (`1 of 2`), matching the
+/// order the REPL drains its type-ahead queue, so the operator can see not just
+/// THAT their line survived but when it will run relative to the others.
+/// `extra_status` carries the block's `· +N more escalated` overflow tail when
+/// this row happens to be the last one painted.
+pub fn render_queued(
+    elapsed_ms: u64,
+    line: &str,
+    position: usize,
+    total: usize,
+    extra_status: &str,
+    color_on: bool,
+) -> (String, String) {
+    use crate::style::{Color, paint_with};
+    let hint = one_line(line, TASK_HINT_MAX);
+    let head = if hint.is_empty() {
+        format!("{QUEUED_GLYPH} {QUEUED_LABEL}")
+    } else {
+        format!("{QUEUED_GLYPH} {QUEUED_LABEL} · {hint}")
+    };
+    // Dim, not cyan: a queued line is WAITING, and the live escalations above it
+    // should keep the eye. The whole pair is dim so the row reads as background.
+    let top = paint_with(&head, Color::Dim, color_on);
+    let detail = format!(
+        "{} · {position} of {total} — runs when this turn ends{extra_status}",
+        fmt_elapsed(elapsed_ms)
+    );
+    let bottom = format!(
+        "{}{} {}",
+        paint_with("   ", Color::Dim, color_on),
+        paint_with(IDLE_PREFIX, Color::Dim, color_on),
+        paint_with(&one_line(&detail, STATUS_MAX), Color::Dim, color_on)
+    );
+    (top, bottom)
+}
+
 /// The live banner rows, NEWEST FIRST — one `(escalation_row, status_row)` pair
 /// per painted escalation, empty when nothing is pinned. Reads the global stack
 /// and derives each animation frame from that banner's own clock, so any paint
@@ -497,6 +715,16 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
         return Vec::new();
     }
     let hidden = banners.len() - visible;
+    // FIFO queue coordinates for the queued rows (`1 of 2`), derived from the
+    // store's own order — oldest queued row is `1`, which is the next line the
+    // REPL will run. Keyed by row id because the paint order below is REVERSED.
+    let queued_total = banners.iter().filter(|b| b.kind == Kind::Queued).count();
+    let queued_pos: std::collections::HashMap<&str, usize> = banners
+        .iter()
+        .filter(|b| b.kind == Kind::Queued)
+        .enumerate()
+        .map(|(n, b)| (b.id.as_str(), n + 1))
+        .collect();
     // Newest first: the top banner is the escalation the operator just launched,
     // and it matches `cycle_worker`'s newest-first Shift-Tab ordering.
     banners
@@ -505,23 +733,34 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
         .take(visible)
         .enumerate()
         .map(|(i, b)| {
+            // The overflow tail rides the LAST painted status row (the oldest
+            // visible banner) rather than claiming a row of its own, so the
+            // block height stays an exact multiple of ROWS_PER_BANNER.
+            let extra = if hidden > 0 && i + 1 == visible {
+                format!(" · +{hidden} more escalated")
+            } else {
+                String::new()
+            };
+            let elapsed_ms = b.pinned_at.elapsed().as_millis() as u64;
+            if b.kind == Kind::Queued {
+                return render_queued(
+                    elapsed_ms,
+                    &b.task,
+                    queued_pos.get(b.id.as_str()).copied().unwrap_or(1),
+                    queued_total.max(1),
+                    &extra,
+                    color_on,
+                );
+            }
             let terminal = b.terminal_at.map(|_| b.failed);
             // Age the absolute beat here, on the paint path, so each heart keeps
             // ticking (and can go yellow → red) between the REPL's throttled polls.
             let beat_age = b.beat.map(|t| (now_unix_secs() - t).max(0));
-            // The overflow tail rides the LAST painted status row (the oldest
-            // visible banner) rather than claiming a row of its own, so the
-            // block height stays an exact multiple of ROWS_PER_BANNER.
-            let status = if hidden > 0 && i + 1 == visible {
-                format!("{} · +{hidden} more escalated", b.status)
-            } else {
-                b.status.clone()
-            };
             render(
-                b.pinned_at.elapsed().as_millis() as u64,
+                elapsed_ms,
                 &b.id,
                 &b.task,
-                &status,
+                &format!("{}{extra}", b.status),
                 terminal,
                 beat_age,
                 color_on,
@@ -540,6 +779,75 @@ mod tests {
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         static L: Mutex<()> = Mutex::new(());
         L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A queued line's tray row means "typed, NOT yet run", so the rows must
+    /// retire in the same FIFO order the REPL drains the type-ahead queue —
+    /// row N disappears as line N starts executing — and a wholesale discard
+    /// must drop every queued row at once. Escalation banners are a different
+    /// kind and must survive both paths untouched: the tray is shared, and a
+    /// queued-line drain that evicted a live worker's banner would lose the
+    /// only on-screen trace of that worker.
+    #[test]
+    fn queued_rows_retire_oldest_first_and_leave_escalations_alone() {
+        let _g = lock();
+        clear_queued();
+        let queued_tasks = || {
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|b| b.kind == Kind::Queued)
+                .map(|b| b.task.clone())
+                .collect::<Vec<_>>()
+        };
+        let has_escalation = |id: &str| {
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|b| b.id == id && b.kind == Kind::Escalation)
+        };
+        let drop_probe = || {
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|b| b.id != "w_queued_probe");
+        };
+        drop_probe();
+        push_banner("w_queued_probe", "a live worker");
+
+        // Distinct ids per pin, so the rows can be told apart in the footer.
+        let first = pin_queued("what is the status of ISS-414652");
+        let second = pin_queued(":workers");
+        assert_ne!(first, second, "each queued row needs its own id");
+        assert_eq!(queued_count(), 2);
+        assert_eq!(
+            queued_tasks(),
+            vec![
+                "what is the status of ISS-414652".to_string(),
+                ":workers".to_string()
+            ],
+            "rows are stored in arrival order"
+        );
+
+        // Drain: oldest row goes first, matching the queue's own drain order.
+        assert!(unpin_oldest_queued(), "a queued row was pinned");
+        assert_eq!(queued_tasks(), vec![":workers".to_string()]);
+
+        // Discard: every remaining queued row goes, the escalation stays.
+        clear_queued();
+        assert_eq!(queued_count(), 0);
+        assert!(
+            has_escalation("w_queued_probe"),
+            "clearing queued rows must not evict escalation banners"
+        );
+
+        // Draining an empty queue is a silent no-op — the drain path calls this
+        // unconditionally, including for lines that predate the tray.
+        assert!(!unpin_oldest_queued());
+        assert!(has_escalation("w_queued_probe"));
+        drop_probe();
     }
 
     /// A RESUMED worker must get its tray row back. `worker::resume_in_place`

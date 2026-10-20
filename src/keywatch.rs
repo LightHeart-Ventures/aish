@@ -407,6 +407,12 @@ fn reader_loop(
                         } else {
                             queued_count += 1;
                             crate::terminal::print_midturn_queued(&line, queued_count);
+                            // …and give it a row in the escalation tray, so the
+                            // "⏳ queued" line SURVIVES the stream scrolling past
+                            // it. The row is retired as the REPL dequeues the
+                            // line to run it (`unpin_oldest_queued`), so the tray
+                            // always shows exactly the lines still waiting.
+                            crate::escalation::pin_queued(&line);
                             let _ = cfg.line_tx.send(line);
                         }
                         // Line consumed → return to the bare prompt affordance
