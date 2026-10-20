@@ -20,6 +20,15 @@
 //! discarding, and keeps draining — the coordinator runs to completion and its
 //! durable side effects (git, PRs, the coordinator store) still land.
 //!
+//! Both fds the shield keeps for itself — the relay's read end and the dup of
+//! the real destination — are `CLOEXEC`. They must be: every process this
+//! coordinator spawns (sub-workers, `git`, `cargo`) would otherwise inherit a
+//! copy of the *parent's* pipe write end. The parent's reader then cannot see
+//! EOF while any descendant is alive, so a coordinator that finished minutes
+//! ago still reads as `running` upstream and its result is withheld until the
+//! last grandchild exits. `pipeline.rs` carries the same lesson for pipeline
+//! stages; this is that hazard one level up.
+//!
 //! `drain` is the ordered shutdown: flush, close the write end so the relay sees
 //! EOF, and wait briefly for it to copy the tail. It must be the last thing the
 //! process does with stdout/stderr — the final answer is written before it.
@@ -27,6 +36,7 @@
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How long `drain` waits for a relay to flush its tail downstream before
@@ -44,6 +54,15 @@ struct Relay {
     /// The standard fd we hijacked (1 or 2). Closing it is what signals EOF to
     /// the relay thread, because the dup'd write end was already closed.
     fd: libc::c_int,
+    /// The real destination, shared with the relay thread.
+    ///
+    /// `drain` *takes* it rather than waiting for the thread to notice EOF.
+    /// fd 1/2 are inheritable by design — every child must be able to write to
+    /// them — so any still-live grandchild holds a copy of the relay's write
+    /// end and the relay would not see EOF until the last of them exits.
+    /// Handing ownership over makes the downstream's EOF depend only on *this*
+    /// process finishing.
+    dst: Arc<Mutex<Option<std::fs::File>>>,
     /// Fires once the relay thread has copied everything and exited.
     done: Receiver<()>,
 }
@@ -70,9 +89,16 @@ impl FdShield {
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
         for r in self.relays {
-            // Sole remaining write end: closing it is the relay's EOF.
+            // Our last write end: closing it is the relay's EOF, unless a
+            // grandchild inherited a copy.
             unsafe { libc::close(r.fd) };
             let _ = r.done.recv_timeout(DRAIN_GRACE);
+            // Close the downstream whether or not the relay got there first.
+            // Dropping the `File` is what the parent's reader sees as EOF, and
+            // it must not be contingent on a descendant's lifetime.
+            if let Ok(mut slot) = r.dst.lock() {
+                drop(slot.take());
+            }
         }
     }
 }
@@ -84,21 +110,21 @@ fn hijack(fd: libc::c_int) -> Option<Relay> {
     if !is_pipe(fd) {
         return None;
     }
-    let mut ends = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    let (rd, wr) = (ends[0], ends[1]);
+    let (rd, wr) = pipe_cloexec()?;
 
     // Keep the real destination alive under a private number before we clobber.
-    let orig = unsafe { libc::dup(fd) };
-    if orig < 0 {
-        unsafe {
-            libc::close(rd);
-            libc::close(wr);
+    // CLOEXEC matters most here: this fd *is* the parent's pipe, and a copy
+    // leaked into a grandchild keeps the parent from ever seeing EOF.
+    let orig = match dup_cloexec(fd) {
+        Some(n) => n,
+        None => {
+            unsafe {
+                libc::close(rd);
+                libc::close(wr);
+            }
+            return None;
         }
-        return None;
-    }
+    };
     if unsafe { libc::dup2(wr, fd) } < 0 {
         unsafe {
             libc::close(rd);
@@ -112,49 +138,124 @@ fn hijack(fd: libc::c_int) -> Option<Relay> {
     unsafe { libc::close(wr) };
 
     let (tx, done) = mpsc::channel();
+    // SAFETY: `orig` is ours alone from here on; the `File` owns and closes it.
+    let dst = Arc::new(Mutex::new(Some(unsafe {
+        std::fs::File::from_raw_fd(orig)
+    })));
+    let thread_dst = Arc::clone(&dst);
     let spawned = std::thread::Builder::new()
         .name(format!("fd-shield-{fd}"))
         .spawn(move || {
-            relay(rd, orig);
+            relay(rd, thread_dst);
             let _ = tx.send(());
         });
     if spawned.is_err() {
         // Put the original back so the process is no worse off than unshielded.
+        // `orig` is still owned by the `File` in `dst`; restore through it, then
+        // let the drop close it.
         unsafe {
             libc::dup2(orig, fd);
-            libc::close(orig);
             libc::close(rd);
+        }
+        if let Ok(mut slot) = dst.lock() {
+            drop(slot.take());
         }
         return None;
     }
-    Some(Relay { fd, done })
+    Some(Relay { fd, dst, done })
 }
 
-/// Copy `rd` -> `orig` until EOF, tolerating a dead downstream.
+/// Copy `rd` -> the shared destination until EOF, tolerating a dead downstream.
 ///
 /// The first failed write means the parent is gone. We do **not** stop: the
 /// writer (this process) must keep finding a reader on the other end of its
 /// pipe, or it would block once the buffer fills and then die on the same EPIPE
-/// we exist to absorb. So we keep reading and throw the bytes away.
-fn relay(rd: libc::c_int, orig: libc::c_int) {
+/// we exist to absorb. So we drop the destination and keep draining to nowhere.
+///
+/// `drain` may take the destination out from under us at shutdown; a `None`
+/// slot means exactly the same thing as a dead downstream — discard and
+/// continue until the fd closes.
+fn relay(rd: libc::c_int, dst: Arc<Mutex<Option<std::fs::File>>>) {
     let mut src = unsafe { std::fs::File::from_raw_fd(rd) };
-    let mut dst = unsafe { std::fs::File::from_raw_fd(orig) };
     let mut buf = [0u8; 16 * 1024];
-    let mut downstream_alive = true;
     loop {
         match src.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if downstream_alive && dst.write_all(&buf[..n]).is_err() {
-                    downstream_alive = false;
+                if let Ok(mut slot) = dst.lock() {
+                    let dead = match slot.as_mut() {
+                        Some(f) => f.write_all(&buf[..n]).is_err(),
+                        None => false,
+                    };
+                    if dead {
+                        // Release the parent's pipe the moment it breaks.
+                        drop(slot.take());
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
-    let _ = dst.flush();
-    // `src`/`dst` own their fds and close on drop.
+    if let Ok(mut slot) = dst.lock() {
+        if let Some(f) = slot.as_mut() {
+            let _ = f.flush();
+        }
+        drop(slot.take());
+    }
+    // `src` owns `rd` and closes on drop.
+}
+
+/// `pipe()` with both ends marked `CLOEXEC`.
+///
+/// Portable `pipe` + `fcntl` rather than Linux-only `pipe2(O_CLOEXEC)` so the
+/// crate still builds on macOS. The window between the two calls is safe: the
+/// shield is engaged once, at startup, before anything else can `fork`.
+fn pipe_cloexec() -> Option<(libc::c_int, libc::c_int)> {
+    let mut ends = [0 as libc::c_int; 2];
+    // SAFETY: `ends` is a valid 2-element array; `pipe` fills it or returns < 0.
+    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let (rd, wr) = (ends[0], ends[1]);
+    if !set_cloexec(rd) || !set_cloexec(wr) {
+        // SAFETY: both are freshly-owned descriptors we have not published.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return None;
+    }
+    Some((rd, wr))
+}
+
+/// `dup(2)` onto a fresh descriptor that is already `CLOEXEC`, atomically.
+fn dup_cloexec(fd: libc::c_int) -> Option<libc::c_int> {
+    // SAFETY: F_DUPFD_CLOEXEC on a presumed-valid fd; the result is checked.
+    let n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if n < 0 {
+        return None;
+    }
+    Some(n)
+}
+
+/// Set `FD_CLOEXEC` on `fd`, preserving the other descriptor flags.
+fn set_cloexec(fd: libc::c_int) -> bool {
+    // SAFETY: F_GETFD/F_SETFD on a valid fd; both return values are checked.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return false;
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    rc >= 0
+}
+
+/// True when `fd` has `FD_CLOEXEC` set.
+#[cfg(test)]
+fn is_cloexec(fd: libc::c_int) -> bool {
+    // SAFETY: F_GETFD on a valid fd; the return value is checked.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    flags >= 0 && (flags & libc::FD_CLOEXEC) != 0
 }
 
 /// True when `fd` is a pipe/FIFO — the only case that can break under us.
@@ -170,6 +271,11 @@ fn is_pipe(fd: libc::c_int) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+
+    /// Wrap a raw write fd the way `hijack` does, so tests can call `relay`.
+    fn dest(fd: libc::c_int) -> Arc<Mutex<Option<std::fs::File>>> {
+        Arc::new(Mutex::new(Some(unsafe { std::fs::File::from_raw_fd(fd) })))
+    }
 
     fn pipe_pair() -> (libc::c_int, libc::c_int) {
         let mut ends = [0 as libc::c_int; 2];
@@ -206,7 +312,7 @@ mod tests {
         // Downstream: stands in for the parent-owned pipe.
         let (down_rd, down_wr) = pipe_pair();
 
-        let t = std::thread::spawn(move || relay(up_rd, down_wr));
+        let t = std::thread::spawn(move || relay(up_rd, dest(down_wr)));
 
         let mut writer = unsafe { std::fs::File::from_raw_fd(up_wr) };
         writer
@@ -229,13 +335,89 @@ mod tests {
             .expect("relay thread should exit cleanly, not panic");
     }
 
+    /// Every descriptor the shield keeps for itself must be `CLOEXEC`, or an
+    /// `exec` in any descendant inherits a copy.
+    #[test]
+    fn shield_primitives_are_close_on_exec() {
+        let (rd, wr) = pipe_cloexec().expect("pipe");
+        assert!(is_cloexec(rd), "relay read end must not survive exec");
+        assert!(is_cloexec(wr), "shield write end must not survive exec");
+
+        let duped = dup_cloexec(wr).expect("dup");
+        assert!(
+            is_cloexec(duped),
+            "the dup of the real destination must not survive exec"
+        );
+
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+            libc::close(duped);
+        }
+    }
+
+    /// The regression this module exists to prevent at the *process* level: a
+    /// grandchild spawned while the shield is up must not pin the parent's
+    /// pipe open. If it does, the parent never sees EOF, keeps reporting the
+    /// finished coordinator as `running`, and withholds its result until the
+    /// last descendant exits.
+    #[test]
+    fn a_live_grandchild_does_not_hold_the_downstream_open() {
+        // `down_rd` stands in for the parent coordinator's read end.
+        let (down_rd, down_wr) = pipe_pair();
+
+        // Shield a scratch fd that points at the parent's write end, so the
+        // test harness's own stdout/stderr are left alone.
+        let victim = unsafe { libc::dup(down_wr) };
+        assert!(victim >= 0, "dup the downstream onto a scratch fd");
+        unsafe { libc::close(down_wr) };
+
+        let relay = hijack(victim).expect("a pipe fd must be shielded");
+
+        // Something long-lived, spawned *after* the shield is up.
+        let mut grandchild = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn grandchild");
+
+        // The shielded process finishes: fd closed, relay joined, both of the
+        // relay's descriptors dropped. Nothing in *this* process holds the
+        // downstream write end any more.
+        FdShield {
+            relays: vec![relay],
+        }
+        .drain();
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = unsafe { std::fs::File::from_raw_fd(down_rd) };
+            let mut sink = Vec::new();
+            let _ = reader.read_to_end(&mut sink);
+            let _ = tx.send(());
+        });
+        let saw_eof = rx.recv_timeout(Duration::from_secs(5));
+
+        let _ = grandchild.kill();
+        let _ = grandchild.wait();
+
+        assert!(
+            saw_eof.is_ok(),
+            "downstream never reached EOF: a live grandchild inherited the \
+             shielded destination, so the parent would keep this coordinator \
+             marked `running` until that descendant exits"
+        );
+    }
+
     /// A relay with a live downstream must deliver the bytes verbatim.
     #[test]
     fn relay_forwards_bytes_to_a_live_downstream() {
         let (up_rd, up_wr) = pipe_pair();
         let (down_rd, down_wr) = pipe_pair();
 
-        let t = std::thread::spawn(move || relay(up_rd, down_wr));
+        let t = std::thread::spawn(move || relay(up_rd, dest(down_wr)));
 
         let mut writer = unsafe { std::fs::File::from_raw_fd(up_wr) };
         writer.write_all(b"hello coordinator\n").expect("write");
