@@ -1399,23 +1399,57 @@ pub fn footer_seq_resized(
         hints.len() as u16,
     );
     let mut seq = String::new();
+    // Set when this paint is the first one at a NEW terminal height — see the
+    // band erase below.
+    let mut geometry_changed = false;
     if ACTIVE.load(Ordering::Relaxed) {
         let mut installed = INSTALLED_LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(before) = *installed {
-            let editing = reading_line();
-            seq.push_str(&layout_transition_seq(before, layout, editing));
-            let delta = layout_delta(before, layout);
-            let row = BODY_ROW.load(Ordering::Relaxed);
-            if row > 0 {
-                BODY_ROW.store(
-                    row.saturating_sub(delta.grow)
-                        .saturating_add(delta.release)
-                        .clamp(1, layout.body_bottom),
-                    Ordering::Relaxed,
-                );
+            // A WINDOW RESIZE IS NOT A TRAY TRANSITION. `before` was solved for
+            // the old height, so every row in it — body floor included — is
+            // offset from the new plan by the height delta. Feeding that into
+            // the tray choreography makes it believe the tray grew or shrank by
+            // the whole delta and emit a region-scoped `SU`/`SD`, which drags
+            // the transcript across the screen and smears the chrome the
+            // emulator left behind at the old rows: the "ghost" escalation
+            // banner that reappears above the live footer (often doubled) after
+            // navigating away from the window and back. On a geometry change
+            // there is nothing to reconcile — the emulator already reflowed the
+            // screen — so just re-anchor the body cursor inside the new body and
+            // re-record the plan.
+            if before.rows == layout.rows {
+                let editing = reading_line();
+                seq.push_str(&layout_transition_seq(before, layout, editing));
+                let delta = layout_delta(before, layout);
+                let row = BODY_ROW.load(Ordering::Relaxed);
+                if row > 0 {
+                    BODY_ROW.store(
+                        row.saturating_sub(delta.grow)
+                            .saturating_add(delta.release)
+                            .clamp(1, layout.body_bottom),
+                        Ordering::Relaxed,
+                    );
+                }
+            } else {
+                geometry_changed = true;
+                let row = BODY_ROW.load(Ordering::Relaxed);
+                if row > 0 {
+                    BODY_ROW.store(row.clamp(1, layout.body_bottom), Ordering::Relaxed);
+                }
             }
         }
         *installed = Some(layout);
+    }
+    // The emulator reflowed the screen under us, so the rows the NEW footer band
+    // covers can still hold fragments of the OLD, differently-sized footer —
+    // most visibly a banner row that the shorter/taller plan no longer paints,
+    // left sitting inside the band as a ghost. Erase the whole band once before
+    // repainting it. `ED` is NOT clipped by the DECSTBM margins, so this clears
+    // exactly the absolute rows [top_row..rows] and can never touch transcript
+    // above the footer; the DECSC/DECRC wrapper keeps the caller's cursor.
+    if geometry_changed && layout.height > 0 {
+        let top = layout.top_row();
+        seq.push_str(&format!("\x1b7\x1b[{top};1H\x1b[J\x1b8"));
     }
     let input = effective_input_line_resized(resized);
     seq.push_str(&footer_seq_with(
@@ -2757,6 +2791,69 @@ mod tests {
         assert!(
             tail.contains(&format!("\x1b[{row};{col}H")),
             "cursor was not re-homed past the prompt at {row};{col}: {tail:?}"
+        );
+    }
+
+    /// REGRESSION (ghost escalation banner): a WINDOW RESIZE is not a tray
+    /// transition.
+    ///
+    /// The installed layout was solved for the OLD height, so after the
+    /// emulator reflows the screen every row in it is off by the height delta.
+    /// Feeding that into the tray choreography made it believe the tray grew by
+    /// the whole delta and emit a region-scoped scroll (`ESC[1;<old>r` + LFs),
+    /// which dragged the transcript across the screen and smeared the chrome the
+    /// emulator had left at the old rows — the duplicated "ghost" escalation
+    /// banner that shows up above the live footer after navigating away from the
+    /// window and back. The resize paint must instead erase the new footer band
+    /// once and repaint it, with no transcript scrolling at all.
+    #[test]
+    fn resize_with_pinned_banner_erases_band_without_scrolling() {
+        const CHILD: &str = "AISH_TEST_RESIZE_GHOST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut term = Terminal::detect().expect("PTY required");
+            term.init_scroll_region();
+            term.draw_footer("msg", "bar");
+            crate::escalation::pin("w_ghost", "ghost worker");
+            // One paint at the ORIGINAL geometry so the next paint can tell the
+            // size actually moved.
+            paint_cached_footer(false);
+            let old_bottom = FooterLayout::for_rows(24).body_bottom;
+            let size = libc::winsize {
+                ws_row: 18,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSWINSZ, &size) },
+                0
+            );
+            let new_top = FooterLayout::for_rows(18).top_row();
+            print!("<<GHOST:{old_bottom}:{new_top}>>");
+            let _ = std::io::stdout().flush();
+            paint_cached_footer(false);
+            crate::escalation::unpin("w_ghost");
+            return;
+        }
+        let bytes = run_pty_test(
+            "resize_with_pinned_banner_erases_band_without_scrolling",
+            CHILD,
+            None,
+        );
+        let output = String::from_utf8_lossy(&bytes);
+        let (_, tail) = output
+            .split_once("<<GHOST:")
+            .expect("child marker missing from PTY output");
+        let (coords, tail) = tail.split_once(">>").expect("unterminated marker");
+        let (old_bottom, new_top) = coords.split_once(':').expect("malformed marker");
+        assert!(
+            tail.contains(&format!("\x1b[{new_top};1H\x1b[J")),
+            "resize paint did not erase the new footer band at row {new_top}: {tail:?}"
+        );
+        assert!(
+            !tail.contains(&format!("\x1b[1;{old_bottom}r")),
+            "resize paint scrolled the transcript through the old body floor \
+             {old_bottom} (ghost-banner regression): {tail:?}"
         );
     }
 
