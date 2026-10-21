@@ -291,6 +291,23 @@ impl Severity {
     }
 }
 
+/// Render a plain informational notice for the SecondStatusLine's
+/// recent-message slot (`session.flash`).
+///
+/// Unlike [`alert_badge`] / [`severity_badge`] this carries NO alarm-clock
+/// glyph and no attention color: it is for routine, operator-initiated notices
+/// that belong on the footer rather than above the prompt (`:new`'s "history
+/// cleared", the `mcp: ready` startup line). Dim when color is on, bare text
+/// otherwise. Pure, so it's unit-testable.
+pub fn notice_flash(text: &str, color_on: bool) -> String {
+    if color_on {
+        format!("\x1b[2m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+
 /// Severity-tiered variant of [`alert_badge`]: same glyph + layout, but the
 /// color reflects the tier (cyan=info, yellow=warn, red=critical). Pure.
 pub fn severity_badge(banner: &str, sev: Severity, color_on: bool) -> String {
@@ -1442,5 +1459,17 @@ Watch for this condition and call the `set_alert` tool with alert_id=7 …";
         // so the fired-alert SecondStatusLine and the worker row stay in lockstep.
         assert!(alert_badge("x", false).starts_with(ALERT_GLYPH));
         assert_eq!(job_activity_emoji("set_alert now"), ALERT_GLYPH);
+    }
+
+    #[test]
+    fn notice_flash_is_dim_and_glyphless() {
+        // Routine notices (`:new`'s "history cleared") must NOT borrow the
+        // alarm-clock glyph — that's reserved for fired `:alert`s.
+        assert_eq!(notice_flash("history cleared", false), "history cleared");
+        assert!(!notice_flash("history cleared", false).contains(ALERT_GLYPH));
+        assert_eq!(
+            notice_flash("history cleared", true),
+            "\x1b[2mhistory cleared\x1b[0m"
+        );
     }
 }
