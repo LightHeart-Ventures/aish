@@ -913,22 +913,46 @@ pub async fn run(
                 // freshly arms, surface a one-line heads-up; the main loop drains
                 // the armed resume on its next idle pass (Session::take_resume_tick).
                 {
-                    let (terminal_ids, outstanding) = {
+                    // `guarded` collects the terminal FAILURES whose error text
+                    // is an aish loop-guard stop (call-budget exceeded,
+                    // auto-recovery exhausted, rate-limit yield) rather than a
+                    // real task failure — those turn the resume into a TRIAGE
+                    // turn that ends in a selectable `choice` block.
+                    let (terminal_ids, outstanding, guarded) = {
                         let jobs = worker_jobs.lock().unwrap();
                         let mut terminal = Vec::new();
+                        let mut guarded: Vec<(String, String, String)> = Vec::new();
                         let mut outstanding = 0usize;
                         for w in jobs.iter() {
                             if matches!(w.status().as_str(), "done" | "failed") {
                                 terminal.push(w.id.clone());
+                                if let Some(err) = w.error_text()
+                                    && let Some(tag) = crate::worker::loopguard_tag(&err)
+                                {
+                                    guarded.push((
+                                        w.id.clone(),
+                                        tag.to_string(),
+                                        crate::worker::loopguard_excerpt(&err, 240),
+                                    ));
+                                }
                             } else {
                                 outstanding += 1;
                             }
                         }
-                        (terminal, outstanding)
+                        (terminal, outstanding, guarded)
                     };
                     let freshly_armed = resume
                         .lock()
-                        .map(|mut r| r.observe(&terminal_ids, outstanding))
+                        .map(|mut r| {
+                            // observe FIRST: note_flagged only keeps ids that
+                            // are already in the pending set, so a worker the
+                            // operator `:close`d can't resurrect a triage turn.
+                            let armed = r.observe(&terminal_ids, outstanding);
+                            for (id, tag, excerpt) in &guarded {
+                                r.note_flagged(id, tag, excerpt);
+                            }
+                            armed
+                        })
                         .unwrap_or(false);
                     if freshly_armed {
                         crate::tools::print_above_prompt(
