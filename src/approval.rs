@@ -302,12 +302,24 @@ fn verdict_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.verdict"))
 }
 
-/// This process's worker label, for the request row. A coordinator carries it
-/// in `AISH_WORKER_LABEL`; a non-coordinator reports `local`.
+/// This process's worker label, for the request row. A coordinator is
+/// identified by `AISH_RUN_ID` (set by `coordinator::run` at startup and
+/// propagated to every child worker); a non-coordinator reports `local`.
+///
+/// `AISH_WORKER_LABEL` is still honoured FIRST as an explicit override, but it
+/// is not set anywhere in the tree — relying on it alone is why every parked
+/// request used to be attributed to `local`, leaving the operator unable to
+/// tell which coordinator was blocked, and leaving `:attach <id>` unable to
+/// re-surface that coordinator's own pending ask.
 fn worker_label() -> String {
     std::env::var("AISH_WORKER_LABEL")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AISH_RUN_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| "local".to_string())
 }
 
@@ -410,6 +422,67 @@ pub fn pending() -> Vec<Request> {
     }
     out.sort_by_key(|r| r.created);
     out
+}
+
+/// The pending requests filed BY one coordinator, oldest first.
+///
+/// `run_id` may be a full run id or the short prefix the operator sees in the
+/// console (`w_8oWNuD2p`), matched against the request's recorded `worker`
+/// label in either direction so a short-vs-long mismatch still resolves.
+pub fn pending_for(run_id: &str) -> Vec<Request> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return Vec::new();
+    }
+    pending()
+        .into_iter()
+        .filter(|r| worker_matches(&r.worker, run_id))
+        .collect()
+}
+
+/// Does a recorded `worker` label denote the coordinator `run_id`?
+///
+/// Prefix-tolerant in BOTH directions: the console shows a short run id while
+/// the request may have recorded a longer one (or vice versa). `local` and the
+/// empty label never match a real run id — otherwise attaching to any worker
+/// would show every non-coordinator ask.
+fn worker_matches(worker: &str, run_id: &str) -> bool {
+    if worker.is_empty() || worker == "local" || run_id.is_empty() {
+        return false;
+    }
+    worker == run_id || worker.starts_with(run_id) || run_id.starts_with(worker)
+}
+
+/// The block re-printed when the operator ATTACHES to a coordinator that has a
+/// parked approval request — `None` when it has none.
+///
+/// The console note fired once, at the moment the worker asked; `:attach` then
+/// wipes the pane and replays the worker's transcript, so by the time the
+/// operator is looking at the blocked coordinator the only copy of the id they
+/// need to type has scrolled away. Re-surfacing it here makes the ask PERSIST
+/// for as long as it is unanswered: every attach reprints it, and it stops
+/// appearing the moment it is approved, denied, or swept as stale.
+pub fn attach_notice(run_id: &str) -> Option<String> {
+    render_attach_notice(&pending_for(run_id))
+}
+
+/// Pure renderer for [`attach_notice`] — `None` for an empty slice.
+fn render_attach_notice(reqs: &[Request]) -> Option<String> {
+    if reqs.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "\x1b[1;33m⚠ {} pending approval request{} from this coordinator — it is BLOCKED until you answer\x1b[0m",
+        reqs.len(),
+        if reqs.len() == 1 { "" } else { "s" }
+    );
+    for r in reqs {
+        out.push_str(&format!(
+            "\n  \x1b[1m{}\x1b[0m {} \x1b[2m{}\x1b[0m\n     \x1b[2mreason: {}\x1b[0m\n     answer: \x1b[32m:approve {}\x1b[0m · \x1b[31m:deny {}\x1b[0m",
+            r.id, r.op, r.target, r.reason, r.id, r.id
+        ));
+    }
+    Some(out)
 }
 
 /// Resolve an operator-typed id (exact, or an unambiguous prefix) to a pending
@@ -567,6 +640,60 @@ mod tests {
         assert!(note.contains("~/.aws"));
         assert!(note.contains(":approve a0000003"));
         assert!(note.contains(":deny a0000003"));
+    }
+
+    #[test]
+    fn worker_matches_is_prefix_tolerant_both_ways() {
+        // Exact.
+        assert!(worker_matches("w_8oWNuD2p", "w_8oWNuD2p"));
+        // Recorded label is longer than the id the operator attached with.
+        assert!(worker_matches("w_8oWNuD2p-child", "w_8oWNuD2p"));
+        // Recorded label is the short form of a longer run id.
+        assert!(worker_matches("w_8oWNuD2p", "w_8oWNuD2p-child"));
+        // Different workers never cross-match.
+        assert!(!worker_matches("w_8oWNuD2p", "w_cDP4hc0O"));
+    }
+
+    #[test]
+    fn worker_matches_never_matches_local_or_empty() {
+        // `local` is the non-coordinator sentinel: attaching to a worker must
+        // not surface asks that did not come from it.
+        assert!(!worker_matches("local", "w_8oWNuD2p"));
+        assert!(!worker_matches("", "w_8oWNuD2p"));
+        assert!(!worker_matches("w_8oWNuD2p", ""));
+    }
+
+    #[test]
+    fn pending_for_empty_run_id_matches_nothing() {
+        // Guards the "attach with no id re-prints every worker's ask" footgun.
+        assert!(pending_for("").is_empty());
+        assert!(pending_for("   ").is_empty());
+    }
+
+    #[test]
+    fn attach_notice_is_none_when_nothing_pending() {
+        assert!(render_attach_notice(&[]).is_none());
+    }
+
+    #[test]
+    fn attach_notice_repeats_id_path_and_both_verbs() {
+        // The whole point of the re-print: the operator must be able to answer
+        // from the attach pane alone, without the scrolled-away console note.
+        let note = render_attach_notice(&[req("a445368")]).expect("some");
+        assert!(note.contains("a445368"));
+        assert!(note.contains("/home/u/.aws/credentials"));
+        assert!(note.contains(":approve a445368"));
+        assert!(note.contains(":deny a445368"));
+    }
+
+    #[test]
+    fn attach_notice_pluralises_and_lists_every_request() {
+        let note = render_attach_notice(&[req("a000001"), req("a000002")]).expect("some");
+        assert!(note.contains("2 pending approval request"));
+        assert!(note.contains(":approve a000001"));
+        assert!(note.contains(":approve a000002"));
+        let one = render_attach_notice(&[req("a000003")]).expect("some");
+        assert!(one.contains("1 pending approval request"));
     }
 
     #[test]

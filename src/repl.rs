@@ -6061,6 +6061,15 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
                 // as attached and forwards every subsequent line).
                 backfill_attached(run_id, session, &banner);
             }
+            // SEC-2.4: a coordinator parked on a sensitive-path approval is
+            // BLOCKED, and its one-shot console note has long since scrolled
+            // past. Re-print the ask (and the exact :approve/:deny line) as the
+            // last thing in the pane, so attaching to a stuck worker always
+            // shows how to unstick it. Prints nothing when there is no pending
+            // request, and stops printing once one is answered.
+            if let Some(note) = crate::approval::attach_notice(run_id) {
+                println!("{note}");
+            }
         }
         many => {
             println!(
