@@ -11065,7 +11065,18 @@ async fn handle_colon(
             // Clear the terminal before starting the fresh conversation so the
             // operator sees a clean slate (matching what `:new` implies).
             print!("\x1b[2J\x1b[H");
-            println!("history cleared");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            // Report the reset on the SecondStatusLine's recent-message slot
+            // instead of printing it above the prompt: a confirmation line in
+            // the freshly-cleared scrollback is the one bit of noise `:new` is
+            // supposed to remove. Same flash slot (most-recent wins) the
+            // `mcp: ready` notice and worker-done badges use.
+            if let Ok(mut f) = session.flash.lock() {
+                *f = Some(crate::style::notice_flash(
+                    "history cleared",
+                    crate::style::colors_enabled(),
+                ));
+            }
         }
         Some("allow") => handle_allow(parts.next(), parts.next(), session),
         Some("secrets") => handle_secrets(parts.collect(), session),
