@@ -1129,8 +1129,8 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
             // termination. Without a mid-round signal every surface shows the
             // startup summary — "starting up" — for the worker's entire life.
             if let Some(t) = session.activity.as_mut() {
-                t.note_tool_call(&desc, result.is_error);
-                t.maybe_refresh().await;
+                t.note_tool_call(&call.name, &desc, result.is_error);
+                t.maybe_refresh();
             }
             // Observe hooks: PostToolUse (always) + PostToolUseFailure (on error).
             // Carry the tool name, program/path, and the error flag so an audit
