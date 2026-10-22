@@ -3556,6 +3556,15 @@ impl WorkerJob {
             other => format!("worker {} is still running (status: {other}).", self.id),
         }
     }
+    /// The raw failure text of a terminal `failed` worker (`None` while running
+    /// or when it finished cleanly). Unlike [`Self::fetch`] this is NOT wrapped
+    /// in a "worker … failed:" preamble, so loop-guard classification
+    /// ([`loopguard_tag`]) sees exactly what the coordinator reported.
+    pub fn error_text(&self) -> Option<String> {
+        let i = self.inner.lock().unwrap();
+        (i.status == "failed").then(|| i.error.clone().unwrap_or_else(|| "unknown error".into()))
+    }
+
     /// One-line result summary for table cells — mirrors `format_result` in tools.rs.
     /// Running jobs return `"—"`; done jobs show `"✓ success"` (or `"✓ #NN"` when
     /// the result text contains a PR reference); failed jobs show `"✗ <reason>"`
@@ -3582,6 +3591,57 @@ impl WorkerJob {
             }
             _ => "—".to_string(),
         }
+    }
+}
+
+/// Classify a worker's failure text as a LOOP-GUARD stop — the family of
+/// self-protective aborts the agentic loop raises when a run burns its per-turn
+/// call budget, exhausts its retry/auto-recovery allowance, or yields to spread
+/// load across the rate-limit window. These read as "failed" but are NOT real
+/// task failures: the work is usually half-done and the right next move is a
+/// decision (resume with fresh context / narrow the scope / split the task /
+/// drop it), not a blind retry.
+///
+/// Returns a short stable tag when the text matches, `None` for an ordinary
+/// failure. Case-insensitive substring matching — the operator-visible strings
+/// are stable, and matching loosely is the right trade-off here: a false
+/// positive costs one extra triage prompt, a false negative silently drops the
+/// operator back into "worker failed, good luck".
+pub fn loopguard_tag(err: &str) -> Option<&'static str> {
+    let low = err.to_ascii_lowercase();
+    // Ordered most-specific first so the tag names the actual guard that fired.
+    for (needle, tag) in [
+        ("call-budget-exceeded", "call-budget-exceeded"),
+        ("per-turn hard budget", "call-budget-exceeded"),
+        ("budget-exhausted", "budget-exhausted"),
+        ("serial-chain-yield", "serial-chain-yield"),
+        ("turn-limit", "turn-limit"),
+        ("max turns", "turn-limit"),
+        ("auto-recovery attempt", "auto-recovery-exhausted"),
+        ("flagged for operator", "flagged-for-operator"),
+        ("rate-limit window", "rate-limit-yield"),
+    ] {
+        if low.contains(needle) {
+            return Some(tag);
+        }
+    }
+    None
+}
+
+/// Condense a loop-guard failure into one short line for the triage prompt:
+/// strips the box-drawing gutter (`┃`) the live stream prints, collapses
+/// whitespace, and truncates. Keeps the resume prompt small — the agent can
+/// always call `job_output` for the full text.
+pub fn loopguard_excerpt(err: &str, max: usize) -> String {
+    let cleaned: String = err
+        .replace(['┃', '┏', '┗', '│'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.chars().count() > max {
+        format!("{}…", cleaned.chars().take(max).collect::<String>())
+    } else {
+        cleaned
     }
 }
 
@@ -4598,6 +4658,67 @@ fn flush_results(jobs: &WorkerJobs) {
 
 #[cfg(test)]
 mod tests {
+    /// The reported operator-visible failure text, verbatim (gutter included).
+    const BUDGET_FAILURE: &str = "aish: turn stopped [call-budget-exceeded]: yielded after 52 tool \
+calls this turn (per-turn hard budget) to spread load across the rate-limit window and ┃ resume \
+with fresh context ┃ cache: 0 read + 0 write + 377 uncached in (0% hit) → 17 out ┃ aish: flagged \
+for operator after 4 auto-recovery attempt(s)";
+
+    #[test]
+    fn loopguard_tag_classifies_the_reported_stop() {
+        assert_eq!(
+            super::loopguard_tag(BUDGET_FAILURE),
+            Some("call-budget-exceeded")
+        );
+    }
+
+    #[test]
+    fn loopguard_tag_covers_the_guard_family() {
+        for (err, want) in [
+            (
+                "yielded after 52 tool calls (per-turn hard budget)",
+                "call-budget-exceeded",
+            ),
+            ("turn stopped [budget-exhausted]", "budget-exhausted"),
+            ("turn stopped [serial-chain-yield]", "serial-chain-yield"),
+            ("hit max turns for this run", "turn-limit"),
+            (
+                "flagged for operator after 4 auto-recovery attempt(s)",
+                "auto-recovery-exhausted",
+            ),
+            (
+                "spreading load across the rate-limit window",
+                "rate-limit-yield",
+            ),
+        ] {
+            assert_eq!(super::loopguard_tag(err), Some(want), "err: {err}");
+        }
+    }
+
+    #[test]
+    fn loopguard_tag_ignores_ordinary_failures() {
+        for err in [
+            "compile error: cannot find value `x` in this scope",
+            "task failed: gh pr create exited 1",
+            "no such file or directory",
+            "",
+        ] {
+            assert_eq!(super::loopguard_tag(err), None, "err: {err}");
+        }
+    }
+
+    #[test]
+    fn loopguard_excerpt_strips_gutter_and_truncates() {
+        let e = super::loopguard_excerpt(BUDGET_FAILURE, 60);
+        assert!(!e.contains('┃'), "{e}");
+        assert!(!e.contains("  "), "whitespace not collapsed: {e}");
+        assert!(e.chars().count() <= 61, "{e}");
+        assert!(e.ends_with('…'), "{e}");
+        assert!(e.starts_with("aish: turn stopped"), "{e}");
+        // Short input passes through unchanged and un-truncated.
+        assert_eq!(super::loopguard_excerpt("short one", 60), "short one");
+    }
+
     /// Reactor-panic defect: `ThinkingSpinner::start` used a bare
     /// `tokio::spawn`, but it is reachable from the `aish-keywatch` reader
     /// thread (mid-turn Shift-Tab → `cycle_worker_live` → attach backfill),

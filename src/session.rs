@@ -122,6 +122,79 @@ outcome for the user. Do NOT re-dispatch work that is already complete."
     )
 }
 
+/// A terminal child that stopped on an aish LOOP GUARD rather than finishing
+/// its task — see [`crate::worker::loopguard_tag`]. Carried alongside the
+/// pending-resume ids so the woken turn can name the guard and the worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlaggedWorker {
+    /// The worker id (`w_########`).
+    pub id: String,
+    /// Short stable guard tag, e.g. `call-budget-exceeded`.
+    pub tag: String,
+    /// One-line condensed failure text for the prompt.
+    pub excerpt: String,
+}
+
+/// The TRIAGE variant of [`resume_prompt`], used when at least one resumed
+/// child stopped on a loop guard. A budget/turn-limit stop is a DECISION point,
+/// not a result to summarize: the work is partially done, blind re-dispatch
+/// burns the same budget again, and only the operator can say whether to resume,
+/// narrow, split, or drop it. So this prompt does three things the plain resume
+/// prompt must not: it NAMES the guard that fired, it orders the agent to read
+/// the real output before recommending anything, and it requires the turn to end
+/// in exactly ONE `choice` block — the Option UI aish renders as a selectable
+/// popup, whose chosen id comes straight back as the next input. Pure, so the
+/// contract is unit-tested rather than discovered in production.
+fn triage_prompt(ids: &[String], flagged: &[FlaggedWorker]) -> String {
+    let n = flagged.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let detail = flagged
+        .iter()
+        .map(|f| format!("- {} [{}]: {}", f.id, f.tag, f.excerpt))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let others: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !flagged.iter().any(|f| f.id == *id))
+        .collect();
+    let also = if others.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {} other worker(s) finished normally and still need synthesizing: {}.",
+            others.len(),
+            others.join(", ")
+        )
+    };
+    let first = flagged.first().map(|f| f.id.as_str()).unwrap_or("");
+    format!(
+        "[Auto-resume · triage] {n} background worker{plural} you dispatched did NOT finish its \
+task — it stopped on an aish LOOP GUARD (a self-protective budget/turn/rate-limit abort), so its \
+work is partially done:\n{detail}\n{also}\n\nThis is a DECISION point, not a failure to \
+summarize. Do this now, in order:\n\
+1. Call job_output for each flagged id (e.g. job_output {{\"job\":\"{first}\"}}) and read what it \
+actually accomplished before it was cut off — how far it got, what is left, whether its partial \
+work is on disk or in a branch.\n\
+2. Say in 2-4 lines what it completed, what remains, and WHY the guard fired (too many serial \
+tool calls? scope too wide for one turn? genuinely rate-limited?).\n\
+3. End your turn with exactly ONE fenced ```choice block (mode: one) so the operator can pick the \
+next step with a single keystroke. Use these option ids verbatim, keeping only the ones that \
+genuinely apply, and write labels/summaries grounded in what you just read:\n\
+   - `resume-fresh` — re-dispatch the SAME task with fresh context to continue from its partial \
+work\n\
+   - `resume-narrowed` — re-dispatch a narrowed scope (name the specific cut) so it fits the \
+budget\n\
+   - `split-up` — fan the remaining work out across several smaller background workers\n\
+   - `finish-here` — you finish the remaining work inline in this session, no new worker\n\
+   - `inspect` — show the full worker output / its branch diff before deciding\n\
+   - `drop` — abandon the remaining work and keep what landed\n\n\
+Do NOT re-dispatch, retry, or start new work in this turn — the operator picks first. Do NOT \
+re-dispatch work that is already complete."
+    )
+}
+
+/// Coalescing state for the auto-resume-on-child-completion wake hook.
 /// Coalescing state for the auto-resume-on-child-completion wake hook. When a
 /// top-level interactive session fans out background coordinators via
 /// `run_in_background`, their results "auto-deliver" only as one-line notices —
@@ -147,6 +220,10 @@ pub struct ResumeState {
     /// Set once the LAST outstanding fanned-out child has gone terminal with
     /// something pending; cleared when the REPL consumes the resume via `take`.
     armed: bool,
+    /// Terminal children whose failure text matched an aish loop guard, so the
+    /// armed resume becomes a TRIAGE turn (see [`triage_prompt`]) instead of a
+    /// plain "synthesize their results" nudge. Drained with the pending ids.
+    flagged: Vec<FlaggedWorker>,
 }
 
 impl ResumeState {
@@ -173,6 +250,31 @@ impl ResumeState {
         false
     }
 
+    /// Record that terminal child `id` stopped on a loop guard (not a genuine
+    /// task failure). Deduped by id — the presenter re-observes the same
+    /// terminal worker on every poll tick. Only ids already folded into the
+    /// pending set are kept, so a worker the operator `:close`d (or one already
+    /// consumed by an earlier resume) can never re-arm a triage turn.
+    pub fn note_flagged(&mut self, id: &str, tag: &str, excerpt: &str) {
+        if !self.pending.iter().any(|p| p == id) {
+            return;
+        }
+        if self.flagged.iter().any(|f| f.id == id) {
+            return;
+        }
+        self.flagged.push(FlaggedWorker {
+            id: id.to_string(),
+            tag: tag.to_string(),
+            excerpt: excerpt.to_string(),
+        });
+    }
+
+    /// Drain the loop-guard-flagged children recorded since the last drain.
+    /// Called with [`Self::take`] when a resume fires.
+    pub fn take_flagged(&mut self) -> Vec<FlaggedWorker> {
+        std::mem::take(&mut self.flagged)
+    }
+
     /// Drain an armed resume: returns the ids to synthesize and clears both the
     /// arm and the pending list (the `seen` set is RETAINED so an already-consumed
     /// completion can never re-fire). `None` when nothing is armed.
@@ -196,6 +298,7 @@ impl ResumeState {
     pub fn forget(&mut self, id: &str) -> bool {
         self.pending.retain(|p| p != id);
         self.seen.remove(id);
+        self.flagged.retain(|f| f.id != id);
         if self.pending.is_empty() && self.armed {
             self.armed = false;
             return true;
@@ -926,11 +1029,22 @@ impl Session {
         if self.attached.lock().ok().and_then(|g| g.clone()).is_some() {
             return None;
         }
-        let ids = self.resume.lock().ok()?.take()?;
+        let (ids, flagged) = {
+            let mut st = self.resume.lock().ok()?;
+            let ids = st.take()?;
+            let flagged = st.take_flagged();
+            (ids, flagged)
+        };
         if ids.is_empty() {
             return None;
         }
-        Some(resume_prompt(&ids))
+        // A loop-guard stop is a DECISION point, not a result to summarize:
+        // swap the generic synthesis nudge for the triage directive.
+        if flagged.is_empty() {
+            Some(resume_prompt(&ids))
+        } else {
+            Some(triage_prompt(&ids, &flagged))
+        }
     }
 
     /// Load the lifecycle-hook registry from the user-global
@@ -2383,6 +2497,100 @@ mod tests {
         let mut r = ResumeState::default();
         assert!(!r.observe(&[], 0));
         assert!(r.take().is_none());
+    }
+
+    #[test]
+    fn triage_prompt_names_guard_and_demands_one_choice_block() {
+        let flagged = vec![FlaggedWorker {
+            id: "w_a".into(),
+            tag: "call-budget-exceeded".into(),
+            excerpt: "yielded after 52 tool calls this turn".into(),
+        }];
+        let p = triage_prompt(&["w_a".to_string(), "w_b".to_string()], &flagged);
+        // Names the guard, the id, and the condensed reason.
+        assert!(p.contains("LOOP GUARD"), "{p}");
+        assert!(p.contains("w_a [call-budget-exceeded]"), "{p}");
+        assert!(p.contains("52 tool calls"), "{p}");
+        // Folds in the normally-finished sibling rather than dropping it.
+        assert!(p.contains("w_b"), "{p}");
+        // Demands the Option UI: exactly one choice block, with the canonical ids.
+        assert!(p.contains("```choice"), "{p}");
+        assert!(p.contains("exactly ONE"), "{p}");
+        for id in [
+            "resume-fresh",
+            "resume-narrowed",
+            "split-up",
+            "finish-here",
+            "inspect",
+            "drop",
+        ] {
+            assert!(p.contains(id), "missing option {id} in: {p}");
+        }
+        // Must read the real output before recommending, and must not act alone.
+        assert!(p.contains("job_output"), "{p}");
+        assert!(p.contains("Do NOT re-dispatch"), "{p}");
+    }
+
+    #[test]
+    fn note_flagged_requires_pending_and_dedupes() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut r = ResumeState::default();
+        r.observe(&["w_a".into()], 0);
+        // Unknown id is ignored — a :close'd worker can't re-arm a triage turn.
+        r.note_flagged("w_zz", "call-budget-exceeded", "x");
+        // Known id records once, repeat observations don't duplicate.
+        r.note_flagged("w_a", "call-budget-exceeded", "burned the budget");
+        r.note_flagged("w_a", "call-budget-exceeded", "burned the budget");
+        let f = r.take_flagged();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].id, "w_a");
+        assert_eq!(f[0].tag, "call-budget-exceeded");
+        // Drained — a second take yields nothing.
+        assert!(r.take_flagged().is_empty());
+    }
+
+    #[test]
+    fn forget_drops_flagged_entry() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut r = ResumeState::default();
+        r.observe(&["w_a".into(), "w_b".into()], 0);
+        r.note_flagged("w_a", "call-budget-exceeded", "x");
+        r.forget("w_a");
+        assert!(r.take_flagged().is_empty());
+    }
+
+    #[test]
+    fn take_resume_tick_swaps_in_triage_for_flagged_worker() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut session = Session::new().unwrap();
+        {
+            let mut st = session.resume.lock().unwrap();
+            assert!(st.observe(&["w_a".into()], 0));
+            st.note_flagged("w_a", "call-budget-exceeded", "yielded after 52 tool calls");
+        }
+        let p = session.take_resume_tick().expect("armed resume");
+        assert!(p.contains("triage"), "{p}");
+        assert!(p.contains("```choice"), "{p}");
+        // Consumed exactly once.
+        assert!(session.take_resume_tick().is_none());
+    }
+
+    #[test]
+    fn take_resume_tick_keeps_plain_synthesis_when_nothing_flagged() {
+        if !auto_resume_enabled() {
+            return;
+        }
+        let mut session = Session::new().unwrap();
+        assert!(session.resume.lock().unwrap().observe(&["w_a".into()], 0));
+        let p = session.take_resume_tick().expect("armed resume");
+        assert!(!p.contains("```choice"), "{p}");
+        assert!(!p.contains("LOOP GUARD"), "{p}");
     }
 
     #[test]
