@@ -105,6 +105,12 @@ pub static SENSITIVE_EXEMPT: &[&str] = &[
     "*.env.sample",
     "*.env.template",
     "*.env.dist",
+    // Infix variants: `.env.op.example`, `.env.local.sample`, ... — the
+    // environment qualifier sits between `.env` and the template suffix.
+    ".env.*.example",
+    ".env.*.sample",
+    ".env.*.template",
+    ".env.*.dist",
 ];
 
 /// Whether a path holds credential/key/identity material.
@@ -560,9 +566,27 @@ mod tests {
             ".env.template",
             ".env.dist",
             "app.env.example",
+            ".env.op.example",
+            ".env.local.sample",
+            ".env.production.template",
+            ".env.staging.dist",
         ] {
             let p = Path::new("/tmp/aish_glob_probe").join(name);
             assert!(!classify_path(&p).is_sensitive(), "{name} should be benign");
+        }
+    }
+
+    #[test]
+    fn env_infix_example_exempt_but_real_env_still_sensitive() {
+        // Templates with an environment qualifier are benign...
+        for name in [".env.op.example", ".env.local.sample"] {
+            let p = Path::new("/tmp/aish_glob_probe").join(name);
+            assert!(!classify_path(&p).is_sensitive(), "{name} should be benign");
+        }
+        // ...but real env files with the same qualifier stay sensitive.
+        for name in [".env.op", ".env.local", ".env.op.production"] {
+            let p = Path::new("/tmp/aish_glob_probe").join(name);
+            assert!(classify_path(&p).is_sensitive(), "{name} should be sensitive");
         }
     }
 
