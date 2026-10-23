@@ -4,6 +4,14 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.61.1] - 2026-10-23
+
+### Changed
+- **Sub-work decomposition and fan-out now reach the operator's console by default.** The per-round sub-work ledger summary was written with a plain `eprintln!`, which `worker::forward_decision` gates behind `:worker-output` (off by default) — so the decomposition the feature computes was computed and then discarded in the default configuration. It now goes out on the always-surfaced `📣` console channel for nested coordinators, still behind the existing `progress_if_changed()` guard (no per-round spam) and still recorded into `session.worker_transcript`. All three `run_in_background` paths also announce at spawn time when nested: the generic worker spawn and nested batch tier name the sub-worker (`fan-out: spawned sub-worker <short-id> — <first line of brief>` / `queued sub-work on the batch tier (<id>)`), and the host spawn-broker names the **spool request** rather than claiming a run id that does not exist yet. Top-level calls stay silent — `escalation.rs` already prints its own launch notice. A new shared encoder in `src/worker.rs` (`encode_console_note` / `emit_console_note`) is now the only place the console sentinel is written: it scrubs **before** folding physical newlines onto `CONSOLE_LINE_SEP` (U+2028), so a secret straddling a newline still matches and a multi-line note is framed by the `📣 [label]` prefix exactly once; `tools::message_console` calls the helper instead of re-implementing scrub/fold/emit, which is how the ledger site drifted onto plain stderr in the first place. No extra model calls, no new I/O, no polling (#1036).
+
+### Fixed
+- **A multi-byte character in model output no longer panics the process.** `subwork::parse_directive` runs over every line of model output and called `strip_ci`, which sliced `s[..prefix.len()]` directly — when byte index 7 (`"SUBWORK".len()`) landed inside a multi-byte UTF-8 char the slice panicked and killed the shell (`end byte index 7 is not a char boundary; it is inside '—'`). An em dash after a five-letter word was enough to trigger it, e.g. `"Phase — kickoff"`, which given how routinely models emit em dashes made this a frequent hard crash. `strip_ci` now uses `str::get(..n)`, which returns `None` on a non-boundary instead of panicking and subsumes the old length guard; the trailing `&s[prefix.len()..]` stays safe because the matched prefix is ASCII by construction. The regression test covers the exact crash shape, every byte offset of a multi-byte char, shorter-than-prefix and all-multibyte inputs, and valid directives carrying non-ASCII payloads. The other `.len()]` index sites were audited and none share the failure mode (#1035).
+
 ## [0.61.0] - 2026-10-23
 
 ### Added
