@@ -79,6 +79,8 @@ impl LocalBackend {
             pinned_path.as_ref().and_then(|p| p.to_str()),
         )?;
 
+        // Must precede `init()`: the Metal device probe logs during that call.
+        super::llama_log::init_backend_logging();
         let backend = LlamaBackend::init().context("failed to initialize llama.cpp backend")?;
 
         Ok(Self {
