@@ -158,6 +158,17 @@ fn resolve_repo_quant(sel: Option<&Selection>, model_id: &str) -> Result<(String
     if let Some((repo, quant)) = crate::hwdetect::repo_and_quant_for(model_id) {
         return Ok((repo, quant));
     }
+    // The id may itself BE the repo coordinate (`owner/Name-GGUF`) — operators
+    // pin those directly via AISH_LOCAL_MODEL_ID. There is nothing to look up:
+    // use it as the repo with the default quant rather than refusing it.
+    if let Some(repo) = crate::hwdetect::hf_repo_shaped(model_id) {
+        let quant = sel
+            .map(|s| s.quant.trim())
+            .filter(|q| !q.is_empty())
+            .unwrap_or(DEFAULT_QUANT)
+            .to_string();
+        return Ok((repo, quant));
+    }
     Err(anyhow!(
         "no Hugging Face repo is known for local model '{model_id}'. Download a GGUF \
          manually and pin it with AISH_LOCAL_MODEL_PATH=/abs/path/model.gguf. \
@@ -172,8 +183,7 @@ fn resolve_repo_quant(sel: Option<&Selection>, model_id: &str) -> Result<(String
 
 /// Appended to every local-model resolution failure so a stranded operator has
 /// a way back to a working backend instead of a dead session.
-pub const LOCAL_RECOVERY_HINT: &str =
-    "To get working again now: ':backend claude' (or grok/openai/openrouter). \
+pub const LOCAL_RECOVERY_HINT: &str = "To get working again now: ':backend claude' (or grok/openai/openrouter). \
      To re-pick a local model: ':model-detect'.";
 
 /// What a successful [`preflight_local_model`] resolved the selection to.
@@ -242,8 +252,16 @@ pub fn preflight_local_model(sel: Option<&Selection>, pin: Option<&str>) -> Resu
         .map(|s| s.model_id.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| crate::hwdetect::DEFAULT_MODEL_ID.to_string());
-    let (repo, quant) = resolve_repo_quant(sel, &model_id)?;
-    Ok(LocalModelPlan::Repo { repo, quant })
+    match resolve_repo_quant(sel, &model_id) {
+        Ok((repo, quant)) => Ok(LocalModelPlan::Repo { repo, quant }),
+        // (3) Last resort: weights already sitting in the cache for this id are
+        // proof enough — an unmappable id must not strand a session whose GGUF
+        // is right there on disk.
+        Err(e) => match crate::hwdetect::cached_gguf_for(&model_id) {
+            Some(p) => Ok(LocalModelPlan::PinnedFile(p)),
+            None => Err(e),
+        },
+    }
 }
 
 /// [`preflight_local_model`] against the live `AISH_LOCAL_MODEL_PATH` pin.
@@ -778,10 +796,33 @@ mod tests {
     }
 
     #[test]
-    fn preflight_rejects_unmappable_model_id() {
-        // The exact selection that stranded the session: not a real HF repo,
-        // no curated tier entry, empty hf_repo.
+    fn preflight_accepts_repo_shaped_model_id() {
+        // The selection that stranded the session: no curated tier entry and
+        // an empty hf_repo, but the id IS the repo coordinate — use it.
         let s = sel("bartowski/Qwen3.8-27B-GGUF", "", None);
+        match preflight_local_model(Some(&s), None).expect("repo-shaped id must preflight") {
+            LocalModelPlan::Repo { repo, quant } => {
+                assert_eq!(repo, "bartowski/Qwen3.8-27B-GGUF");
+                assert_eq!(quant, DEFAULT_QUANT);
+            }
+            other => panic!("expected a Repo plan, got {other:?}"),
+        }
+        // An explicit quant on the selection wins over the default.
+        let s = sel("bartowski/Qwen3.8-27B-GGUF", "", None);
+        let s = Selection {
+            quant: "Q5_K_M".to_string(),
+            ..s
+        };
+        match preflight_local_model(Some(&s), None).expect("repo-shaped id must preflight") {
+            LocalModelPlan::Repo { quant, .. } => assert_eq!(quant, "Q5_K_M"),
+            other => panic!("expected a Repo plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_unmappable_model_id() {
+        // Not repo-shaped, no curated tier entry, empty hf_repo, no cache.
+        let s = sel("totally-made-up-model", "", None);
         let err = preflight_local_model(Some(&s), None)
             .expect_err("an unmappable model_id must fail preflight");
         let msg = err.to_string();
