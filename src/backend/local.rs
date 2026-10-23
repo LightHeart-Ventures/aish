@@ -8,10 +8,19 @@
 //! - `AISH_LOCAL_MODEL_PATH`: Full path to a .gguf model file (operator pin)
 //! - `AISH_LOCAL_MODEL_ID`: Model id from the selection ladder (e.g., "qwen2.5-0.5b-instruct")
 //! - `AISH_LOCAL_N_GPU_LAYERS`: Number of layers to offload to GPU (default: 0, CPU-only)
+//! - `AISH_LOCAL_N_CTX`: Context window in tokens (default: 4096, clamped 512..=131072)
+//! - `AISH_LOCAL_MAX_OUTPUT_TOKENS`: Tokens reserved for the reply (default: 512, clamped 16..=8192)
+//! - `AISH_LOCAL_BATCH_SIZE`: Prompt tokens per `decode` call (default: 512, clamped 32..=512)
+//!
+//! Prompt feeding is planned by [`super::local_plan`]: prompts larger than one
+//! batch are decoded in chunks, and prompts larger than the context window are
+//! trimmed from the middle (system prompt and most recent turns survive).
 
 #[cfg(feature = "local")]
 use anyhow::{Context, anyhow};
 
+#[cfg(feature = "local")]
+use super::local_plan;
 use anyhow::Result;
 #[cfg(feature = "local")]
 use llama_cpp_2::{
@@ -121,7 +130,8 @@ impl LocalBackend {
         let model = self.model().await?;
 
         // Build the prompt from system + history.
-        let mut prompt = format!("[INST] {system}\n\n");
+        let system_header = format!("[INST] {system}\n\n");
+        let mut prompt = system_header.clone();
 
         for msg in history {
             match msg.role {
@@ -141,29 +151,80 @@ impl LocalBackend {
         let vocab = model.vocab();
         let tokens = vocab.tokenize(prompt.as_bytes(), true, true);
 
+        // Tunables. Garbage or out-of-range values clamp to a sane window
+        // instead of failing the turn (see `local_plan::env_usize`).
+        let n_ctx =
+            local_plan::env_usize("AISH_LOCAL_N_CTX", local_plan::DEFAULT_N_CTX, 512, 131_072);
+        let max_tokens = local_plan::env_usize(
+            "AISH_LOCAL_MAX_OUTPUT_TOKENS",
+            local_plan::DEFAULT_MAX_OUTPUT_TOKENS,
+            16,
+            8192,
+        );
+        // Capped at llama.cpp's default `n_batch` (512): a chunk larger than the
+        // context's batch size would be rejected by `decode`, and we don't touch
+        // `n_batch` here.
+        let batch_capacity = local_plan::env_usize(
+            "AISH_LOCAL_BATCH_SIZE",
+            local_plan::DEFAULT_BATCH_CAPACITY,
+            32,
+            512,
+        );
+
+        // Plan the feed BEFORE allocating the context: the plan tells us how
+        // many prompt tokens actually survive the window, chunked so no single
+        // `decode` exceeds the batch.
+        let keep_head = vocab.tokenize(system_header.as_bytes(), true, true).len();
+        let plan =
+            local_plan::plan_prompt(tokens.len(), keep_head, n_ctx, max_tokens, batch_capacity);
+
+        if plan.is_empty() {
+            return Err(anyhow!("local backend: empty prompt, nothing to decode"));
+        }
+        if plan.trimmed() {
+            eprintln!(
+                "\x1b[2m  prompt trimmed: dropped {} of {} tokens to fit n_ctx={} (reserved {} for output)\x1b[0m",
+                plan.dropped,
+                plan.dropped + plan.kept,
+                n_ctx,
+                max_tokens
+            );
+        }
+
         // Create context and batch.
-        let ctx_params =
-            LlamaContextParams::default().with_n_ctx(Some(NonZeroU32::new(4096).unwrap()));
+        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx as u32));
         let mut ctx = model
             .new_context(&self.backend, ctx_params)
             .context("failed to create inference context")?;
 
-        let mut batch = LlamaBatch::new(512, 1);
-        let last_token_idx = (tokens.len() - 1) as i32;
-        for (i, &token) in tokens.iter().enumerate() {
-            batch
-                .add(token, i as i32, &[0], i as i32 == last_token_idx)
-                .context("failed to add token to batch")?;
+        // Feed the prompt chunk by chunk. Only the final token of the final
+        // chunk needs logits — that's where sampling starts.
+        let mut batch = LlamaBatch::new(plan.batch_capacity, 1);
+        let last_chunk = plan.chunks.len() - 1;
+        for (ci, chunk) in plan.chunks.iter().enumerate() {
+            batch.clear();
+            for i in 0..chunk.len {
+                let wants_logits = ci == last_chunk && i + 1 == chunk.len;
+                batch
+                    .add(
+                        tokens[chunk.src_start + i],
+                        (chunk.pos_start + i) as i32,
+                        &[0],
+                        wants_logits,
+                    )
+                    .context("failed to add prompt token to batch")?;
+            }
+            ctx.decode(&mut batch)
+                .context("failed to decode prompt chunk")?;
         }
-
-        ctx.decode(&mut batch)
-            .context("failed to decode initial batch")?;
 
         // Generate output tokens with greedy sampling.
         let mut sampler = LlamaSampler::greedy();
         let mut output = String::new();
-        let mut n_cur = batch.n_tokens();
-        let max_tokens = 512; // Limit output length.
+        // Sampling continues at the position after the last *kept* prompt token
+        // (positions are renumbered over the kept tokens when trimming).
+        let mut n_cur = plan.next_position() as i32;
+        let mut generated = 0usize;
 
         for _ in 0..max_tokens {
             let next_token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -183,6 +244,7 @@ impl LocalBackend {
             // `Special`/bool arg on `LlamaModel::token_to_piece_bytes`.
             let token_bytes = vocab.token_to_piece(next_token, false, None);
             output.push_str(&String::from_utf8_lossy(&token_bytes));
+            generated += 1;
 
             // Prepare next batch.
             batch.clear();
@@ -200,7 +262,7 @@ impl LocalBackend {
             raw: None,
             truncated_tool_call: false,
             usage: None,
-            truncated_text: output.len() >= max_tokens as usize,
+            truncated_text: generated >= max_tokens,
         })
     }
 }

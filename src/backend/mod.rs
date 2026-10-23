@@ -2,6 +2,10 @@ pub mod claude;
 pub mod grok;
 #[cfg(feature = "local")]
 pub mod local;
+/// Pure prompt-batching planner for the local backend. Compiled in the default
+/// build too (not just `--features local`) so its unit tests run in CI without
+/// the llama.cpp toolchain.
+pub mod local_plan;
 pub mod openai;
 
 use anyhow::Result;
