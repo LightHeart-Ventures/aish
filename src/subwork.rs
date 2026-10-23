@@ -374,7 +374,9 @@ impl SubWorkLedger {
         if ok {
             report.push_str("\nRESULT: all sub-work-items completed successfully.");
         } else {
-            report.push_str("\nRESULT: NOT COMPLETE — the combined result does not yet meet the ask.");
+            report.push_str(
+                "\nRESULT: NOT COMPLETE — the combined result does not yet meet the ask.",
+            );
             if !failed.is_empty() {
                 report.push_str(&format!(" Failed: {}.", failed.join(", ")));
             }
@@ -648,7 +650,10 @@ mod tests {
         l.ingest("SUBWORK PLAN: alpha | a\nSUBWORK DONE: alpha | shipped");
         let v = l.verify();
         assert!(v.ok, "{}", v.report);
-        assert!(v.report.contains("all sub-work-items completed successfully"));
+        assert!(
+            v.report
+                .contains("all sub-work-items completed successfully")
+        );
 
         // A worker that never decomposed is untouched.
         let empty = ledger();
@@ -666,7 +671,9 @@ mod tests {
         let mut l = ledger();
 
         l.ingest("SUBWORK PLAN: alpha | wire the parser\nSUBWORK PLAN: beta | add tests");
-        let first = l.progress_if_changed().expect("declaration emits a summary");
+        let first = l
+            .progress_if_changed()
+            .expect("declaration emits a summary");
         assert!(first.contains("sub-work: 0/2 done"));
         assert!(first.contains("[pending] alpha — wire the parser"));
         assert!(first.contains("[pending] beta — add tests"));
@@ -675,12 +682,16 @@ mod tests {
         assert!(l.progress_if_changed().is_none());
 
         l.ingest("SUBWORK RUNNING: alpha | parsing markers");
-        let second = l.progress_if_changed().expect("status change emits a summary");
+        let second = l
+            .progress_if_changed()
+            .expect("status change emits a summary");
         assert!(second.contains("0/2 done, 1 running"));
         assert!(second.contains("[running] alpha — parsing markers"));
 
         l.ingest("SUBWORK DONE: alpha | parser landed\nSUBWORK FAILED: beta | 1 assertion failed");
-        let third = l.progress_if_changed().expect("terminal states emit a summary");
+        let third = l
+            .progress_if_changed()
+            .expect("terminal states emit a summary");
         assert!(third.contains("1/2 done"));
         assert!(third.contains("1 failed"));
         assert!(third.contains("[done] alpha — parser landed"));

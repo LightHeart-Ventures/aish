@@ -307,7 +307,6 @@ pub fn notice_flash(text: &str, color_on: bool) -> String {
     }
 }
 
-
 /// Severity-tiered variant of [`alert_badge`]: same glyph + layout, but the
 /// color reflects the tier (cyan=info, yellow=warn, red=critical). Pure.
 pub fn severity_badge(banner: &str, sev: Severity, color_on: bool) -> String {

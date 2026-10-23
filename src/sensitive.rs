@@ -586,7 +586,10 @@ mod tests {
         // ...but real env files with the same qualifier stay sensitive.
         for name in [".env.op", ".env.local", ".env.op.production"] {
             let p = Path::new("/tmp/aish_glob_probe").join(name);
-            assert!(classify_path(&p).is_sensitive(), "{name} should be sensitive");
+            assert!(
+                classify_path(&p).is_sensitive(),
+                "{name} should be sensitive"
+            );
         }
     }
 
