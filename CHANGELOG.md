@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.61.4] - 2026-10-24
+
+### Fixed
+- **`:backend local` accepts repo-shaped model ids and already-downloaded GGUFs.** An operator-pinned `AISH_LOCAL_MODEL_ID=owner/Name-GGUF` was refused with `maps to no known Hugging Face repo; it will not load` because `repo_and_quant_for()` only knew the curated tier table — even when the weights were already sitting in `~/.aish/models/`. A new strict `hwdetect::hf_repo_shaped()` (exactly one `/`, both halves non-empty, no whitespace, no `..`) treats a repo-shaped id as its own Hugging Face coordinate and lets the network decide existence, and a new non-network `hwdetect::cached_gguf_for()` treats weights on disk as the strongest proof a selection is usable (largest `.gguf` wins, `mmproj-*` projectors skipped) so a renamed, gated, or offline repo cannot strand a session. `selection_is_resolvable()` accepts either signal (no bogus warning on switch), `resolve_repo_quant()` uses a repo-shaped id with the selection's quant or `DEFAULT_QUANT`, and `preflight_local_model()` falls back to a cached GGUF as a `PinnedFile` plan before erroring. Shape validation is deliberately strict — `../etc/passwd`, `owner/../name`, `owner name/model`, `owner/a/b`, `/name`, and `owner/` are all rejected so a stray id can never be coerced into a URL path, each covered by a test (#1044).
+
 ## [0.61.3] - 2026-10-23
 
 ### Fixed
