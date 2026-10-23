@@ -73,6 +73,16 @@ pub trait LineEditor {
     fn read_line_with_initial(&mut self, prompt: &str, initial: &str) -> ReadOutcome;
     /// Append a submitted line to the in-memory history ring.
     fn add_history(&mut self, line: &str);
+    /// Snapshot the history ring, oldest → newest.
+    ///
+    /// The editor owns history, but it is NOT the active line reader during a
+    /// model turn — the [`crate::keywatch`] reader thread is. That thread needs
+    /// a copy so mid-turn Up/Down recall the same commands as the prompt does
+    /// (without it, Up was inert while aish was thinking). Default: empty, so
+    /// mocks and future backends keep compiling with no mid-turn history.
+    fn history_entries(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Persist history to disk (best-effort — failure is ignored).
     fn save_history(&mut self);
     /// Hand out the above-the-prompt printer. Returns `Some` at most once and
@@ -485,6 +495,18 @@ impl LineEditor for RustylineEditor {
 
     fn add_history(&mut self, line: &str) {
         let _ = self.rl.add_history_entry(line);
+    }
+
+    fn history_entries(&self) -> Vec<String> {
+        use rustyline::history::{History, SearchDirection};
+        // Walk by index through the `History` trait rather than a concrete
+        // backend's `iter()`, so this holds for both MemHistory and
+        // FileHistory (whichever `DefaultHistory` resolves to by feature).
+        let h = self.rl.history();
+        (0..h.len())
+            .filter_map(|i| h.get(i, SearchDirection::Forward).ok().flatten())
+            .map(|r| r.entry.into_owned())
+            .collect()
     }
 
     fn save_history(&mut self) {

@@ -219,16 +219,97 @@ fn decode_csi(seq: &[u8]) -> Option<Key> {
 
 /// A minimal, UTF-8-correct single-line editor for the mid-turn prompt. Cursor
 /// is a **char** index in `0..=chars.len()`.
+///
+/// Also owns mid-turn **history recall**: seeded with the REPL's history
+/// (oldest → newest) at turn start, Up/Down walk it exactly like the
+/// at-the-prompt editor does. `nav` is the cursor into that list (`None` ==
+/// editing a live line, not a recalled one) and `draft` stashes the in-progress
+/// text on the first Up so walking back down to the newest entry restores it
+/// instead of eating it.
 #[derive(Debug, Default, Clone)]
 pub struct LineBuf {
     chars: Vec<char>,
     cursor: usize,
+    /// History entries, oldest first (index 0) → newest last.
+    hist: Vec<String>,
+    /// Index into `hist` of the entry currently displayed, or `None` when the
+    /// buffer holds the operator's own in-progress line.
+    nav: Option<usize>,
+    /// The in-progress line stashed when history recall started.
+    draft: String,
 }
 
 impl LineBuf {
-    /// A fresh empty buffer.
+    /// A fresh empty buffer with no history (Up/Down are inert).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh empty buffer seeded with `hist` (oldest first) for Up/Down
+    /// recall. Consecutive duplicates are collapsed so repeated commands don't
+    /// require repeated Ups to walk past.
+    pub fn with_history(hist: Vec<String>) -> Self {
+        let mut dedup: Vec<String> = Vec::with_capacity(hist.len());
+        for entry in hist {
+            if entry.trim().is_empty() {
+                continue;
+            }
+            if dedup.last().map(String::as_str) == Some(entry.as_str()) {
+                continue;
+            }
+            dedup.push(entry);
+        }
+        Self {
+            hist: dedup,
+            ..Self::default()
+        }
+    }
+
+    /// Replace the whole line, parking the cursor at its end.
+    fn set_line(&mut self, text: &str) {
+        self.chars = text.chars().collect();
+        self.cursor = self.chars.len();
+    }
+
+    /// Walk one entry back (older) through history. Returns `true` when the
+    /// buffer changed, so the caller knows to repaint.
+    fn hist_prev(&mut self) -> bool {
+        if self.hist.is_empty() {
+            return false;
+        }
+        let next = match self.nav {
+            // First Up of this recall: stash the live line, show the newest.
+            None => {
+                self.draft = self.as_string();
+                self.hist.len() - 1
+            }
+            // Already at the oldest entry — stay put (don't wrap).
+            Some(0) => return false,
+            Some(i) => i - 1,
+        };
+        self.nav = Some(next);
+        let text = self.hist[next].clone();
+        self.set_line(&text);
+        true
+    }
+
+    /// Walk one entry forward (newer); past the newest entry the stashed draft
+    /// comes back. Returns `true` when the buffer changed.
+    fn hist_next(&mut self) -> bool {
+        let Some(i) = self.nav else {
+            return false;
+        };
+        if i + 1 < self.hist.len() {
+            self.nav = Some(i + 1);
+            let text = self.hist[i + 1].clone();
+            self.set_line(&text);
+        } else {
+            // Walked off the newest entry → back to the operator's own line.
+            self.nav = None;
+            let draft = std::mem::take(&mut self.draft);
+            self.set_line(&draft);
+        }
+        true
     }
 
     /// The current text.
@@ -254,10 +335,13 @@ impl LineBuf {
         self.chars.is_empty()
     }
 
-    /// Reset to empty.
+    /// Reset to empty (history itself is kept; only the recall cursor and the
+    /// stashed draft are dropped).
     pub fn clear(&mut self) {
         self.chars.clear();
         self.cursor = 0;
+        self.nav = None;
+        self.draft.clear();
     }
 
     /// Take the current line, leaving the buffer empty. Returns `None` when the
@@ -268,27 +352,38 @@ impl LineBuf {
         if s.trim().is_empty() { None } else { Some(s) }
     }
 
+    /// Editing a recalled entry makes the line the operator's own again, so a
+    /// later Down restores their draft instead of overwriting the edit with the
+    /// next history entry.
+    fn detach_from_history(&mut self) {
+        self.nav = None;
+    }
+
     fn insert(&mut self, c: char) {
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
+        self.detach_from_history();
     }
 
     fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
             self.chars.remove(self.cursor);
+            self.detach_from_history();
         }
     }
 
     fn delete(&mut self) {
         if self.cursor < self.chars.len() {
             self.chars.remove(self.cursor);
+            self.detach_from_history();
         }
     }
 
     fn kill_to_start(&mut self) {
         self.chars.drain(0..self.cursor);
         self.cursor = 0;
+        self.detach_from_history();
     }
 
     fn kill_word(&mut self) {
@@ -302,6 +397,7 @@ impl LineBuf {
         }
         self.chars.drain(i..self.cursor);
         self.cursor = i;
+        self.detach_from_history();
     }
 
     /// Fold a decoded [`Key`] into the buffer. Editing keys mutate state and
@@ -348,11 +444,26 @@ impl LineBuf {
                 self.kill_word();
                 Action::None
             }
-            // Up/Down are reserved for future history recall; today they no-op
-            // rather than corrupting the line.
-            Key::Up | Key::Down => Action::None,
+            // Up/Down walk the seeded history (GH: up-arrow was inert while a
+            // turn was in flight). Both are no-ops when there's nothing to
+            // recall, so they never corrupt the line.
+            Key::Up => {
+                self.hist_prev();
+                Action::None
+            }
+            Key::Down => {
+                self.hist_next();
+                Action::None
+            }
             Key::Enter => match self.take() {
-                Some(line) => Action::Submit(line),
+                Some(line) => {
+                    // Make the just-submitted line recallable for the rest of
+                    // the turn, mirroring the at-the-prompt editor.
+                    if self.hist.last() != Some(&line) {
+                        self.hist.push(line.clone());
+                    }
+                    Action::Submit(line)
+                }
                 None => Action::None,
             },
             Key::ShiftTab => Action::CycleWorker,
@@ -760,6 +871,100 @@ mod tests {
         b.apply(Key::Delete); // empty guard
         assert!(b.is_empty());
         assert_eq!(b.cursor(), 0);
+    }
+
+    // ---- history recall (GH: Up was inert while aish was busy) ----
+
+    #[test]
+    fn up_recalls_newest_then_older() {
+        let mut b = LineBuf::with_history(vec!["first".into(), "second".into()]);
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "second");
+        assert_eq!(b.cursor(), "second".chars().count());
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "first");
+        // Walking past the oldest entry parks there instead of clearing.
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "first");
+    }
+
+    #[test]
+    fn down_walks_back_and_restores_draft() {
+        let mut b = LineBuf::with_history(vec!["older".into(), "newer".into()]);
+        for c in "draft".chars() {
+            b.apply(Key::Char(c));
+        }
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "newer");
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "older");
+        b.apply(Key::Down);
+        assert_eq!(b.as_string(), "newer");
+        // Past the newest entry the operator's own in-progress line comes back.
+        b.apply(Key::Down);
+        assert_eq!(b.as_string(), "draft");
+        // Down at the live line is a no-op, not a wipe.
+        b.apply(Key::Down);
+        assert_eq!(b.as_string(), "draft");
+    }
+
+    #[test]
+    fn history_is_deduped_and_blank_filtered() {
+        let b = LineBuf::with_history(vec![
+            "ls".into(),
+            "ls".into(),
+            "   ".into(),
+            "".into(),
+            "git status".into(),
+        ]);
+        let mut b = b;
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "git status");
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "ls");
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "ls");
+    }
+
+    #[test]
+    fn up_without_history_is_inert() {
+        let mut b = typed("abc");
+        assert_eq!(b.apply(Key::Up), Action::None);
+        assert_eq!(b.as_string(), "abc");
+        assert_eq!(b.apply(Key::Down), Action::None);
+        assert_eq!(b.as_string(), "abc");
+    }
+
+    #[test]
+    fn submitted_line_becomes_recallable() {
+        let mut b = LineBuf::with_history(vec!["old".into()]);
+        for c in "fresh".chars() {
+            b.apply(Key::Char(c));
+        }
+        assert_eq!(b.apply(Key::Enter), Action::Submit("fresh".to_string()));
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "fresh");
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "old");
+    }
+
+    #[test]
+    fn editing_a_recalled_line_detaches_from_history() {
+        let mut b = LineBuf::with_history(vec!["cargo test".into()]);
+        b.apply(Key::Up);
+        assert_eq!(b.as_string(), "cargo test");
+        b.apply(Key::Char('!'));
+        assert_eq!(b.as_string(), "cargo test!");
+        // Editing re-owns the line: Down must not clobber the edit with the
+        // next history entry (there is none) — it restores the empty draft only
+        // after the edit is submitted, so here Down is a no-op on the edit.
+        b.apply(Key::Down);
+        assert_eq!(b.as_string(), "cargo test!");
+        // Submitting the edited line records the edit, not the original.
+        assert_eq!(
+            b.apply(Key::Enter),
+            Action::Submit("cargo test!".to_string())
+        );
     }
 
     // ---- FooterRender ----

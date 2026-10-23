@@ -95,6 +95,17 @@ pub struct MidturnCfg {
     /// pre-fills the next prompt with it (`read_line_with_initial`), so the
     /// operator keeps typing exactly where they left off. Cleared on submit.
     pub partial: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Snapshot of the REPL's command history (oldest → newest) taken at turn
+    /// start, so Up/Down recall WORKS mid-turn.
+    ///
+    /// The at-the-prompt editor (rustyline) owns the real history ring, but it
+    /// is not running during a turn — this reader thread is. Without a copy the
+    /// mid-turn [`LineBuf`] had nothing to walk and Up/Down were inert: pressing
+    /// Up while aish was thinking did nothing, which reads as "history is
+    /// broken" (GH up-arrow report). Lines submitted mid-turn are appended to
+    /// the copy so they are recallable for the rest of the turn; the canonical
+    /// ring is updated by the REPL when it dequeues them.
+    pub history: Vec<String>,
 }
 
 /// Mirror the in-progress mid-turn line into the shared carry-over slot. Called
@@ -317,7 +328,12 @@ fn reader_loop(
     // `MidturnCfg` was supplied. When absent we fall through to the legacy
     // Shift-Tab-only `scan_csi_z` scan below, unchanged.
     let mut parser = KeyParser::new();
-    let mut linebuf = LineBuf::new();
+    // Seed the mid-turn editor with the REPL's history so Up/Down recall works
+    // while a turn is in flight (no cfg ⇒ legacy Shift-Tab path, buffer unused).
+    let mut linebuf = match midturn.as_ref() {
+        Some(cfg) => LineBuf::with_history(cfg.history.clone()),
+        None => LineBuf::new(),
+    };
     // How many lines the operator has submitted during THIS turn, so each queued
     // receipt can show its 1-based position in the pending queue (they are drained
     // and run in submission order once the turn ends).

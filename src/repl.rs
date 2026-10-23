@@ -1654,6 +1654,10 @@ pub async fn run(
                             prompt: midturn_prompt.clone(),
                             inline: midturn_inline,
                             partial: mt_partial.clone(),
+                            // Hand the reader thread a snapshot of the history
+                            // ring so mid-turn Up/Down recall the same commands
+                            // the at-the-prompt editor would.
+                            history: editor.history_entries(),
                         });
                         let mut keywatch =
                             crate::keywatch::TurnKeyWatch::install(Some(on_shift_tab), midturn);
