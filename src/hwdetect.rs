@@ -663,6 +663,67 @@ impl Drop for LocalEnvGuard {
 }
 
 // ---------------------------------------------------------------------------
+// Repo-shaped ids and the on-disk GGUF cache
+// ---------------------------------------------------------------------------
+
+/// Is `model_id` itself a Hugging Face repo coordinate (`owner/name`)?
+///
+/// Operators routinely pin `AISH_LOCAL_MODEL_ID=bartowski/Some-Model-GGUF` —
+/// that IS the repo, so refusing it for "maps to no known Hugging Face repo"
+/// is wrong: there is nothing to look up. Deliberately strict so a stray id
+/// cannot be coerced into a URL path: exactly one `/`, both halves non-empty,
+/// no whitespace, no `..` traversal.
+pub fn hf_repo_shaped(model_id: &str) -> Option<String> {
+    let id = model_id.trim();
+    if id.is_empty() || id.contains("..") || id.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (owner, name) = id.split_once('/')?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Filesystem-safe per-repo cache subdirectory name (`owner/Name` → `owner_Name`).
+/// Mirrors `modelfetch::repo_slug`; kept here so resolvability checks need no
+/// dependency on the download path.
+pub fn repo_cache_slug(repo: &str) -> String {
+    repo.replace('/', "_")
+}
+
+/// An already-downloaded GGUF for `repo_or_id` under `~/.aish/models/<slug>/`.
+///
+/// Weights on disk are the strongest possible proof a selection is usable, and
+/// they outrank every registry: the repo may have been renamed, gated or taken
+/// down upstream, or the operator may simply be offline. Prefers the largest
+/// `.gguf` (the real weights over any small sidecar), ignores `mmproj-*`
+/// projector files, and never touches the network.
+pub fn cached_gguf_for(repo_or_id: &str) -> Option<PathBuf> {
+    let slug = repo_cache_slug(repo_or_id.trim());
+    if slug.is_empty() {
+        return None;
+    }
+    let dir = aish_dir().join("models").join(slug);
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if !name.ends_with(".gguf") || name.starts_with("mmproj") {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().map(|(b, _)| size > *b).unwrap_or(true) {
+            best = Some((size, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+// ---------------------------------------------------------------------------
 // Selection validation (F4)
 // ---------------------------------------------------------------------------
 
@@ -684,7 +745,12 @@ pub fn selection_is_resolvable(sel: &Selection) -> bool {
     if !sel.hf_repo.trim().is_empty() {
         return true;
     }
-    repo_and_quant_for(sel.model_id.trim()).is_some()
+    let id = sel.model_id.trim();
+    if repo_and_quant_for(id).is_some() {
+        return true;
+    }
+    // Weights already on disk, or an id that is itself a repo coordinate.
+    cached_gguf_for(id).is_some() || hf_repo_shaped(id).is_some()
 }
 
 /// Warning text for an unmappable selection — named so tests and callers share
@@ -992,14 +1058,46 @@ mod tests {
     }
 
     #[test]
-    fn unresolvable_when_unmapped_id_only() {
-        // The reported bug: a hallucinated repo id with no mapping and no pin.
+    fn repo_shaped_id_is_its_own_repo() {
+        // The reported bug: `:backend local` refused `owner/Name-GGUF` for
+        // "maps to no known Hugging Face repo" even though the id IS the repo
+        // coordinate. Shape is enough to try; the network decides existence.
         let sel = sel_with("bartowski/Qwen3.8-27B-GGUF", "", None);
+        assert!(selection_is_resolvable(&sel));
+        assert_eq!(
+            hf_repo_shaped("bartowski/Qwen3.8-27B-GGUF").as_deref(),
+            Some("bartowski/Qwen3.8-27B-GGUF")
+        );
+    }
+
+    #[test]
+    fn unresolvable_when_unmapped_id_only() {
+        // A bare, non-repo-shaped id with no mapping, no pin, no cache.
+        let sel = sel_with("totally-made-up-model", "", None);
         assert!(!selection_is_resolvable(&sel));
         // Blank / whitespace-only hints do not count as present.
-        assert!(!selection_is_resolvable(&sel_with("nope", "   ", Some("  "))));
+        assert!(!selection_is_resolvable(&sel_with(
+            "nope",
+            "   ",
+            Some("  ")
+        )));
+        // Shape guards: traversal, whitespace, and multi-segment paths are out.
+        for bad in [
+            "../etc/passwd",
+            "owner/../name",
+            "owner name/model",
+            "owner/a/b",
+            "/name",
+            "owner/",
+        ] {
+            assert!(
+                hf_repo_shaped(bad).is_none(),
+                "{bad} must not be repo-shaped"
+            );
+            assert!(!selection_is_resolvable(&sel_with(bad, "", None)));
+        }
         let warn = unresolvable_selection_warning(&sel);
-        assert!(warn.contains("bartowski/Qwen3.8-27B-GGUF"));
+        assert!(warn.contains("totally-made-up-model"));
         assert!(warn.contains("AISH_LOCAL_MODEL_PATH"));
         assert!(warn.contains("not persisted"));
     }
