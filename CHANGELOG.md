@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.61.0] - 2026-10-23
+
+### Added
+- **Coordinator workers decompose their brief into at most 5 verified sub-work-items.** A dispatched worker now splits its assignment into up to five sub-items, runs them in the parent worker's shared worktree, verifies each one, and streams a progress summary as items land. The cap is enforced in code by `SubWorkLedger::ingest` (a sixth `SUBWORK PLAN:` declaration is rejected), sub-items share the parent worktree, verification requires every declared item to be `done`, and a failed or unfinished item is named in the final answer rather than silently marked done. Parsing is pure over existing loop text, with no extra model call (#1033).
+
 ## [0.60.0] - 2026-10-22
 
 ### Added
