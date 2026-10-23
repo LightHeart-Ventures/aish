@@ -4,6 +4,13 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.61.3] - 2026-10-23
+
+### Fixed
+- **`:backend local` no longer strands the session on an unusable backend.** The switch validated nothing before committing: it printed a success line, ran a full `LlamaBackend::init()` (Metal libraries, residency set, ~40 GB working-set reservation), flipped `session.backend_kind`, and only discovered an unresolvable model at the *first inference* — leaving every subsequent turn failing with no signposted way back. The sequence is now preflight-then-commit: a new non-network `modelfetch::preflight_local_model()` passes only when `AISH_LOCAL_MODEL_PATH` (or the selection's persisted `model_path`) exists as a file, or the `model_id` maps to a `(repo, quant)` pair; a new RAII `hwdetect::LocalEnvGuard` snapshots every `AISH_LOCAL_*` key before `apply_env` writes it and restores the exact prior state (including unset → unset) unless `commit()` lands, so a failed switch reports `staying on <previous backend>` with the process env unpolluted. `repl::prepare_local_backend()` shares that sequence between the `:backend local` arm and the `:model-detect` rebuild path, `LocalBackend::new()` runs the same preflight ahead of device init, `hwdetect::ensure_selected` keeps an unmappable operator pin in-memory for the run instead of persisting it to `~/.aish/config/local-model.json`, and every local-resolution failure now appends a shared recovery hint (pin a GGUF, re-pick with `:model-detect`, or escape with `:backend claude`) (#1042).
+- **llama.cpp/ggml startup spam is silenced by default.** A single `:backend local` emitted ~57 lines of third-party chatter at default verbosity — per-library `ggml_metal_library_compile_pipeline` lines plus the full `ggml_metal_device_init` capability dump — written straight to stderr before aish got a say. A new `backend::llama_log::init_backend_logging()`, called immediately before `LlamaBackend::init()` (placement matters: routing installed afterwards misses the noisiest part), routes llama.cpp through `send_logs_to_tracing` and pairs it with a tiny subscriber scoped to the `llama-cpp-2` target that passes `ERROR`/`WARN` through verbatim, re-emits the `loaded N libraries …` roll-up in aish's dim style, and drops the rest — 57 stderr lines down to 1. It only claims the global dispatcher when nothing else owns it, and `AISH_LOCAL_DEBUG=1` skips routing entirely for the unchanged firehose (#1041).
+
+
 ## [0.61.2] - 2026-10-23
 
 ### Fixed
