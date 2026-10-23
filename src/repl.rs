@@ -9904,16 +9904,43 @@ fn is_local_backend(_backend: &Backend) -> bool {
     false
 }
 
-/// Rebuild the local backend in place so a freshly-detected model selection
-/// takes effect. No-op stub without the `local` feature.
+/// Validate a local selection, then build the backend — in that order (F1/F3).
+///
+/// The preflight is cheap and non-network: it proves the operator's pin exists
+/// or that the selected `model_id` maps to a known `(repo, quant)`. Only once
+/// it passes do we call `Backend::new_local()`, which initializes the GPU/Metal
+/// device. An unresolvable model therefore costs no device init and — because
+/// the caller has not mutated anything yet — no state change.
 #[cfg(feature = "local")]
-fn rebuild_local_backend(backend: &mut Backend, session: &mut Session) -> anyhow::Result<()> {
-    *backend = Backend::new_local()?;
+fn prepare_local_backend(
+    sel: Option<&crate::hwdetect::Selection>,
+) -> anyhow::Result<(Backend, crate::modelfetch::LocalModelPlan)> {
+    let pin = std::env::var("AISH_LOCAL_MODEL_PATH").ok();
+    let plan = crate::modelfetch::preflight_local_model(sel, pin.as_deref())?;
+    let backend = Backend::new_local()?;
+    Ok((backend, plan))
+}
+
+/// Rebuild the local backend in place so a freshly-detected model selection
+/// takes effect. Preflights first, and leaves `backend`/`session` untouched if
+/// anything fails. No-op stub without the `local` feature.
+#[cfg(feature = "local")]
+fn rebuild_local_backend(
+    backend: &mut Backend,
+    session: &mut Session,
+    sel: Option<&crate::hwdetect::Selection>,
+) -> anyhow::Result<()> {
+    let (b, _plan) = prepare_local_backend(sel)?;
+    *backend = b;
     session.backend_kind = backend.kind().to_string();
     Ok(())
 }
 #[cfg(not(feature = "local"))]
-fn rebuild_local_backend(_backend: &mut Backend, _session: &mut Session) -> anyhow::Result<()> {
+fn rebuild_local_backend(
+    _backend: &mut Backend,
+    _session: &mut Session,
+    _sel: Option<&crate::hwdetect::Selection>,
+) -> anyhow::Result<()> {
     anyhow::bail!("built without the 'local' feature")
 }
 
@@ -10979,13 +11006,27 @@ async fn handle_colon(
             // local backend, rebuild it so the new selection takes effect.
             match crate::hwdetect::ensure_selected(true, None) {
                 Ok(sel) => {
+                    // Same guard discipline as `:backend local` (F2): if the
+                    // rebuild fails, the AISH_LOCAL_* hints rewind and the
+                    // running backend is left exactly as it was.
+                    let env_guard = crate::hwdetect::LocalEnvGuard::capture();
                     crate::hwdetect::apply_env(&sel);
                     println!("{}", crate::hwdetect::report(&sel));
                     if is_local_backend(backend) {
-                        match rebuild_local_backend(backend, session) {
-                            Ok(()) => println!("backend → {}", backend.describe()),
-                            Err(e) => println!("can't reload local backend: {e:#}"),
+                        match rebuild_local_backend(backend, session, Some(&sel)) {
+                            Ok(()) => {
+                                env_guard.commit();
+                                println!("backend → {}", backend.describe());
+                            }
+                            Err(e) => {
+                                // `env_guard` drops here → AISH_LOCAL_* restored.
+                                println!("can't reload local backend: {e:#}");
+                                println!("staying on {}", backend.describe());
+                            }
                         }
+                    } else {
+                        // No backend swap attempted; keep the new selection.
+                        env_guard.commit();
                     }
                 }
                 Err(e) => eprintln!("\x1b[31maish:\x1b[0m local model detection failed: {e:#}"),
@@ -11053,22 +11094,38 @@ async fn handle_colon(
                     // First switch to local on a machine that's never been
                     // profiled? Detect hardware and pick the best-fitting local
                     // model (operator env pins win; never overridden).
-                    match crate::hwdetect::ensure_selected(false, None) {
+                    //
+                    // Order matters (F1/F2/F3): snapshot the env, apply the
+                    // selection hints, PREFLIGHT the model, init the device,
+                    // and only then commit state + print the success line. Any
+                    // failure drops the guard, which rewinds the AISH_LOCAL_*
+                    // vars and leaves the previous backend fully intact.
+                    let env_guard = crate::hwdetect::LocalEnvGuard::capture();
+                    let sel = match crate::hwdetect::ensure_selected(false, None) {
                         Ok(sel) => {
                             crate::hwdetect::apply_env(&sel);
-                            println!("{}", crate::hwdetect::short_line(&sel));
+                            Some(sel)
                         }
                         Err(e) => {
-                            eprintln!("\x1b[33maish:\x1b[0m local model detection failed: {e:#}")
+                            eprintln!("\x1b[33maish:\x1b[0m local model detection failed: {e:#}");
+                            None
                         }
-                    }
-                    match Backend::new_local() {
-                        Ok(b) => {
+                    };
+                    match prepare_local_backend(sel.as_ref()) {
+                        Ok((b, _plan)) => {
+                            if let Some(sel) = &sel {
+                                println!("{}", crate::hwdetect::short_line(sel));
+                            }
                             *backend = b;
                             session.backend_kind = backend.kind().to_string();
+                            env_guard.commit();
                             println!("backend → {}", backend.describe());
                         }
-                        Err(e) => println!("can't switch: {e:#}"),
+                        Err(e) => {
+                            // `env_guard` drops here → AISH_LOCAL_* restored.
+                            println!("can't switch: {e:#}");
+                            println!("staying on {}", backend.describe());
+                        }
                     }
                 }
             }

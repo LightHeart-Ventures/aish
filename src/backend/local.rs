@@ -68,6 +68,17 @@ impl LocalBackend {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        // F3: prove the model is resolvable BEFORE acquiring any device
+        // resources. `LlamaBackend::init()` compiles the Metal libraries and
+        // reserves a working set (~0.3s on an M-series Mac); doing that for a
+        // selection that can never load is pure waste — and it used to happen
+        // on every `:backend local` with an unmappable model id.
+        let sel = crate::hwdetect::load_selection();
+        crate::modelfetch::preflight_local_model(
+            sel.as_ref(),
+            pinned_path.as_ref().and_then(|p| p.to_str()),
+        )?;
+
         let backend = LlamaBackend::init().context("failed to initialize llama.cpp backend")?;
 
         Ok(Self {
@@ -92,8 +103,9 @@ impl LocalBackend {
         if let Some(p) = &self.pinned_path {
             if !p.is_file() {
                 return Err(anyhow!(
-                    "pinned local model file not found: {} (AISH_LOCAL_MODEL_PATH)",
-                    p.display()
+                    "pinned local model file not found: {} (AISH_LOCAL_MODEL_PATH). {}",
+                    p.display(),
+                    crate::modelfetch::LOCAL_RECOVERY_HINT
                 ));
             }
             return Ok(p.clone());

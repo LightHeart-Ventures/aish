@@ -543,9 +543,18 @@ pub fn ensure_selected(force: bool, cli_model: Option<&str>) -> Result<Selection
             hf_repo: String::new(),
             approx_size_mb: 0,
         };
-        // Best-effort persist; a write failure must not block the pin taking
-        // effect for this run.
-        let _ = save_selection(&sel);
+        // F4: never persist a pin that can never resolve to weights — an
+        // unmappable `model_id` written to disk re-poisons every later session
+        // and only explodes at first inference. Warn loudly and keep it
+        // in-memory for this run so the switch-time preflight can reject it
+        // with the full recovery hint.
+        if selection_is_resolvable(&sel) {
+            // Best-effort persist; a write failure must not block the pin
+            // taking effect for this run.
+            let _ = save_selection(&sel);
+        } else {
+            eprintln!("\x1b[33m{}\x1b[0m", unresolvable_selection_warning(&sel));
+        }
         return Ok(sel);
     }
 
@@ -583,6 +592,111 @@ pub fn apply_env(sel: &Selection) {
             std::env::set_var("AISH_LOCAL_MODEL_PATH", path);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Env rollback guard (F2)
+// ---------------------------------------------------------------------------
+
+/// The process-env hints [`apply_env`] writes. Captured/restored as a unit so a
+/// failed backend switch cannot leave half-applied selection hints behind.
+pub const LOCAL_ENV_KEYS: [&str; 2] = ["AISH_LOCAL_MODEL_ID", "AISH_LOCAL_MODEL_PATH"];
+
+/// RAII snapshot of the `AISH_LOCAL_*` process env.
+///
+/// `apply_env` mutates global state *before* a local backend is known to be
+/// buildable. Wrapping the attempt in a guard means every early return — a
+/// failed preflight, a failed `Backend::new_local()` — rewinds the environment
+/// to exactly what it was. Call [`commit`](Self::commit) once the switch has
+/// actually taken effect to keep the new values.
+#[allow(dead_code)] // only constructed on the `local`-feature path.
+pub struct LocalEnvGuard {
+    saved: Vec<(String, Option<String>)>,
+    committed: bool,
+}
+
+#[allow(dead_code)]
+impl LocalEnvGuard {
+    /// Snapshot the standard [`LOCAL_ENV_KEYS`].
+    pub fn capture() -> Self {
+        Self::capture_keys(&LOCAL_ENV_KEYS)
+    }
+
+    /// Snapshot an explicit key set (used by tests to stay off shared keys).
+    pub fn capture_keys(keys: &[&str]) -> Self {
+        let saved = keys
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        Self {
+            saved,
+            committed: false,
+        }
+    }
+
+    /// Keep the current values — the switch succeeded.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// Put every captured key back to its pre-capture value.
+    pub fn rollback(&self) {
+        // SAFETY: same contract as `apply_env` — single-threaded startup or
+        // interactive command handling, touching only aish's own hint vars.
+        unsafe {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for LocalEnvGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.rollback();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Selection validation (F4)
+// ---------------------------------------------------------------------------
+
+/// Can this selection ever be resolved to weights?
+///
+/// True when it carries an explicit `model_path`, a non-empty `hf_repo`, or a
+/// `model_id` that maps to a curated tier. A selection failing this check is
+/// unusable: it only explodes later, at first inference, with
+/// "no Hugging Face repo is known for local model '…'".
+#[allow(dead_code)] // consumed on the `local`-feature path and in tests.
+pub fn selection_is_resolvable(sel: &Selection) -> bool {
+    if sel
+        .model_path
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty())
+    {
+        return true;
+    }
+    if !sel.hf_repo.trim().is_empty() {
+        return true;
+    }
+    repo_and_quant_for(sel.model_id.trim()).is_some()
+}
+
+/// Warning text for an unmappable selection — named so tests and callers share
+/// one wording.
+#[allow(dead_code)]
+pub fn unresolvable_selection_warning(sel: &Selection) -> String {
+    format!(
+        "aish: warning: local model '{}' maps to no known Hugging Face repo; \
+         it will not load. Pin a GGUF with AISH_LOCAL_MODEL_PATH=/abs/path/model.gguf, \
+         or run ':model-detect' to pick a supported model. (not persisted)",
+        sel.model_id
+    )
 }
 
 /// One-line confirmation, e.g.
@@ -831,5 +945,140 @@ mod tests {
             ..detected
         };
         assert!(short_line(&pinned).contains("operator-pinned"));
+    }
+
+    // -- F4: selection validation ------------------------------------------
+
+    fn sel_with(model_id: &str, hf_repo: &str, model_path: Option<&str>) -> Selection {
+        Selection {
+            model_id: model_id.into(),
+            model_path: model_path.map(|p| p.to_string()),
+            quant: String::new(),
+            source: SelectionSource::Operator,
+            detected_at: 0,
+            budget_mb: 0,
+            profile_summary: "operator-pinned".into(),
+            params: String::new(),
+            hf_repo: hf_repo.into(),
+            approx_size_mb: 0,
+        }
+    }
+
+    #[test]
+    fn resolvable_when_curated_tier_id() {
+        // Every curated tier id must map, otherwise auto-detection itself
+        // would produce unusable selections.
+        for t in TIERS {
+            assert!(
+                selection_is_resolvable(&sel_with(t.model_id, "", None)),
+                "curated tier {} must be resolvable",
+                t.model_id
+            );
+        }
+    }
+
+    #[test]
+    fn resolvable_when_hf_repo_or_path_present() {
+        assert!(selection_is_resolvable(&sel_with(
+            "something-custom",
+            "bartowski/Whatever-GGUF",
+            None
+        )));
+        assert!(selection_is_resolvable(&sel_with(
+            "something-custom",
+            "",
+            Some("/abs/path/model.gguf")
+        )));
+    }
+
+    #[test]
+    fn unresolvable_when_unmapped_id_only() {
+        // The reported bug: a hallucinated repo id with no mapping and no pin.
+        let sel = sel_with("bartowski/Qwen3.8-27B-GGUF", "", None);
+        assert!(!selection_is_resolvable(&sel));
+        // Blank / whitespace-only hints do not count as present.
+        assert!(!selection_is_resolvable(&sel_with("nope", "   ", Some("  "))));
+        let warn = unresolvable_selection_warning(&sel);
+        assert!(warn.contains("bartowski/Qwen3.8-27B-GGUF"));
+        assert!(warn.contains("AISH_LOCAL_MODEL_PATH"));
+        assert!(warn.contains("not persisted"));
+    }
+
+    // -- F2: env rollback guard --------------------------------------------
+
+    /// Restore an explicit key set after a test so parallel tests stay clean.
+    fn set_or_clear(key: &str, val: Option<&str>) {
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn env_guard_rolls_back_on_drop() {
+        let had = "AISH_TEST_GUARD_HAD";
+        let absent = "AISH_TEST_GUARD_ABSENT";
+        set_or_clear(had, Some("before"));
+        set_or_clear(absent, None);
+
+        {
+            let _g = LocalEnvGuard::capture_keys(&[had, absent]);
+            set_or_clear(had, Some("after"));
+            set_or_clear(absent, Some("after"));
+            assert_eq!(std::env::var(had).as_deref(), Ok("after"));
+            // dropped without commit → failed switch
+        }
+
+        assert_eq!(
+            std::env::var(had).as_deref(),
+            Ok("before"),
+            "pre-existing value must be restored"
+        );
+        assert!(
+            std::env::var(absent).is_err(),
+            "a key absent before the switch must be removed again"
+        );
+        set_or_clear(had, None);
+    }
+
+    #[test]
+    fn env_guard_commit_keeps_new_values() {
+        let key = "AISH_TEST_GUARD_COMMIT";
+        set_or_clear(key, Some("before"));
+        {
+            let g = LocalEnvGuard::capture_keys(&[key]);
+            set_or_clear(key, Some("after"));
+            g.commit();
+        }
+        assert_eq!(
+            std::env::var(key).as_deref(),
+            Ok("after"),
+            "a committed switch keeps the applied hints"
+        );
+        set_or_clear(key, None);
+    }
+
+    #[test]
+    fn env_guard_explicit_rollback_is_idempotent() {
+        let key = "AISH_TEST_GUARD_IDEMPOTENT";
+        set_or_clear(key, Some("before"));
+        let g = LocalEnvGuard::capture_keys(&[key]);
+        set_or_clear(key, Some("after"));
+        g.rollback();
+        assert_eq!(std::env::var(key).as_deref(), Ok("before"));
+        g.rollback();
+        assert_eq!(std::env::var(key).as_deref(), Ok("before"));
+        drop(g); // drop after an explicit rollback must not resurrect anything
+        assert_eq!(std::env::var(key).as_deref(), Ok("before"));
+        set_or_clear(key, None);
+    }
+
+    #[test]
+    fn local_env_keys_cover_apply_env() {
+        // apply_env writes exactly these; if it grows a key the guard must too.
+        assert!(LOCAL_ENV_KEYS.contains(&"AISH_LOCAL_MODEL_ID"));
+        assert!(LOCAL_ENV_KEYS.contains(&"AISH_LOCAL_MODEL_PATH"));
     }
 }
