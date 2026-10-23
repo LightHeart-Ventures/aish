@@ -77,6 +77,7 @@ use crate::backend::Backend;
 use crate::control::{ControlChannel, ControlSignal};
 use crate::db::CoordinatorStore;
 use crate::session::Session;
+use crate::subwork::{SubWorkLedger, SUBWORK_DECOMPOSITION};
 use crate::tools;
 
 /// Reassess directive folded into the next round when an operator interrupt
@@ -962,6 +963,14 @@ pub async fn drive(
     // increments THIS counter instead of auto_recoveries; it has its own
     // higher cap (MAX_SERIAL_CHAIN_RECOVERIES). See loopguard.rs for rationale.
     let mut serial_chain_recoveries = 0usize;
+    // Sub-work decomposition ledger (TASK-311). A dispatched worker may split its
+    // assigned task into AT MOST `subwork::MAX_SUBWORK_ITEMS` sub-items that all run
+    // in THIS worktree (`session.cwd`) — no per-item worktrees or branches. The
+    // ledger parses the declarations/status updates out of each round's synthesis,
+    // emits a running progress summary as statuses change, and appends a
+    // verification block to the final answer so a failed or unfinished sub-item is
+    // never silently reported as done.
+    let mut subwork = SubWorkLedger::new(&session.cwd);
     // Read the round cap once per run so a single env value governs the whole
     // loop (a mid-run env change can't move the goalposts under us).
     let round_cap = max_rounds();
@@ -1026,7 +1035,7 @@ feature branch (you are typically already on a dedicated work branch — commit 
 or push the default branch), push it, and open a DRAFT pull request with `gh pr create --draft --fill` \
 (pass `--title`/`--body` when `--fill` cannot infer them). Put the PR URL in your final answer. If there \
 are no committable changes, or `gh`/the remote is unavailable, skip the PR and report the branch name \
-plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n{PHASE_PIPELINE}\n\n{CODE_INTEL_DISCOVERY}\n\nTASK:\n{input}",
+plus `git status` instead — do not fail the run over it.\n\n{PHASE0_GUARD}\n\n{PHASE_PIPELINE}\n\n{SUBWORK_DECOMPOSITION}\n\n{CODE_INTEL_DISCOVERY}\n\nTASK:\n{input}",
         cwd = session.cwd.display(),
     );
 
@@ -1269,6 +1278,9 @@ final status plus your best partial result. After this turn you are terminated."
             if let Some(w) = session.worker_transcript.as_mut() {
                 w.record_message("assistant", "synthesis", &answer);
             }
+            // Stand-down wrap-up still gets the sub-work verification block: a run
+            // told to stop must not report unfinished sub-items as done (TASK-311).
+            let answer = subwork.finalize(answer);
             persist_terminal(store, run_id, Phase::Done, Some(&answer), None, session);
             finalize_worker_store(run_id, "done", Some(&answer));
             return Outcome {
@@ -1359,6 +1371,19 @@ final status plus your best partial result. After this turn you are terminated."
         // place and the run proceeds untouched.
         if let Some(t) = session.activity.as_mut() {
             t.refresh_round(rounds as u64, &answer).await;
+        }
+
+        // ── Sub-work ledger (TASK-311): ingest this round's SUBWORK declarations
+        // and status updates, then stream a progress summary the moment anything
+        // CHANGED. Emitting per-change (rather than only at the end) is the whole
+        // point — an operator tailing the worker sees sub-item effort as it lands.
+        // Pure parsing over text already in hand: no extra model call, no I/O.
+        subwork.ingest(&answer);
+        if let Some(progress) = subwork.progress_if_changed() {
+            eprintln!("{progress}");
+            if let Some(w) = session.worker_transcript.as_mut() {
+                w.record_message("assistant", "subwork-progress", &progress);
+            }
         }
 
         // ── Worker-exit evaluation: did this round's turn end abnormally? The
@@ -1504,7 +1529,10 @@ delivered above). Fold them into your work: continue the task, or give the final
             continue;
         }
 
-        // No pending sub-work, no pending messages → done.
+        // No pending sub-work, no pending messages → done. Append the sub-work
+        // verification block (TASK-311) so the final answer carries a per-item
+        // pass/fail roll-up rather than an unchecked "all done".
+        let answer = subwork.finalize(answer);
         persist_terminal(store, run_id, Phase::Done, Some(&answer), None, session);
         finalize_worker_store(run_id, "done", Some(&answer));
         return Outcome {

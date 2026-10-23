@@ -92,6 +92,7 @@ mod schedule;
 mod stream_cancel;
 mod stream_render;
 mod style;
+mod subwork;
 mod suggest;
 mod terminal;
 mod tool_telemetry;
