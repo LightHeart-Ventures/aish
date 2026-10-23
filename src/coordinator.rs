@@ -77,7 +77,7 @@ use crate::backend::Backend;
 use crate::control::{ControlChannel, ControlSignal};
 use crate::db::CoordinatorStore;
 use crate::session::Session;
-use crate::subwork::{SubWorkLedger, SUBWORK_DECOMPOSITION};
+use crate::subwork::{SUBWORK_DECOMPOSITION, SubWorkLedger};
 use crate::tools;
 
 /// Reassess directive folded into the next round when an operator interrupt
@@ -1380,7 +1380,27 @@ final status plus your best partial result. After this turn you are terminated."
         // Pure parsing over text already in hand: no extra model call, no I/O.
         subwork.ingest(&answer);
         if let Some(progress) = subwork.progress_if_changed() {
-            eprintln!("{progress}");
+            // Emit on the ALWAYS-SURFACED `📣` console channel, NOT plain stderr.
+            // Plain stderr from a coordinator is filtered by
+            // `worker::forward_decision`, which gates it behind `:worker-output`
+            // — a toggle that is OFF by default. So the ledger this feature
+            // computes was, in the default configuration, computed and then
+            // thrown away: the operator could not see the decomposition happen,
+            // which is the entire point of streaming it per-change.
+            //
+            // The `progress_if_changed()` guard above still fires at most once
+            // per actual ledger CHANGE (never per round), so promoting the
+            // channel buys visibility without buying per-round spam.
+            //
+            // Nested-only: `session.nested` means a parent shell is reading our
+            // stderr and will frame the sentinel. In a non-nested drive nobody
+            // decodes `📣`, so a raw sentinel would just be litter on the TTY —
+            // fall back to the plain line there.
+            if session.nested {
+                crate::worker::emit_console_note(&progress);
+            } else {
+                eprintln!("{progress}");
+            }
             if let Some(w) = session.worker_transcript.as_mut() {
                 w.record_message("assistant", "subwork-progress", &progress);
             }

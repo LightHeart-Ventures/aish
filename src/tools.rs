@@ -3892,7 +3892,7 @@ tier:\"interactive\" (or omit `tier`) to use a sub-coordinator instead",
             )
         })?;
 
-        let _id = crate::batch::spawn(
+        let id = crate::batch::spawn(
             &session.batch_jobs,
             task.to_string(),
             session.batch_model.clone(),
@@ -3901,6 +3901,18 @@ tier:\"interactive\" (or omit `tier`) to use a sub-coordinator instead",
             session.session_id.clone(),
             session.name.clone(),
         );
+        // PUSH the fan-out to the operator the moment it happens. We are nested
+        // by construction on this branch, so the interactive shell is NOT the
+        // one starting this work and prints no launch notice of its own — without
+        // this line the batch job's existence is discoverable only by polling
+        // `:workers` / `background_status` after the fact.
+        crate::worker::emit_console_note(&fan_out_note(
+            &format!(
+                "queued sub-work on the batch tier ({})",
+                crate::batch::short_id(&id)
+            ),
+            task,
+        ));
         return Ok(
             "Queued in the background (batch tier). The result auto-delivers here when done; if \
 your context is compacted before you consume it, retrieve it deterministically with \
@@ -3933,6 +3945,14 @@ short, natural sentence that you're working on it and the answer will appear her
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                // Nested by construction on this branch. Name the SPOOL REQUEST
+                // rather than a worker id: the host hasn't launched the sibling
+                // yet, so no run id exists to report, and claiming one would be
+                // fabrication.
+                crate::worker::emit_console_note(&fan_out_note(
+                    &format!("spooled a sibling spawn request ({fname})"),
+                    task,
+                ));
                 return Ok(format!(
                     "Queued a background coordinator via the host spawn-broker (flat sibling; full \
 toolset + MCP in this directory). The host launches it and its result auto-delivers here when it's \
@@ -4010,6 +4030,16 @@ sentence that you're on it and the answer will appear when ready."
     };
     let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
     let short = crate::batch::short_id(&id);
+    // Announce the fan-out, but ONLY when we are nested. A top-level call is the
+    // interactive shell starting a worker on the operator's own instruction, and
+    // it already prints its own launch notice (see `escalation.rs`) — a second
+    // line here would just duplicate it on screen.
+    if session.nested {
+        crate::worker::emit_console_note(&fan_out_note(
+            &format!("spawned sub-worker {short}"),
+            task,
+        ));
+    }
     Ok(format!(
         "Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \
 sub-work out on its own). The result auto-delivers here when it's done — do NOT poll for it. If your \
@@ -4218,14 +4248,58 @@ interactive session has no parent console to message"
     // lines. (Previously we emitted one sentinel per physical line, which
     // repeated the 📣 [label] prefix on every line of a multi-line note.)
     // An out-of-band note is still model- and transcript-visible: scrub it.
-    let message = crate::redact::scrub(message);
-    let encoded = message
-        .lines()
-        .collect::<Vec<_>>()
-        .join(&crate::worker::CONSOLE_LINE_SEP.to_string());
-    eprintln!("📣 {encoded}");
+    // Scrub + fold + write the sentinel via the ONE shared encoder
+    // (`worker::emit_console_note`) rather than re-implementing it here. The
+    // ledger site in `coordinator::drive` had its own (gated, plain-stderr)
+    // emit and the two drifted; a single helper makes that class of drift
+    // impossible.
+    crate::worker::emit_console_note(message);
     Ok("delivered to the operator's console".into())
 }
+
+/// Build the one-line fan-out announcement a NESTED coordinator posts to the
+/// operator's console the instant it starts sub-work. Pure, so the wording is
+/// unit-testable; the emit is a thin [`crate::worker::emit_console_note`] call
+/// at each spawn site.
+///
+/// Why this exists: all three `run_in_background` spawn paths used to return a
+/// string to the MODEL and nothing else, so the only way an operator could
+/// learn a worker had fanned out was to PULL (`:workers`, `background_status`).
+/// Sub-workers appeared out of nowhere in a later listing with no record of
+/// when — or by whom — they were started.
+///
+/// `what` names the thing that was started (e.g. `spawned sub-worker w_1234abcd`)
+/// and `task` is the brief. Only the first NON-BLANK line of the brief is used,
+/// truncated to [`FAN_OUT_TASK_CHARS`]: the console channel is an out-of-band
+/// interjection shown over the operator's live prompt, not a log — dumping a
+/// multi-paragraph brief there would bury what they were reading.
+///
+/// The brief is scrubbed HERE, before truncation, even though
+/// `emit_console_note` scrubs again downstream (scrubbing is idempotent). A
+/// brief routinely quotes credentials; truncating first could slice a secret in
+/// half and leave the prefix unmatched by the scrubber's patterns.
+pub(crate) fn fan_out_note(what: &str, task: &str) -> String {
+    let scrubbed = crate::redact::scrub(task);
+    let first = scrubbed
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut head: String = first.chars().take(FAN_OUT_TASK_CHARS).collect();
+    if first.chars().count() > FAN_OUT_TASK_CHARS {
+        head.push('…');
+    }
+    if head.is_empty() {
+        format!("fan-out: {what}")
+    } else {
+        format!("fan-out: {what} — {head}")
+    }
+}
+
+/// How much of a fan-out brief survives into the console note. ~80 chars is one
+/// terminal line's worth after the `📣 [label] fan-out: …` framing — enough to
+/// recognise the sub-work, short enough not to scroll the operator's prompt.
+const FAN_OUT_TASK_CHARS: usize = 80;
 
 /// Which source represents a worker in the status table when the in-memory
 /// handle and the durable row disagree.
@@ -6641,6 +6715,56 @@ fn char_ceil(s: &str, mut i: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    // ── Nested fan-out announcements ───────────────────────────────────────
+    //
+    // The wording is a pure function precisely so it can be pinned here; the
+    // emit is a thin `worker::emit_console_note` wrapper with nothing to assert.
+
+    #[test]
+    fn fan_out_note_formats_the_spawn_announcement() {
+        assert_eq!(
+            super::fan_out_note("spawned sub-worker w_1234abcd", "Audit the billing module"),
+            "fan-out: spawned sub-worker w_1234abcd — Audit the billing module"
+        );
+    }
+
+    #[test]
+    fn fan_out_note_uses_the_first_nonblank_line_and_truncates() {
+        let brief = "\n   \nSummarize every single open pull request in the repository and rank \
+them by review age\nthen file a report";
+        let note = super::fan_out_note("spawned sub-worker w_beefcafe", brief);
+        // Only the first non-blank line survives: a multi-paragraph brief would
+        // bury whatever the operator was reading under their live prompt.
+        assert!(!note.contains("then file a report"), "{note}");
+        assert!(note.ends_with('…'), "long brief must be elided: {note}");
+        // `fan-out: <what> — ` framing plus exactly the truncation budget + ellipsis.
+        let head = note.split_once(" — ").expect("framing present").1;
+        assert_eq!(head.chars().count(), super::FAN_OUT_TASK_CHARS + 1);
+    }
+
+    #[test]
+    fn fan_out_note_drops_the_dash_when_the_brief_is_empty() {
+        let note = super::fan_out_note("queued sub-work on the batch tier (b_00ff11)", "   \n\n");
+        assert_eq!(
+            note,
+            "fan-out: queued sub-work on the batch tier (b_00ff11)"
+        );
+    }
+
+    #[test]
+    fn fan_out_note_scrubs_the_brief_before_truncating() {
+        // Scrub-then-truncate, never the reverse: truncating first can slice a
+        // secret in half and leave the prefix unmatched by the patterns.
+        let note = super::fan_out_note(
+            "spawned sub-worker w_0badc0de",
+            "deploy with sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx0123",
+        );
+        assert!(
+            !note.contains("sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx0123"),
+            "secret survived the fan-out note: {note}"
+        );
+    }
+
     // FIX D — the recursion cap must never stamp a tier the child cannot reach.
     // With a metered key the cheap batch path is still the right cap; without one
     // (subscription auth) `batch` is unreachable, so the cap degrades to

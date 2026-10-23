@@ -1235,6 +1235,53 @@ pub fn console_row(label: &str, text: &str) -> String {
 /// decodes it back into aligned continuation lines.
 pub const CONSOLE_LINE_SEP: char = '\u{2028}';
 
+/// Encode a (possibly multi-line) note into the single-line payload the `📣`
+/// sentinel transport requires. Pure, so the encoding is unit-testable without a
+/// live pipe; the side effect lives in [`emit_console_note`].
+///
+/// Two things happen here and BOTH are load-bearing:
+///
+/// 1. The note is scrubbed. The console channel deliberately bypasses the
+///    `:worker-output` gate, so an unscrubbed note is printed to the operator's
+///    terminal AND captured in a transcript no matter what the operator
+///    toggled — it is the one output path where "nobody was looking" is never a
+///    valid excuse for leaking a token out of a task brief or a command line.
+/// 2. Physical newlines are folded onto [`CONSOLE_LINE_SEP`]. Without the fold
+///    the newline-delimited stderr transport splits the note into N sentinel
+///    lines and the parent frames the 📣 `[label]` prefix N times — the exact
+///    repeated-prefix bug [`console_row`] exists to prevent.
+///
+/// Scrubbing runs BEFORE the fold so a secret that straddles a newline is still
+/// matched as the single string the scrubber expects.
+pub fn encode_console_note(text: &str) -> String {
+    let scrubbed = crate::redact::scrub(text);
+    scrubbed
+        .lines()
+        .collect::<Vec<_>>()
+        .join(&CONSOLE_LINE_SEP.to_string())
+}
+
+/// Emit a note on the ALWAYS-SURFACED console channel: a `📣` sentinel line on
+/// this coordinator's stderr, which the parent's [`stream_stderr`] forwards
+/// unconditionally (framed by [`console_row`]) instead of running it through
+/// [`forward_decision`]'s `:worker-output` gate.
+///
+/// This is the ONE place the sentinel is written. Every producer — the
+/// `message_console` tool, the coordinator's sub-work ledger, the nested fan-out
+/// announcements — goes through here, so the encoding can never drift between
+/// call sites (it already had: the ledger used a plain `eprintln!`, which the
+/// gate silently swallowed by default, making the whole feature invisible).
+///
+/// Silently drops an empty note: a bare `📣` with no text is parsed as `None` by
+/// `console_message` anyway, so emitting one is pure noise on the wire.
+pub fn emit_console_note(text: &str) {
+    let encoded = encode_console_note(text);
+    if encoded.trim().is_empty() {
+        return;
+    }
+    eprintln!("📣 {encoded}");
+}
+
 /// Stream a child's stderr line by line, forwarding the interesting lines to the
 /// user's terminal live via `announce`, and retaining only the last
 /// `STDERR_TAIL_LINES` raw lines as a bounded ring for the failure message.
@@ -4658,6 +4705,58 @@ fn flush_results(jobs: &WorkerJobs) {
 
 #[cfg(test)]
 mod tests {
+    // ── Console-note encoder (the 📣 sentinel transport) ────────────────────
+    //
+    // The encoder is the one piece of the always-surfaced channel that can be
+    // tested without a live pipe, and it is the piece that broke before: the
+    // sub-work ledger hand-rolled a plain `eprintln!` instead of this, and the
+    // `:worker-output` gate silently swallowed it. These lock the contract the
+    // transport depends on.
+
+    #[test]
+    fn console_note_folds_a_multiline_note_onto_one_line() {
+        let encoded = super::encode_console_note("first line\nsecond line\nthird");
+        // One physical line on the wire: `next_line` must not split the note, or
+        // the parent frames the 📣 [label] prefix once per physical line.
+        assert!(
+            !encoded.contains('\n'),
+            "encoded note must contain no newline: {encoded:?}"
+        );
+        assert_eq!(
+            encoded.matches(super::CONSOLE_LINE_SEP).count(),
+            2,
+            "two joins for three lines: {encoded:?}"
+        );
+        assert_eq!(
+            encoded,
+            format!(
+                "first line{sep}second line{sep}third",
+                sep = super::CONSOLE_LINE_SEP
+            )
+        );
+    }
+
+    #[test]
+    fn console_note_leaves_a_single_line_untouched() {
+        let encoded = super::encode_console_note("just one line");
+        assert_eq!(encoded, "just one line");
+        assert!(!encoded.contains(super::CONSOLE_LINE_SEP));
+    }
+
+    #[test]
+    fn console_note_scrubs_secrets() {
+        // The console channel BYPASSES the `:worker-output` gate, so an
+        // unscrubbed note reaches the operator's terminal and the transcript no
+        // matter what they toggled — scrubbing here is not optional.
+        let encoded =
+            super::encode_console_note("token sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx0123 leaked");
+        assert!(
+            !encoded.contains("sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx0123"),
+            "secret survived the encoder: {encoded:?}"
+        );
+        assert!(encoded.starts_with("token "), "{encoded:?}");
+    }
+
     /// The reported operator-visible failure text, verbatim (gutter included).
     const BUDGET_FAILURE: &str = "aish: turn stopped [call-budget-exceeded]: yielded after 52 tool \
 calls this turn (per-turn hard budget) to spread load across the rate-limit window and ┃ resume \
