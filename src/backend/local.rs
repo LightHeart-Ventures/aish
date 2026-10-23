@@ -68,6 +68,8 @@ impl LocalBackend {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        // Must precede `init()`: the Metal device probe logs during that call.
+        super::llama_log::init_backend_logging();
         let backend = LlamaBackend::init().context("failed to initialize llama.cpp backend")?;
 
         Ok(Self {

@@ -1,5 +1,9 @@
 pub mod claude;
 pub mod grok;
+/// Quiet-by-default routing for llama.cpp/ggml startup logs. Compiled in the
+/// default build too (not just `--features local`) so its unit tests run in CI
+/// without the llama.cpp toolchain.
+pub mod llama_log;
 #[cfg(feature = "local")]
 pub mod local;
 /// Pure prompt-batching planner for the local backend. Compiled in the default
