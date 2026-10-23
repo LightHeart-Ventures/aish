@@ -160,8 +160,96 @@ fn resolve_repo_quant(sel: Option<&Selection>, model_id: &str) -> Result<(String
     }
     Err(anyhow!(
         "no Hugging Face repo is known for local model '{model_id}'. Download a GGUF \
-         manually and pin it with AISH_LOCAL_MODEL_PATH=/abs/path/model.gguf"
+         manually and pin it with AISH_LOCAL_MODEL_PATH=/abs/path/model.gguf. \
+         {LOCAL_RECOVERY_HINT}"
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Preflight (cheap, NON-network) — validate a local selection before any
+// device init or backend swap. See `crate::repl::prepare_local_backend`.
+// ---------------------------------------------------------------------------
+
+/// Appended to every local-model resolution failure so a stranded operator has
+/// a way back to a working backend instead of a dead session.
+pub const LOCAL_RECOVERY_HINT: &str =
+    "To get working again now: ':backend claude' (or grok/openai/openrouter). \
+     To re-pick a local model: ':model-detect'.";
+
+/// What a successful [`preflight_local_model`] resolved the selection to.
+///
+/// Deliberately does NOT touch the network or the GPU: it proves the *mapping*
+/// (or the operator's pin) is sound, not that the weights are already on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalModelPlan {
+    /// An explicit GGUF file that exists right now (operator pin, or a
+    /// previously-downloaded file recorded on the selection).
+    PinnedFile(PathBuf),
+    /// Weights are downloadable: a `(repo, quant)` mapping is known.
+    Repo { repo: String, quant: String },
+}
+
+impl LocalModelPlan {
+    /// One-line human description for logs / success lines.
+    pub fn describe(&self) -> String {
+        match self {
+            LocalModelPlan::PinnedFile(p) => p.display().to_string(),
+            LocalModelPlan::Repo { repo, quant } => format!("{repo} ({quant})"),
+        }
+    }
+}
+
+/// Cheap, **non-network** preflight for a local-model selection.
+///
+/// Returns `Ok` when the model can plausibly be loaded later:
+/// * an explicit pin (`pin`, i.e. `AISH_LOCAL_MODEL_PATH`, or the selection's
+///   recorded `model_path`) that exists as a file, or
+/// * a known `(hf_repo, quant)` mapping for the selected `model_id`.
+///
+/// Returns `Err` — with a recovery hint — when the pin is missing from disk or
+/// the `model_id` maps to nothing. No bytes are downloaded and no GPU/Metal
+/// device is touched; this is what lets `:backend local` fail *before* it
+/// commits the switch (see findings F1/F3).
+pub fn preflight_local_model(sel: Option<&Selection>, pin: Option<&str>) -> Result<LocalModelPlan> {
+    // (1) An explicit pin is authoritative — and must already exist.
+    let pinned = pin
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            sel.and_then(|s| s.model_path.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+    if let Some(p) = pinned {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Ok(LocalModelPlan::PinnedFile(pb));
+        }
+        // A stale `model_path` on the selection is recoverable (re-download);
+        // a bad operator pin is not — only hard-fail on the explicit pin.
+        if pin.map(str::trim).is_some_and(|s| !s.is_empty()) {
+            return Err(anyhow!(
+                "pinned local model file not found: {p} (AISH_LOCAL_MODEL_PATH). \
+                 {LOCAL_RECOVERY_HINT}"
+            ));
+        }
+    }
+
+    // (2) Otherwise the (repo, quant) mapping must be known.
+    let model_id = sel
+        .map(|s| s.model_id.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::hwdetect::DEFAULT_MODEL_ID.to_string());
+    let (repo, quant) = resolve_repo_quant(sel, &model_id)?;
+    Ok(LocalModelPlan::Repo { repo, quant })
+}
+
+/// [`preflight_local_model`] against the live `AISH_LOCAL_MODEL_PATH` pin.
+pub fn preflight_selection(sel: &Selection) -> Result<LocalModelPlan> {
+    let pin = std::env::var("AISH_LOCAL_MODEL_PATH").ok();
+    preflight_local_model(Some(sel), pin.as_deref())
 }
 
 /// `~/.aish/models` — the on-disk GGUF cache root.
@@ -639,6 +727,106 @@ fn fmt_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- preflight (F1 / F3 / F4) -------------------------------------
+
+    fn sel(model_id: &str, hf_repo: &str, model_path: Option<&str>) -> crate::hwdetect::Selection {
+        crate::hwdetect::Selection {
+            model_id: model_id.to_string(),
+            model_path: model_path.map(str::to_string),
+            quant: "Q4_K_M".to_string(),
+            source: crate::hwdetect::SelectionSource::Operator,
+            detected_at: 0,
+            budget_mb: 0,
+            profile_summary: String::new(),
+            params: String::new(),
+            hf_repo: hf_repo.to_string(),
+            approx_size_mb: 0,
+        }
+    }
+
+    /// A unique scratch path under the system temp dir (no tempfile dep).
+    fn scratch(name: &str) -> PathBuf {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("aish-preflight-{uniq}-{name}"))
+    }
+
+    #[test]
+    fn preflight_accepts_existing_operator_pin() {
+        let p = scratch("pin.gguf");
+        std::fs::write(&p, b"not really a gguf").unwrap();
+        let s = sel("whatever-unmappable", "", None);
+        let plan = preflight_local_model(Some(&s), Some(p.to_str().unwrap()))
+            .expect("existing pin should preflight even for an unmappable model_id");
+        assert_eq!(plan, LocalModelPlan::PinnedFile(p.clone()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn preflight_rejects_missing_pin_file() {
+        let p = scratch("absent.gguf");
+        let s = sel("qwen2.5-0.5b-instruct", "", None);
+        let err = preflight_local_model(Some(&s), Some(p.to_str().unwrap()))
+            .expect_err("a pin that does not exist must fail preflight");
+        let msg = err.to_string();
+        assert!(msg.contains("pinned local model file not found"), "{msg}");
+        // F5: every local failure carries a way back out.
+        assert!(msg.contains(":backend claude"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_rejects_unmappable_model_id() {
+        // The exact selection that stranded the session: not a real HF repo,
+        // no curated tier entry, empty hf_repo.
+        let s = sel("bartowski/Qwen3.8-27B-GGUF", "", None);
+        let err = preflight_local_model(Some(&s), None)
+            .expect_err("an unmappable model_id must fail preflight");
+        let msg = err.to_string();
+        assert!(msg.contains("no Hugging Face repo is known"), "{msg}");
+        assert!(msg.contains("AISH_LOCAL_MODEL_PATH"), "{msg}");
+        assert!(msg.contains(":backend claude"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_accepts_selection_hf_repo() {
+        let s = sel("some-custom-id", "acme/Custom-GGUF", None);
+        let plan = preflight_local_model(Some(&s), None).expect("explicit hf_repo resolves");
+        assert_eq!(
+            plan,
+            LocalModelPlan::Repo {
+                repo: "acme/Custom-GGUF".to_string(),
+                quant: "Q4_K_M".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_curated_tier_id() {
+        // No hf_repo on the selection — must fall back to the curated tier map.
+        let s = sel("qwen2.5-0.5b-instruct", "", None);
+        let plan = preflight_local_model(Some(&s), None).expect("curated tier id resolves");
+        match plan {
+            LocalModelPlan::Repo { repo, quant } => {
+                assert!(!repo.is_empty());
+                assert!(!quant.is_empty());
+            }
+            other => panic!("expected a repo plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_stale_selection_path_falls_back_to_mapping() {
+        // A recorded model_path that has since been deleted is recoverable by
+        // re-download, so it must NOT hard-fail when the mapping is known.
+        let gone = scratch("deleted.gguf");
+        let s = sel("qwen2.5-0.5b-instruct", "", Some(gone.to_str().unwrap()));
+        let plan = preflight_local_model(Some(&s), None)
+            .expect("stale selection path should fall through to the repo mapping");
+        assert!(matches!(plan, LocalModelPlan::Repo { .. }));
+    }
 
     #[test]
     fn models_dir_is_under_aish() {
