@@ -481,8 +481,14 @@ fn split_id(body: &str) -> (&str, &str) {
 }
 
 /// Case-insensitive `strip_prefix`.
+///
+/// Uses `str::get` rather than a raw byte-range index: slicing `s[..n]`
+/// panics when `n` lands inside a multi-byte UTF-8 char (e.g. the line
+/// `"Phase — kickoff"`, where an em dash occupies bytes 5..8 and
+/// `"SUBWORK".len()` is 7). `get` returns `None` on a non-boundary instead.
 fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    let head = s.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
         Some(&s[prefix.len()..])
     } else {
         None
@@ -515,6 +521,34 @@ mod tests {
         assert!(parse_directive("SUBWORK").is_none());
         assert!(parse_directive("SUBWORK MAYBE: x | y").is_none());
         assert!(parse_directive("we will split the subwork into pieces").is_none());
+    }
+
+    /// Regression: a line whose byte 7 lands INSIDE a multi-byte char used to
+    /// panic in `strip_ci` with
+    /// `end byte index 7 is not a char boundary; it is inside '—'`.
+    /// Every line of model output flows through `parse_directive`, so an em
+    /// dash after a five-char word was enough to kill the process.
+    #[test]
+    fn non_ascii_lines_do_not_panic_on_char_boundaries() {
+        // The exact shape from the crash report: em dash at bytes 5..8.
+        assert!(parse_directive("Phase — kickoff").is_none());
+        assert!(parse_directive("- Plan — split the work").is_none());
+        // Shorter-than-prefix and all-multibyte inputs.
+        assert!(parse_directive("—").is_none());
+        assert!(parse_directive("héllo").is_none());
+        assert!(parse_directive("日本語のテキストです").is_none());
+        assert!(parse_directive("“SUBWORK”").is_none());
+        // Every byte offset of a multi-byte char, exercised directly.
+        for pad in 0..12 {
+            let line = format!("{}—{}", "a".repeat(pad), "b".repeat(pad));
+            assert!(strip_ci(&line, "SUBWORK").is_none());
+            assert!(parse_directive(&line).is_none());
+        }
+        // And real directives with non-ASCII payloads still parse.
+        let d = parse_directive("SUBWORK DONE: parse-cap — café ✅").unwrap();
+        assert_eq!(d.id, "parse-cap");
+        assert_eq!(d.status, Some(SubWorkStatus::Done));
+        assert_eq!(d.text, "café ✅");
     }
 
     /// Requirement 1: the cap of 5 is enforced in CODE, not just in the prompt.
