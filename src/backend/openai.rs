@@ -264,7 +264,7 @@ impl OpenAiBackend {
                     let (status, parsed) = match super::read_status_and_json(r).await {
                         Ok(p) => p,
                         Err(e) if !last => {
-                            eprintln!(
+                            crate::status_eprintln!(
                                 "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
                             );
                             tokio::time::sleep(delay).await;
@@ -279,7 +279,7 @@ impl OpenAiBackend {
                         Ok(v) => v,
                         Err(snippet) => {
                             if !last {
-                                eprintln!(
+                                crate::status_eprintln!(
                                     "\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m"
                                 );
                                 tokio::time::sleep(delay).await;
@@ -306,7 +306,7 @@ impl OpenAiBackend {
                         .unwrap_or("error");
                     // Retry only what's retryable: rate limits (429) and 5xx.
                     if (status == 429 || status >= 500) && !last {
-                        eprintln!("\x1b[2m  api {kind} ({status}), retrying…\x1b[0m");
+                        crate::status_eprintln!("\x1b[2m  api {kind} ({status}), retrying…\x1b[0m");
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(MAX_DELAY);
                         continue;
@@ -322,7 +322,7 @@ impl OpenAiBackend {
                 }
                 // Transport-level error (connect reset, timeout, dns): transient.
                 Err(e) if !last => {
-                    eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
+                    crate::status_eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(MAX_DELAY);
                 }

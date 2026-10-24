@@ -166,14 +166,14 @@ impl LocalBackend {
         self.model
             .get_or_try_init(|| async {
                 let path = self.resolve_path().await?;
-                eprintln!("\x1b[2m  loading model from {}…\x1b[0m", path.display());
+                crate::status_eprintln!("\x1b[2m  loading model from {}…\x1b[0m", path.display());
 
                 let model_params = LlamaModelParams::default().with_n_gpu_layers(self.n_gpu_layers);
 
                 let model = LlamaModel::load_from_file(&self.backend, &path, &model_params)
                     .map_err(|e| anyhow!("failed to load local model: {e}"))?;
 
-                eprintln!("\x1b[2m  model ready\x1b[0m");
+                crate::status_eprintln!("\x1b[2m  model ready\x1b[0m");
                 // Leak the weights. The cached `LlamaContext` borrows the model
                 // and must outlive the turn that built it; a `&'static` model is
                 // what makes that sound. `LocalBackend` is process-scoped and the
@@ -246,7 +246,7 @@ impl LocalBackend {
             return Err(anyhow!("local backend: empty prompt, nothing to decode"));
         }
         if plan.trimmed() {
-            eprintln!(
+            crate::status_eprintln!(
                 "\x1b[2m  prompt trimmed: dropped {} of {} tokens to fit n_ctx={} (reserved {} for output)\x1b[0m",
                 plan.dropped,
                 plan.dropped + plan.kept,

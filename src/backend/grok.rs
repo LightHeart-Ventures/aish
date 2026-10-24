@@ -395,7 +395,7 @@ impl GrokBackend {
                     let (status, parsed) = match super::read_status_and_json(r).await {
                         Ok(p) => p,
                         Err(e) if !last => {
-                            eprintln!(
+                            crate::status_eprintln!(
                                 "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
                             );
                             tokio::time::sleep(delay).await;
@@ -408,7 +408,7 @@ impl GrokBackend {
                         Ok(v) => v,
                         Err(snippet) => {
                             if !last {
-                                eprintln!(
+                                crate::status_eprintln!(
                                     "\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m"
                                 );
                                 tokio::time::sleep(delay).await;
@@ -448,7 +448,7 @@ impl GrokBackend {
                         && !last
                         && matches!(self.auth, GrokAuth::OAuthFile(_))
                     {
-                        eprintln!("\x1b[2m  grok token expired — refreshing…\x1b[0m");
+                        crate::status_eprintln!("\x1b[2m  grok token expired — refreshing…\x1b[0m");
                         match self.auth.refresh(&self.client).await {
                             Ok(t) => {
                                 bearer = t;
@@ -460,7 +460,7 @@ impl GrokBackend {
                     }
                     // Retry only what's retryable: rate limits (429) and 5xx.
                     if (status == 429 || status >= 500) && !last {
-                        eprintln!("\x1b[2m  api {kind} ({status}), retrying…\x1b[0m");
+                        crate::status_eprintln!("\x1b[2m  api {kind} ({status}), retrying…\x1b[0m");
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(MAX_DELAY);
                         continue;
@@ -477,7 +477,7 @@ lack API access; re-run the Grok CLI to refresh ~/.grok/auth.json"
                 }
                 // Transport-level error (connect reset, timeout, dns): transient.
                 Err(e) if !last => {
-                    eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
+                    crate::status_eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(MAX_DELAY);
                 }
