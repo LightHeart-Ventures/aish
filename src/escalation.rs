@@ -111,6 +111,7 @@
 //! must only ever freeze its OWN row.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Footer rows ONE banner occupies: the escalation message and the worker-status
@@ -200,6 +201,15 @@ pub(crate) const RUNTIME_COL: usize = 8;
 /// seven fewer cells of indent on every other row in the tray.
 pub(crate) const STATE_COL: usize = 7;
 
+/// Separator painted between the STATE cell and the free-text MESSAGE cell.
+///
+/// The state column is padded to [`STATE_COL`], so without a glyph the lifecycle
+/// word and the summary read as one run of text with an accidental gap in it —
+/// `running   fanning out 3 reads`. A middot pins the boundary to a fixed column
+/// and matches the separator the worker list already joins status to activity
+/// with, so the tray reads as the same table.
+pub(crate) const CELL_SEP: &str = "·";
+
 /// Visible width of the status row's MESSAGE column: the free-text cell keeps
 /// the full [`STATUS_MAX`] budget it had before the row became a table, so
 /// adding the fixed columns never shortens an activity line.
@@ -273,6 +283,32 @@ fn now_unix_secs() -> i64 {
 /// Every live escalation, OLDEST FIRST (push order). Rendering reverses this so
 /// the newest escalation is the TOP banner — see [`rows`].
 static BANNERS: Mutex<Vec<Banner>> = Mutex::new(Vec::new());
+
+/// Set whenever a tracked row's PAINTED CONTENT changes — a new status line, a
+/// terminal verdict, a relabelled task.
+///
+/// The footer's heartbeat only repaints while something is animating, which is
+/// the right gate for a spinner but the wrong one for a CONTENT change: a tray
+/// of finished rows animates nothing, so a late `done → failed` flip (or a last
+/// status line landing after the animation stopped) would sit unpainted until
+/// the operator happened to press a key. This flag is that missing wake-up — the
+/// mutators raise it, the heartbeat consumes it with [`take_dirty`] and paints
+/// one frame.
+static DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Mark the tray as needing one repaint. Cheap and idempotent — many changes
+/// between two frames collapse into a single paint.
+fn mark_dirty() {
+    DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// Consume the dirty flag: `true` exactly once per batch of changes.
+///
+/// Called by the footer heartbeat alongside [`animating`]; the take-and-clear is
+/// what keeps an idle tray idle instead of repainting forever after one change.
+pub fn take_dirty() -> bool {
+    DIRTY.swap(false, Ordering::Relaxed)
+}
 
 /// Pin an escalation banner for coordinator `id` running `task`.
 ///
@@ -565,10 +601,71 @@ pub fn pinned_ids() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Which LIFECYCLE PHASE a tray row sorts into.
+///
+/// The tray groups before it sorts, because arrival order alone buries the row
+/// the operator needs: a still-`running` coordinator is the only row that can
+/// still change, a `failed` one is the only row that wants a decision, and a
+/// `done`/`starting` row is just bookkeeping. Grouping keeps each class
+/// together no matter when it launched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// Live work — a coordinator that is running (or coordinating / awaiting a
+    /// batch) and has not stamped a verdict.
+    Running,
+    /// Finished badly: a failed or stopped verdict, still dwelling.
+    Failed,
+    /// Finished well, still dwelling.
+    Done,
+    /// Not started yet: a queued line, or a pinned coordinator whose first
+    /// status has not arrived.
+    Starting,
+}
+
+impl Phase {
+    /// Sort rank, ASCENDING in paint order (0 paints at the TOP of the tray).
+    ///
+    /// Read bottom-up — the operator's eye starts at the row nearest the prompt
+    /// — this is `starting → done → failed → running`: the freshest, most
+    /// actionable work ends up furthest from the prompt only after the noise.
+    const fn rank(self) -> u8 {
+        match self {
+            Phase::Running => 0,
+            Phase::Failed => 1,
+            Phase::Done => 2,
+            Phase::Starting => 3,
+        }
+    }
+}
+
+/// Classify one banner for [`Phase`] grouping.
+///
+/// The stamped verdict wins when there is one (`terminal_at` is the authority on
+/// finished work), otherwise the lifecycle word from the composed status text
+/// decides. An unrecognised head is treated as live rather than as `Starting`:
+/// a row with a pinned coordinator behind it is something the operator is still
+/// waiting on, and mis-sorting it to the bottom would hide active work.
+fn phase(b: &Banner) -> Phase {
+    if b.kind == Kind::Queued {
+        return Phase::Starting;
+    }
+    if b.terminal_at.is_some() {
+        return if b.failed { Phase::Failed } else { Phase::Done };
+    }
+    match split_status(&b.status).0 {
+        "done" => Phase::Done,
+        "failed" | "stopped" => Phase::Failed,
+        "" | "queued" | "pending" => Phase::Starting,
+        _ => Phase::Running,
+    }
+}
+
 /// The tray's paint order: a depth-first FOREST over the parent links.
 ///
-/// Roots keep the tray's established newest-first ordering; each root is
-/// immediately followed by its sub-workers (also newest first), recursively.
+/// Roots are grouped by [`Phase`] — `running` first, then `failed`, `done` and
+/// `starting`, so reading UP from the prompt gives `starting → done → failed →
+/// running` — and stay newest-first WITHIN each group. Each root is immediately
+/// followed by its sub-workers (same grouping), recursively.
 /// Returns `(index, depth)` pairs so the caller can indent without re-walking
 /// the chain. A banner whose parent is no longer in the store sorts as a root.
 fn ordered_rows(banners: &[Banner]) -> Vec<(usize, usize)> {
@@ -577,8 +674,13 @@ fn ordered_rows(banners: &[Banner]) -> Vec<(usize, usize)> {
             .iter()
             .any(|b| b.kind == Kind::Escalation && b.id == id)
     };
-    // Newest first, matching the flat tray's historical order.
-    let newest_first: Vec<usize> = (0..banners.len()).rev().collect();
+    // Newest first (the flat tray's historical order), then grouped by
+    // lifecycle phase. The phase sort is STABLE, so newest-first survives
+    // inside each group — grouping re-ranks the classes, it does not reshuffle
+    // the rows within one.
+    let mut newest_first: Vec<usize> = (0..banners.len()).rev().collect();
+    newest_first.sort_by_key(|&i| phase(&banners[i]).rank());
+    let newest_first = newest_first;
     let children_of = |parent_id: &str| -> Vec<usize> {
         newest_first
             .iter()
@@ -636,7 +738,13 @@ pub fn set_status(id: &str, status: &str) {
             .iter_mut()
             .find(|b| b.kind == Kind::Escalation && b.id == id)
     {
-        b.status = status.to_string();
+        // Compare before storing: the REPL re-composes this row on EVERY footer
+        // paint, so an unconditional `mark_dirty` here would hold the flag high
+        // forever and turn the heartbeat's idle gate into a busy loop.
+        if b.status != status {
+            b.status = status.to_string();
+            mark_dirty();
+        }
     }
 }
 
@@ -662,8 +770,13 @@ pub fn set_task(id: &str, task: &str) {
         && let Some(b) = banners
             .iter_mut()
             .find(|b| b.kind == Kind::Escalation && b.id == id)
+        // Same compare-before-store rule as [`set_status`]: the refresh pass
+        // re-writes the title on every paint, so only a CHANGE may ask for a
+        // frame or the heartbeat never goes idle again.
+        && b.task != task
     {
         b.task = task.to_string();
+        mark_dirty();
     }
 }
 
@@ -692,8 +805,13 @@ pub fn note_terminal(id: &str, failed: bool) {
             .iter_mut()
             .find(|b| b.kind == Kind::Escalation && b.id == id)
     {
-        b.failed = failed;
-        b.terminal_at.get_or_insert_with(Instant::now);
+        // A verdict both freezes the glyph and re-ranks the row's [`Phase`], so
+        // the tray has to repaint even though nothing is animating any more.
+        if b.terminal_at.is_none() {
+            b.failed = failed;
+            b.terminal_at = Some(Instant::now());
+            mark_dirty();
+        }
     }
 }
 
@@ -834,9 +952,19 @@ pub(crate) fn split_status(status: &str) -> (&str, &str) {
 ///
 /// Shared by [`render`] and [`render_queued`] so a live banner and a queued line
 /// line up with each other, not just with their own kind.
+///
+/// The [`CELL_SEP`] middot pins the state/message boundary — but only when there
+/// IS a state to bound. An unrecognised status head leaves the state cell empty
+/// (see [`split_status`]), and a separator hanging off an empty column is noise,
+/// so it degrades to a space of the same width and the message column stays put.
 fn status_cells(elapsed_ms: u64, state: &str, message: &str) -> String {
+    let sep = if state.trim().is_empty() {
+        " "
+    } else {
+        CELL_SEP
+    };
     format!(
-        "{} {} {}",
+        "{} {} {sep} {}",
         col(&fmt_elapsed(elapsed_ms), RUNTIME_COL),
         col(state, STATE_COL),
         one_line(message, MESSAGE_COL)
@@ -1336,7 +1464,7 @@ mod tests {
         // The status row is indented under the message, led by one heart, with
         // runtime and state each in a fixed cell so every banner's message
         // column starts at the same screen position.
-        assert_eq!(bottom, "   ♥ 0s       coordi… 1m12s", "{bottom}");
+        assert_eq!(bottom, "   ♥ 0s       coordi… · 1m12s", "{bottom}");
     }
 
     #[test]
@@ -1390,9 +1518,9 @@ mod tests {
         assert!(bottom.contains('…'), "{bottom}");
         // The fixed columns add their own width on top of the message budget,
         // so the row's ceiling is the message cell plus the two cells, their
-        // gutters, and the indent+indicator.
+        // gutters, the state/message separator cell, and the indent+indicator.
         assert!(
-            bottom.chars().count() <= MESSAGE_COL + RUNTIME_COL + STATE_COL + 8,
+            bottom.chars().count() <= MESSAGE_COL + RUNTIME_COL + STATE_COL + 10,
             "{bottom}"
         );
     }
@@ -1418,7 +1546,7 @@ mod tests {
 
         set_status("w_deadbeefcafe", "coordinating · 12s · 🔧 read_file");
         let (_, bottom) = rows(false, MAX_VISIBLE).remove(0);
-        assert!(bottom.contains("coordi… 12s"), "{bottom}");
+        assert!(bottom.contains("coordi… · 12s"), "{bottom}");
 
         clear();
         assert!(!active());
@@ -1498,6 +1626,89 @@ mod tests {
         assert!(painted[1].0.starts_with("⚠️"), "{:?}", painted[1].0);
         assert!(!painted[0].0.starts_with("⚠️"), "{:?}", painted[0].0);
         assert!(animating(), "the unfinished sibling must still animate");
+        clear();
+    }
+
+    #[test]
+    fn tray_groups_rows_by_phase_and_keeps_newest_first_inside_a_group() {
+        // Read bottom-up from the prompt the tray must go `starting → done →
+        // failed → running`, so in PAINT order (top first) the live work leads
+        // and the not-yet-started bookkeeping trails. The tray paints at most
+        // MAX_VISIBLE rows, so the ordering is asserted in two passes that each
+        // fit under the cap.
+        let _g = lock();
+
+        // Pass 1: the three non-running phases, pinned in the WRONG order.
+        clear();
+        pin("w_start0000001", "starting task");
+        pin("w_done00000001", "done task");
+        set_status("w_done00000001", "done · wrapped up");
+        pin("w_fail00000001", "failed task");
+        set_status("w_fail00000001", "failed · blew up");
+        assert_eq!(
+            phase_order(&["failed task", "done task", "starting task"]),
+            vec!["failed task", "done task", "starting task"],
+        );
+
+        // Pass 2: running work outranks every other phase, and newest-first
+        // survives INSIDE the running group — the phase sort re-ranks classes,
+        // it does not reshuffle a class.
+        clear();
+        pin("w_fail00000001", "failed task");
+        set_status("w_fail00000001", "failed · blew up");
+        pin("w_runold000001", "older running task");
+        set_status("w_runold000001", "running · 🔧 read_file");
+        pin("w_runnew000001", "newer running task");
+        set_status("w_runnew000001", "coordinating · 🔧 grep_files");
+        assert_eq!(
+            phase_order(&["newer running task", "older running task", "failed task"]),
+            vec!["newer running task", "older running task", "failed task"],
+        );
+        clear();
+    }
+
+    /// Paint the tray and label each row by whichever of `tasks` it carries,
+    /// so a phase-ordering assertion reads as a list of task names.
+    fn phase_order(tasks: &[&'static str]) -> Vec<&'static str> {
+        rows(false, MAX_VISIBLE)
+            .iter()
+            .map(|(top, _)| {
+                tasks
+                    .iter()
+                    .copied()
+                    .find(|t| top.contains(t))
+                    .unwrap_or("?")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn content_changes_raise_the_repaint_flag_exactly_once() {
+        // The heartbeat only repaints while something ANIMATES, so a content
+        // change on a still tray needs this flag or it sits unpainted until the
+        // operator presses a key. Equally important: a no-op write must NOT
+        // raise it — the REPL re-composes every row on every paint, so a
+        // dirty-on-write would pin the flag high and busy-loop the heartbeat.
+        let _g = lock();
+        clear();
+        pin("w_dirty0000001", "task");
+        take_dirty();
+
+        set_status("w_dirty0000001", "running · 🔧 read_file");
+        assert!(take_dirty(), "a new status line must ask for a frame");
+        set_status("w_dirty0000001", "running · 🔧 read_file");
+        assert!(
+            !take_dirty(),
+            "re-composing the same status must stay quiet"
+        );
+
+        note_terminal("w_dirty0000001", true);
+        assert!(
+            take_dirty(),
+            "a verdict re-ranks the row, so it must repaint"
+        );
+        note_terminal("w_dirty0000001", true);
+        assert!(!take_dirty(), "a repeated verdict must stay quiet");
         clear();
     }
 
@@ -1602,7 +1813,7 @@ mod tests {
         );
         assert!(!bottom.contains('\u{1b}'), "{bottom:?}");
         assert!(
-            bottom.contains("running 🔧 read_file src/repl.rs"),
+            bottom.contains("running · 🔧 read_file src/repl.rs"),
             "{bottom}"
         );
     }
