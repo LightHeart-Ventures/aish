@@ -1356,9 +1356,14 @@ mod tests {
         // …but the summary survives, flush against the glyph (no dangling ` · `).
         assert!(top.contains("build and open pr"), "{top}");
         assert!(!top.contains(" ·  "), "{top}");
-        // Timer and status still ride the second row.
+        // Timer and status still ride the second row — the state lands in its
+        // own fixed cell, so compare against the CELL (clipped by STATE_COL)
+        // rather than the raw word.
         assert!(bottom.contains("1m12s"), "{bottom}");
-        assert!(bottom.contains("coordinating"), "{bottom}");
+        assert!(
+            bottom.contains(col("coordinating", STATE_COL).trim_end()),
+            "{bottom}"
+        );
     }
 
     #[test]
