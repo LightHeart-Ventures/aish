@@ -246,6 +246,22 @@ pub(crate) const CELL_SEP: &str = "·";
 /// adding the fixed columns never shortens an activity line.
 pub(crate) const MESSAGE_COL: usize = STATUS_MAX;
 
+/// Visible width of the status row's BEAT column — the leading liveness cell
+/// (`♥`, `♥ 20m00s`, `⚠ 3h04m`, or the terminal `↳`).
+///
+/// This cell was the LAST ragged column in the tray, and the worst one: it sits
+/// FIRST, so every field to its right inherited its jitter. A healthy heart is
+/// one cell (`♥`) while a missed-beat heart carries its age (`♥ 20m00s`), so two
+/// rows of the same tray started their runtime column up to seven cells apart —
+/// and the width changed under a *single* row as its worker went stale, making
+/// the whole tray twitch sideways between paints.
+///
+/// 8 = glyph (1) + space (1) + the 6-cell ceiling [`crate::style::fmt_duration`]
+/// guarantees inside a day. That ceiling is why one formatter for every duration
+/// is load-bearing rather than cosmetic: a fixed cell can only be sized once the
+/// value that lands in it has a known maximum width.
+pub(crate) const BEAT_COL: usize = 8;
+
 /// What a tray row is tracking.
 ///
 /// The tray holds two kinds of PENDING work, and the distinction is load-bearing
@@ -938,12 +954,12 @@ fn strip_ansi(s: &str) -> String {
 /// Rendered from the banner's own clock on EVERY paint — including the idle
 /// heartbeat's — so the runtime ticks even when the REPL isn't repainting.
 pub fn fmt_elapsed(ms: u64) -> String {
-    let secs = ms / 1000;
-    match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
-        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
-    }
+    // Delegates to THE duration vocabulary rather than re-deriving the buckets:
+    // the runtime cell and the beat cell sit a space apart on this very row, so
+    // any divergence between two formatters is visible side by side (the old
+    // `20m` beat beside a `3m40s` runtime). It also caps this cell's width at
+    // the same 6 inside a day, which is what [`RUNTIME_COL`] is sized against.
+    crate::style::fmt_duration((ms / 1000).min(i64::MAX as u64) as i64)
 }
 
 /// Collapse `text` to a single line and truncate to `max` visible chars with a
@@ -969,6 +985,21 @@ fn col(text: &str, width: usize) -> String {
     let clipped = one_line(text, width);
     let pad = width.saturating_sub(clipped.width());
     format!("{clipped}{}", " ".repeat(pad))
+}
+
+/// Pad an ALREADY-STYLED cell out to `width` terminal cells.
+///
+/// [`col`] can't be used here: it routes through [`one_line`], which strips ANSI
+/// to measure — so running the heart through it would discard the colour that
+/// IS the liveness signal (green/amber/red). This measures the visible width
+/// around the escape codes and only appends spaces, leaving the styling intact.
+/// Never clips: callers pass cells whose content has a known ceiling
+/// ([`BEAT_COL`]), and silently truncating an escape sequence would bleed colour
+/// into the rest of the row.
+fn pad_styled(styled: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let visible = strip_ansi(styled).width();
+    format!("{styled}{}", " ".repeat(width.saturating_sub(visible)))
 }
 
 /// Split a composed status string into its `(state, message)` columns.
@@ -1023,12 +1054,17 @@ fn status_cells(elapsed_ms: u64, state: &str, message: &str) -> String {
     } else {
         CELL_SEP
     };
+    // `trim_end`: the message is the LAST cell, so when it is empty the padding
+    // of the cells before it would otherwise trail off the row as invisible
+    // filler — padding exists to position the NEXT column, and there isn't one.
     format!(
         "{} {} {sep} {}",
         col(&fmt_elapsed(elapsed_ms), RUNTIME_COL),
         col(state, STATE_COL),
         one_line(message, MESSAGE_COL)
     )
+    .trim_end()
+    .to_string()
 }
 
 /// Build ONE banner's two rows. Pure: the caller supplies the elapsed clock, the
@@ -1129,8 +1165,11 @@ fn render_banner(
     };
     let (state, message) = split_status(status);
     let bottom = format!(
-        "{}{indicator} {}",
+        "{}{} {}",
         paint_with("   ", Color::Dim, color_on),
+        // Fixed cell: a pulsing `♥` and a stale `⚠ 3h04m` must not shift the
+        // runtime column that follows them.
+        pad_styled(&indicator, BEAT_COL),
         paint_with(
             &status_cells(elapsed_ms, state, message),
             Color::Dim,
@@ -1175,7 +1214,9 @@ pub fn render_queued(
     let bottom = format!(
         "{}{} {}",
         paint_with("   ", Color::Dim, color_on),
-        paint_with(IDLE_PREFIX, Color::Dim, color_on),
+        // Same fixed BEAT cell as a live row, so a queued line's runtime column
+        // lands on the live rows' runtime column.
+        pad_styled(&paint_with(IDLE_PREFIX, Color::Dim, color_on), BEAT_COL),
         paint_with(
             &status_cells(elapsed_ms, QUEUED_LABEL, &detail),
             Color::Dim,
@@ -1541,7 +1582,53 @@ mod tests {
         // The status row is indented under the message, led by one heart, with
         // runtime and state each in a fixed cell so every banner's message
         // column starts at the same screen position.
-        assert_eq!(bottom, "   ♥ 0s       coordi… · 1m12s", "{bottom}");
+        assert_eq!(bottom, "   ♥        0s       coordi… · 1m12s", "{bottom}");
+    }
+
+    #[test]
+    /// The BEAT cell is FIXED: a healthy `♥`, a stale `♥ 20m00s` and a finished
+    /// `↳` all occupy [`BEAT_COL`] cells, so the runtime/state/message columns
+    /// behind them start at the same screen offset on every row of the tray.
+    /// This is the regression the ragged tray actually showed — hearts of
+    /// different ages pushing each row's columns to a different place.
+    fn beat_cell_is_fixed_width_so_later_columns_never_shift() {
+        use unicode_width::UnicodeWidthStr;
+        let row = |beat: Option<i64>, terminal| {
+            let (_, bottom) = render(0, "w_abcdef123456", "t", "running", terminal, beat, false);
+            bottom
+        };
+        let rows = [
+            row(Some(0), None),        // fresh: bare glyph
+            row(Some(50), None),       // one missed beat: `♥ 50s`
+            row(Some(1_200), None),    // long stale: `♥ 20m00s` (widest)
+            row(Some(11_040), None),   // hours: `♥ 3h04m`
+            row(None, None),           // unknown beat: hollow glyph
+            row(Some(0), Some(false)), // terminal: the static elbow
+        ];
+        // Every row's message column ("running") lands on one offset.
+        let offsets: Vec<usize> = rows
+            .iter()
+            .map(|r| {
+                let plain = strip_ansi(r);
+                let idx = plain.find("running").unwrap_or_else(|| panic!("{plain}"));
+                plain[..idx].width()
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|w| w[0] == w[1]),
+            "state column must not move with beat age: {offsets:?}\n{rows:#?}"
+        );
+        // And the BEAT cell itself is exactly BEAT_COL wide — the widest value
+        // it can hold must not overflow and push the row out.
+        for r in &rows {
+            let plain = strip_ansi(r);
+            let idx = plain.find("running").unwrap();
+            assert_eq!(
+                plain[..idx].width(),
+                3 + BEAT_COL + 1 + RUNTIME_COL + 1,
+                "{plain}"
+            );
+        }
     }
 
     #[test]
@@ -1597,7 +1684,7 @@ mod tests {
         // so the row's ceiling is the message cell plus the two cells, their
         // gutters, the state/message separator cell, and the indent+indicator.
         assert!(
-            bottom.chars().count() <= MESSAGE_COL + RUNTIME_COL + STATE_COL + 10,
+            bottom.chars().count() <= MESSAGE_COL + RUNTIME_COL + STATE_COL + BEAT_COL + 10,
             "{bottom}"
         );
     }
@@ -2054,7 +2141,12 @@ mod tests {
         let (_, done) = render(0, "w_1", "t", "done", Some(false), Some(900), false);
         assert!(!done.contains('♥'), "{done}");
         assert!(!done.contains('♡'), "{done}");
-        assert!(done.starts_with("   ↳ 0s       done"), "{done}");
+        // `↳` rides the SAME fixed beat cell the heart does, so a finished row's
+        // runtime column lands at the same screen offset as a live one's.
+        assert!(
+            done.starts_with(&format!("   ↳{} 0s", " ".repeat(BEAT_COL - 1))),
+            "{done}"
+        );
     }
 
     #[test]

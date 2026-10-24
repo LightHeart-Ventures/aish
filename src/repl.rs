@@ -10708,7 +10708,7 @@ async fn handle_colon(
                             for (_id, ts, sev, short, _detail, source) in rows {
                                 let s = crate::style::Severity::from_tag(&sev);
                                 let badge = crate::style::severity_badge(&short, s, color);
-                                let age = crate::style::fmt_duration((now - ts).max(0) as u64);
+                                let age = crate::style::fmt_duration(now - ts);
                                 println!("{age:>7} ago  {badge}  \x1b[2m({source})\x1b[0m");
                             }
                             println!("\x1b[2m:activity <n> to show N  ·  :activity clear\x1b[0m");
