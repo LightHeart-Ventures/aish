@@ -2598,12 +2598,12 @@ pub fn unpark_input_row(echo: Option<&str>) {
     // Wipe the editor's leftovers so the resting-prompt repaint starts clean.
     let _ = write!(out, "\x1b[{input_row};1H\x1b[2K\x1b[{row};1H");
     if let Some(line) = echo {
-        // Frame the echo with a HALF-row band above and below (▄ / ▀ half
-        // blocks in the band shade, no background), each spanning the full
-        // terminal width, so the operator can spot where their last input was
-        // at a glance without burning two full rows of grey. At the last body
-        // row these `\r\n`s scroll the region (correct); above it they just
-        // step down a row.
+        // Paint the echo as one solid, full-width background band (a padding
+        // row above and below, all background fill — see
+        // `style::input_echo_block_with` for why it's not half-block glyphs),
+        // so the operator can spot where their last input was at a glance.
+        // At the last body row these `\r\n`s scroll the region (correct);
+        // above it they just step down a row.
         let cols = term_size().map(|(_, c)| c as usize).unwrap_or(80);
         let block = crate::style::input_echo_block(line, cols);
         for row_text in &block {
