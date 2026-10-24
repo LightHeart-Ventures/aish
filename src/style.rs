@@ -712,11 +712,31 @@ pub fn input_highlight_bg() -> String {
         .unwrap_or_else(|| INPUT_HIGHLIGHT_BG.to_string())
 }
 
-/// The three transcript lines that record one submitted input: a blank
-/// highlighted line, the `prompt + line` echo, and a second blank highlighted
-/// line — each padded with spaces out to the full terminal `cols` so the band
-/// spans the row edge to edge. Pure form: the caller decides color and shade,
-/// so the layout is unit-testable without a TTY.
+/// Lower half block — the glyph that paints the HALF-row band above the echo
+/// (its filled bottom half hugs the echo row; its top half stays terminal bg).
+pub const BAND_LOWER_HALF: char = '\u{2584}'; // ▄
+/// Upper half block — the glyph that paints the HALF-row band below the echo.
+pub const BAND_UPPER_HALF: char = '\u{2580}'; // ▀
+
+/// Re-aim an xterm-256 BACKGROUND SGR (`ESC[48;5;N m`) at the FOREGROUND
+/// (`ESC[38;5;N m`) so the same shade that fills the echo row can be drawn as
+/// half-block glyphs on the framing rows. Anything that isn't a 256-color bg
+/// is handed back unchanged (degrade, never mangle).
+pub fn band_fg_from_bg(bg: &str) -> String {
+    if bg.contains("48;5;") {
+        bg.replacen("48;5;", "38;5;", 1)
+    } else {
+        bg.to_string()
+    }
+}
+
+/// The three transcript lines that record one submitted input: a HALF-row band
+/// above, the `prompt + line` echo painted edge to edge, and a HALF-row band
+/// below. The framing rows are `▄` / `▀` glyphs in the band shade with NO
+/// background, so only the half of each cell that touches the echo is filled —
+/// the band reads as a thin lip above and below the echo rather than two full
+/// blank rows. Pure form: the caller decides color and shade, so the layout is
+/// unit-testable without a TTY.
 ///
 /// Embedded resets inside `echo` (the prompt paints its own colors) would end
 /// the band mid-line, so every `ESC[0m` / `ESC[m` is re-armed with `bg`
@@ -726,12 +746,17 @@ pub fn input_echo_block_with(echo: &str, cols: usize, color_on: bool, bg: &str) 
     if !color_on {
         return vec![String::new(), echo.to_string(), String::new()];
     }
-    let blank = format!("{bg}{}{RESET}", " ".repeat(cols));
+    let fg = band_fg_from_bg(bg);
+    let half = |glyph: char| format!("{fg}{}{RESET}", glyph.to_string().repeat(cols));
     let rearmed = echo
         .replace(RESET, &format!("{RESET}{bg}"))
         .replace("\x1b[m", &format!("\x1b[m{bg}"));
     let pad = " ".repeat(cols.saturating_sub(visible_cols(echo)));
-    vec![blank.clone(), format!("{bg}{rearmed}{pad}{RESET}"), blank]
+    vec![
+        half(BAND_LOWER_HALF),
+        format!("{bg}{rearmed}{pad}{RESET}"),
+        half(BAND_UPPER_HALF),
+    ]
 }
 
 /// Runtime form of [`input_echo_block_with`]: reads [`colors_enabled`] and the
@@ -1446,20 +1471,37 @@ Watch for this condition and call the `set_alert` tool with alert_id=7 …";
     }
 
     #[test]
-    fn input_echo_block_frames_echo_with_blank_band_lines() {
+    fn input_echo_block_frames_echo_with_half_row_band_lines() {
         let block = input_echo_block_with("❯ :jobs", 20, true, "\x1b[48;5;237m");
-        assert_eq!(block.len(), 3, "blank + echo + blank");
-        // Every row carries the background and spans the full width, so the
-        // highlight is a solid rectangle rather than a ragged right edge.
+        assert_eq!(block.len(), 3, "half band + echo + half band");
+        // Every row spans the full width and resets, so the band is a solid
+        // rectangle rather than a ragged right edge.
         for row in &block {
-            assert!(row.starts_with("\x1b[48;5;237m"), "row armed: {row:?}");
             assert!(row.ends_with(RESET), "row reset: {row:?}");
-            assert_eq!(visible_cols(row), 20, "row padded: {row:?}");
+            assert_eq!(visible_cols(row), 20, "row spans cols: {row:?}");
         }
-        // The framing lines are blank — only the middle row carries text.
-        assert_eq!(block[0], block[2]);
-        assert!(!block[0].contains(':'));
+        // Only the echo row carries the BACKGROUND; the framing rows paint the
+        // same shade as a half-block FOREGROUND so just the half of the cell
+        // touching the echo is filled.
+        assert!(block[1].starts_with("\x1b[48;5;237m"), "echo armed");
         assert!(block[1].contains("❯ :jobs"));
+        for row in [&block[0], &block[2]] {
+            assert!(row.starts_with("\x1b[38;5;237m"), "band fg: {row:?}");
+            assert!(!row.contains("48;5;"), "band has no bg: {row:?}");
+            assert!(!row.contains(':'), "band is textless: {row:?}");
+        }
+    }
+
+    #[test]
+    fn input_echo_block_band_rows_use_matching_half_blocks() {
+        // Above the echo the band must fill the cell's LOWER half (▄) and below
+        // it the UPPER half (▀), so both lips hug the echo row.
+        let block = input_echo_block_with("❯ hi", 6, true, "\x1b[48;5;237m");
+        assert_eq!(block[0], format!("\x1b[38;5;237m{}{RESET}", "▄".repeat(6)));
+        assert_eq!(block[2], format!("\x1b[38;5;237m{}{RESET}", "▀".repeat(6)));
+        assert_eq!(BAND_LOWER_HALF, '▄');
+        assert_eq!(BAND_UPPER_HALF, '▀');
+        assert_eq!(band_fg_from_bg("\x1b[48;5;250m"), "\x1b[38;5;250m");
     }
 
     #[test]
@@ -1474,8 +1516,9 @@ Watch for this condition and call the `set_alert` tool with alert_id=7 …";
 
     #[test]
     fn input_echo_block_plain_mode_keeps_blank_framing() {
-        // NO_COLOR / non-tty: no SGR anywhere, but the blank lines above and
-        // below stay so the transcript spacing is identical either way.
+        // NO_COLOR / non-tty: no SGR and no half-block glyphs anywhere, but the
+        // blank lines above and below stay so the transcript spacing is
+        // identical either way.
         let block = input_echo_block_with("❯ :jobs", 20, false, "\x1b[48;5;237m");
         assert_eq!(
             block,
