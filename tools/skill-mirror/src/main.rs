@@ -27,6 +27,7 @@ mod allowlist;
 mod catalog;
 mod emit;
 mod github;
+mod guard;
 mod ingest;
 mod state;
 mod validate;
@@ -52,6 +53,8 @@ enum Command {
     Generate(GenerateArgs),
     /// Crawl allowlisted GitHub repos into a SKILL.md tree (`generate`'s input).
     Ingest(ingest::IngestArgs),
+    /// Gate a publish on the generated row count vs the live catalog's.
+    Guard(guard::GuardArgs),
 }
 
 #[derive(clap::Args)]
@@ -79,23 +82,28 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Generate(args) => report(generate(args)),
-        // `generate` is pure filesystem work and stays sync; only the crawl
-        // needs an async runtime, so it is built on demand rather than
-        // wrapping main in #[tokio::main].
-        Command::Ingest(args) => {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("skill-mirror: error: building the async runtime: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            report(rt.block_on(ingest::run(args)))
-        }
+        // `generate` is pure filesystem work and stays sync; only the commands
+        // that touch the network need an async runtime, so it is built on
+        // demand rather than wrapping main in #[tokio::main].
+        Command::Ingest(args) => match runtime() {
+            Ok(rt) => report(rt.block_on(ingest::run(args))),
+            Err(code) => code,
+        },
+        Command::Guard(args) => match runtime() {
+            Ok(rt) => report(rt.block_on(guard::run(args))),
+            Err(code) => code,
+        },
     }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            eprintln!("skill-mirror: error: building the async runtime: {e}");
+            ExitCode::FAILURE
+        })
 }
 
 /// Collapse a subcommand result into a process exit code, with the error chain
