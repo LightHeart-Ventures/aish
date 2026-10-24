@@ -748,15 +748,41 @@ pub fn input_echo_block_with(echo: &str, cols: usize, color_on: bool, bg: &str) 
     }
     let fg = band_fg_from_bg(bg);
     let half = |glyph: char| format!("{fg}{}{RESET}", glyph.to_string().repeat(cols));
-    let rearmed = echo
-        .replace(RESET, &format!("{RESET}{bg}"))
-        .replace("\x1b[m", &format!("\x1b[m{bg}"));
-    let pad = " ".repeat(cols.saturating_sub(visible_cols(echo)));
     vec![
         half(BAND_LOWER_HALF),
-        format!("{bg}{rearmed}{pad}{RESET}"),
+        band_row(echo, cols, bg),
         half(BAND_UPPER_HALF),
     ]
+}
+
+/// Paint ONE already-styled row edge to edge in the band shade `bg`, padded out
+/// to `cols` so the highlight reaches the right margin instead of stopping at
+/// the last glyph.
+///
+/// Embedded resets inside `row` (callers paint their own colors) would end the
+/// band mid-line, so every `ESC[0m` / `ESC[m` is re-armed with `bg` immediately
+/// after — the same trick the submitted-input echo uses, factored out so the
+/// escalation tray can reuse the identical shade and mechanics.
+pub fn band_row(row: &str, cols: usize, bg: &str) -> String {
+    let rearmed = row
+        .replace(RESET, &format!("{RESET}{bg}"))
+        .replace("\x1b[m", &format!("\x1b[m{bg}"));
+    let pad = " ".repeat(cols.saturating_sub(visible_cols(row)));
+    format!("{bg}{rearmed}{pad}{RESET}")
+}
+
+/// Runtime form of [`band_row`] for the OPERATOR-INPUT shade: highlights a row
+/// with exactly the band the submitted-input echo uses, so "this is the thing
+/// you're talking to" reads the same whether it's your own line in the
+/// transcript or the worker you're attached to in the escalation tray.
+///
+/// With `color_on` false the row is handed back untouched (degrade, never
+/// mangle).
+pub fn highlight_row(row: &str, cols: usize, color_on: bool) -> String {
+    if !color_on {
+        return row.to_string();
+    }
+    band_row(row, cols, &input_highlight_bg())
 }
 
 /// Runtime form of [`input_echo_block_with`]: reads [`colors_enabled`] and the

@@ -305,6 +305,28 @@ fn now_unix_secs() -> i64 {
 /// the newest escalation is the TOP banner — see [`rows`].
 static BANNERS: Mutex<Vec<Banner>> = Mutex::new(Vec::new());
 
+/// The worker the operator is currently `:attach`ed to, if any — the coordinator
+/// whose transcript is being mirrored and whose turn typed input is folded into.
+///
+/// Process-global for the same reason [`BANNERS`] is: every paint path needs it
+/// (including the idle heartbeat, which has no `Session`), and the REPL's own
+/// attach slot lives behind a session lock the footer can't take mid-paint.
+static ATTACHED: Mutex<Option<String>> = Mutex::new(None);
+
+/// Record (or clear, with `None`) the worker the operator is attached to, so the
+/// tray can highlight that banner. Mirrors the REPL's attach slot — call it
+/// wherever that slot is written.
+pub fn set_attached(id: Option<&str>) {
+    if let Ok(mut cur) = ATTACHED.lock() {
+        *cur = id.map(str::to_string);
+    }
+}
+
+/// The worker id the operator is attached to, if any.
+pub fn attached() -> Option<String> {
+    ATTACHED.lock().ok().and_then(|cur| cur.clone())
+}
+
 /// Pin an escalation banner for coordinator `id` running `task`.
 ///
 /// Additive, not replacing: an escalation launched while others are still live
@@ -1061,6 +1083,13 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
     // beneath it: the top banner is the escalation the operator just launched
     // (matching `cycle_worker`'s newest-first Shift-Tab ordering), and a
     // fan-out reads as that banner's own nested work.
+    // ATTACH HIGHLIGHT: the worker the operator is `:attach`ed to wears the
+    // SAME band as their own submitted input, so "the thing you're talking to"
+    // reads identically in the tray and in the transcript. Read once per paint
+    // (not per row) — `ATTACHED` is a separate mutex from `BANNERS`, and nothing
+    // takes `BANNERS` while holding it, so there is no lock cycle here.
+    let attached_id = attached();
+    let band_width = crate::style::footer_width();
     ordered_rows(&banners)
         .into_iter()
         .take(visible)
@@ -1113,7 +1142,17 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
                     color_on,
                 )
             };
-            indent_pair(pair, depth, color_on)
+            let pair = indent_pair(pair, depth, color_on);
+            // Attached worker → operator-input band on BOTH of its rows, so the
+            // pair reads as one highlighted block. Everything else is untouched.
+            if attached_id.as_deref() == Some(b.id.as_str()) {
+                (
+                    crate::style::highlight_row(&pair.0, band_width, color_on),
+                    crate::style::highlight_row(&pair.1, band_width, color_on),
+                )
+            } else {
+                pair
+            }
         })
         .collect()
 }
@@ -1495,6 +1534,63 @@ mod tests {
         assert!(!active());
         assert_eq!(row_count(), 0);
         assert!(rows(false, MAX_VISIBLE).is_empty());
+        clear();
+    }
+
+    #[test]
+    /// `:attach` makes ONE worker the thing the operator is typing at, so its
+    /// tray banner wears the exact band the submitted-input echo uses — the
+    /// highlight is the shared "this is your channel" signal, not a second
+    /// vocabulary. Scoped to that id and to BOTH of its rows (the pair reads as
+    /// one block); every sibling banner is handed back untouched, and detaching
+    /// restores the plain tray.
+    fn attaching_bands_only_that_workers_pair() {
+        let _g = lock();
+        clear();
+        set_attached(None);
+        pin("w_attached0001", "the attached worker");
+        pin("w_sibling00002", "someone else");
+
+        let band = crate::style::input_highlight_bg();
+        let banded = |painted: &[(String, String)]| {
+            painted
+                .iter()
+                .filter(|(top, bottom)| top.contains(&band) || bottom.contains(&band))
+                .count()
+        };
+
+        // Nothing attached → no band anywhere.
+        assert_eq!(banded(&rows(true, MAX_VISIBLE)), 0);
+
+        set_attached(Some("w_attached0001"));
+        let painted = rows(true, MAX_VISIBLE);
+        assert_eq!(painted.len(), 2);
+        assert_eq!(banded(&painted), 1, "only the attached pair is banded");
+        let (top, bottom) = painted
+            .iter()
+            .find(|(t, _)| t.contains(&band))
+            .expect("attached banner must be banded");
+        assert!(top.contains("the attached worker"), "{top}");
+        assert!(bottom.contains(&band), "status row bands too: {bottom}");
+
+        // Attaching elsewhere moves the band rather than adding a second one.
+        set_attached(Some("w_sibling00002"));
+        let painted = rows(true, MAX_VISIBLE);
+        assert_eq!(banded(&painted), 1);
+        assert!(
+            painted
+                .iter()
+                .find(|(t, _)| t.contains(&band))
+                .is_some_and(|(t, _)| t.contains("someone else")),
+            "{painted:?}"
+        );
+
+        // Colors off degrades to the untouched rows (never mangled escapes).
+        assert_eq!(banded(&rows(false, MAX_VISIBLE)), 0);
+
+        // Detaching restores the plain tray.
+        set_attached(None);
+        assert_eq!(banded(&rows(true, MAX_VISIBLE)), 0);
         clear();
     }
 

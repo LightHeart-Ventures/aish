@@ -774,6 +774,13 @@ pub async fn run(
                 {
                     let cur = attached.lock().unwrap().clone();
                     if cur != last_attached {
+                        // Mirror the attach slot into the escalation store so the
+                        // tray can band the attached worker's banner in the
+                        // operator-input shade. Done HERE rather than at each of
+                        // the ~9 sites that write the slot: this transition
+                        // watcher already sees every one of them (attach, detach,
+                        // Shift-Tab cycle, goal attach, worker completion).
+                        crate::escalation::set_attached(cur.as_deref());
                         last_attached = cur;
                         if let Ok(mut f) = flash.lock() {
                             *f = None;
