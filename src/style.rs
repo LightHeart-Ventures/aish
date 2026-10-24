@@ -740,45 +740,10 @@ pub fn input_echo_block(echo: &str, cols: usize) -> Vec<String> {
     input_echo_block_with(echo, cols, colors_enabled(), &input_highlight_bg())
 }
 
-/// Compose the footer's 2nd statusline (row H-1): the already-styled `left`
-/// coordinator message stays on the LEFT and the session `name` (set via
-/// `:rename`) is right-justified on the RIGHT, in bold magenta (the accent it
-/// carried as the prompt `[name]` prefix). When there's no name the `left` is returned
-/// unchanged. Pure — width/color are supplied so it's unit-testable.
-pub fn second_statusline_at(
-    left: &str,
-    name: Option<&str>,
-    width: usize,
-    color_on: bool,
-) -> String {
-    let name = match name {
-        Some(n) if !n.is_empty() => n,
-        _ => return left.to_string(),
-    };
-    let width = width.max(MIN_STATUSLINE_COLS);
-    // `visible_cols` (not chars) so emoji status badges appended to the name —
-    // 🤖 workers / ⏰ alert / 🎯 goal, each 2 display cols — don't push the
-    // right edge past the terminal width.
-    let rw = visible_cols(name);
-    // The RIGHT zone (session name + live badges) is the row's anchored signal:
-    // an armed ⏰ alert or a 🤖 working coordinator must stay visible. So the
-    // LEFT (coordinator hint + plugin segments) is what yields when the two
-    // collide — clipped escape-aware with `…` — instead of letting the overflow
-    // run off the edge and take the badges with it.
-    let left_budget = width.saturating_sub(rw + 1);
-    let clipped = clip_cols_styled(left, left_budget);
-    let left = clipped.as_str();
-    let lw = visible_cols(left);
-    let gap = width.saturating_sub(lw + rw).max(1);
-    let spaces = " ".repeat(gap);
-    if color_on {
-        // Bold magenta — same accent the name carried as the prompt `[name]`
-        // prefix before it moved onto this row (kept deliberately, not dimmed).
-        format!("{left}{spaces}\x1b[1;35m{name}{RESET}")
-    } else {
-        format!("{left}{spaces}{name}")
-    }
-}
+// NOTE: the session name no longer rides the 2nd statusline. It is welded into
+// the footer's horizontal RULE (`terminal::separator_line_labeled`), ~2 columns
+// from the right edge with rule glyphs continuing on both sides. This row is now
+// pure left-zone content, clipped to `footer_width()` by its caller.
 
 /// Clip a PLAIN (escape-free) string to at most `max` display columns, marking
 /// a cut with a trailing `…`. Measured by unicode display width, so a CJK or
@@ -1336,20 +1301,6 @@ mod tests {
     }
 
     #[test]
-    fn second_statusline_clips_left_before_dropping_the_name_badges() {
-        let long = "x".repeat(200);
-        let s = second_statusline_at(&long, Some("sprint-42 ⏰"), 80, false);
-        assert!(
-            visible_cols(&s) <= 80,
-            "row overflowed: {}",
-            visible_cols(&s)
-        );
-        // The anchored right zone survives — an armed alert badge must stay visible.
-        assert!(s.ends_with("sprint-42 ⏰"), "lost the name/badges: {s}");
-        assert!(s.contains('…'), "left zone should be clipped: {s}");
-    }
-
-    #[test]
     fn visible_cols_ignores_ansi() {
         assert_eq!(visible_cols("abc"), 3);
         assert_eq!(visible_cols("\x1b[36mabc\x1b[0m"), 3);
@@ -1365,30 +1316,6 @@ mod tests {
             visible_cols("\x1b[36m\x1b]8;;https://x.io\x07ok\x1b]8;;\x07\x1b[39m"),
             2
         );
-    }
-
-    #[test]
-    fn second_statusline_right_justifies_name() {
-        // No name → left returned unchanged.
-        assert_eq!(second_statusline_at("left", None, 80, false), "left");
-        assert_eq!(second_statusline_at("left", Some(""), 80, false), "left");
-        // Plain: name flush right, whole row exactly `width` columns.
-        let s = second_statusline_at("left", Some("myproj"), 80, false);
-        assert!(s.starts_with("left"));
-        assert!(s.ends_with("myproj"));
-        assert_eq!(s.chars().count(), 80);
-    }
-
-    #[test]
-    fn second_statusline_colored_name_is_magenta() {
-        let left = "\x1b[36m⇄ detached\x1b[0m";
-        let s = second_statusline_at(left, Some("proj"), 80, true);
-        assert!(s.starts_with(left)); // left half untouched
-        assert!(s.contains("\x1b[1;35mproj")); // name bold magenta (kept accent)
-        assert!(s.ends_with(RESET));
-        // Alignment is computed from VISIBLE columns, so ANSI in `left` doesn't
-        // push the name off the right edge.
-        assert_eq!(visible_cols(&s), 80);
     }
 
     #[test]

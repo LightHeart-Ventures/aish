@@ -1249,7 +1249,7 @@ fn paint_cached_footer_locked(home_body: bool, _boundary: &MutexGuard<'_, ()>) {
     // → leave-alone-while-reading), so the status message row stays the status
     // message in every state.
     let utf8 = utf8_locale();
-    let sep = separator_line(cols, utf8, crate::style::colors_enabled());
+    let sep = separator_line_current(cols, utf8);
     // footer_seq re-asserts the scroll region internally (inside its DECSC/DECRC
     // save-restore).
     if home_body {
@@ -1342,6 +1342,89 @@ pub fn separator_line(cols: u16, utf8: bool, color_on: bool) -> String {
         format!("\x1b[2m{body}\x1b[0m")
     } else {
         body
+    }
+}
+
+/// The session label welded into the footer's main horizontal rule — the
+/// `:rename` name plus its live status badges (🤖 / ⏰ / 🎯), already composed by
+/// the statusline builder.
+///
+/// It lives in process state rather than as a [`footer_seq_with`] argument
+/// because it is a single string that changes at human speed (a `:rename`, a
+/// coordinator finishing) and has NO effect on the row plan — threading it
+/// through every call site would tax the pure-geometry tests with a value none
+/// of them care about. `None` = no label, paint a plain rule.
+static RULE_LABEL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Columns of rule kept to the RIGHT of the label. Two glyphs is enough to read
+/// as "the rule continues past the name" — the name is welded INTO the rule
+/// rather than hung off its end — while still parking the label hard right,
+/// above the clock on the statusline below.
+const RULE_LABEL_RIGHT: usize = 2;
+
+/// Minimum run of rule kept to the LEFT of the label. Below this the rule stops
+/// reading as a rule, so a narrow window drops the label entirely and paints a
+/// plain rule instead of a cramped `── name ──`.
+const RULE_LABEL_MIN_LEFT: usize = 4;
+
+/// Set (or clear) the label welded into the footer's main rule. Cheap and
+/// idempotent — called on every statusline compose; only the stored string
+/// changes, and the next footer paint picks it up.
+pub fn set_rule_label(label: Option<String>) {
+    if let Ok(mut slot) = RULE_LABEL.lock() {
+        *slot = label.filter(|s| !s.trim().is_empty());
+    }
+}
+
+/// The label currently welded into the footer's main rule, if any.
+pub fn rule_label() -> Option<String> {
+    RULE_LABEL.lock().ok().and_then(|s| s.clone())
+}
+
+/// A horizontal rule `cols` wide with `label` welded into it near the RIGHT
+/// edge: `──────────── name ──`. The rule runs unbroken on BOTH sides of the
+/// label, which is what makes the name read as part of the frame instead of a
+/// word parked at the end of a line.
+///
+/// Degrades rather than corrupts: an over-long label is clipped (escape-aware)
+/// to whatever the window can spare after [`RULE_LABEL_MIN_LEFT`] columns of
+/// left-hand rule, and a window too narrow to frame anything at all falls back
+/// to a plain [`separator_line`].
+pub fn separator_line_labeled(cols: u16, utf8: bool, color_on: bool, label: &str) -> String {
+    let label = label.trim();
+    let total = cols.max(1) as usize;
+    // One space of breathing room each side of the label, plus the right-hand
+    // rule run, is the fixed cost of framing a label at all.
+    let overhead = RULE_LABEL_RIGHT + 2;
+    if label.is_empty() || total <= RULE_LABEL_MIN_LEFT + overhead {
+        return separator_line(cols, utf8, color_on);
+    }
+    let budget = total - RULE_LABEL_MIN_LEFT - overhead;
+    let label = if visible_cols(label) as usize > budget {
+        crate::style::clip_cols_styled(label, budget)
+    } else {
+        label.to_string()
+    };
+    let lw = visible_cols(&label) as usize;
+    let ch = if utf8 { '─' } else { '-' };
+    let left: String = std::iter::repeat_n(ch, total.saturating_sub(overhead + lw)).collect();
+    let right: String = std::iter::repeat_n(ch, RULE_LABEL_RIGHT).collect();
+    if color_on {
+        format!("\x1b[2m{left}\x1b[0m \x1b[1;35m{label}\x1b[0m \x1b[2m{right}\x1b[0m")
+    } else {
+        format!("{left} {label} {right}")
+    }
+}
+
+/// The footer's main rule as it should be painted RIGHT NOW: labeled when a
+/// session name is set (see [`set_rule_label`]), plain otherwise. Every footer
+/// paint site goes through here so the label can never land on one row plan and
+/// not the other.
+pub fn separator_line_current(cols: u16, utf8: bool) -> String {
+    let color_on = crate::style::colors_enabled();
+    match rule_label() {
+        Some(label) => separator_line_labeled(cols, utf8, color_on, &label),
+        None => separator_line(cols, utf8, color_on),
     }
 }
 
@@ -1805,7 +1888,7 @@ impl Terminal {
         }
         let _boundary = FOOTER_PAINT.lock().unwrap_or_else(|e| e.into_inner());
         crate::escalation::sweep();
-        let sep = separator_line(self.cols, self.utf8, crate::style::colors_enabled());
+        let sep = separator_line_current(self.cols, self.utf8);
         let mut buf = String::new();
         // footer_seq re-asserts the scroll region internally, INSIDE its
         // DECSC/DECRC save-restore, so the DECSTBM cursor-home side effect never
@@ -2570,6 +2653,75 @@ mod tests {
     /// footer-global test locks this first. Poison-tolerant: a panic while held
     /// must not cascade-fail the siblings.
     static FOOTER_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn labeled_rule_welds_name_into_the_rule_near_the_right_edge() {
+        let s = separator_line_labeled(40, true, false, "myproj");
+        assert_eq!(visible_cols(&s) as usize, 40, "rule width drifted: {s:?}");
+        // Rule continues on BOTH sides: two glyphs to the right of the name,
+        // a long unbroken run to its left.
+        assert!(s.ends_with(" myproj ──"), "label not framed: {s:?}");
+        assert!(s.starts_with("──────"), "no rule left of the label: {s:?}");
+        // ASCII fallback uses '-' and keeps the same geometry.
+        let a = separator_line_labeled(40, false, false, "myproj");
+        assert_eq!(visible_cols(&a) as usize, 40);
+        assert!(a.ends_with(" myproj --"), "ascii label not framed: {a:?}");
+    }
+
+    #[test]
+    fn labeled_rule_degrades_instead_of_corrupting() {
+        // Empty / whitespace label → plain rule.
+        assert_eq!(
+            separator_line_labeled(40, true, false, "   "),
+            separator_line(40, true, false)
+        );
+        // Window too narrow to frame anything → plain rule, never a cramped mess.
+        let narrow = separator_line_labeled(8, true, false, "myproj");
+        assert_eq!(narrow, separator_line(8, true, false));
+        // Over-long label is clipped to the width, keeping the rule intact.
+        let long = separator_line_labeled(30, true, false, &"n".repeat(80));
+        assert_eq!(visible_cols(&long) as usize, 30, "clip drifted: {long:?}");
+        assert!(long.ends_with("──"), "lost the right-hand rule: {long:?}");
+        assert!(long.contains('…'), "label should be clipped: {long:?}");
+    }
+
+    #[test]
+    fn labeled_rule_colors_the_name_and_dims_the_rule() {
+        let s = separator_line_labeled(40, true, true, "proj");
+        assert!(
+            s.contains("\x1b[1;35mproj\x1b[0m"),
+            "name not accented: {s:?}"
+        );
+        assert!(s.starts_with("\x1b[2m"), "rule not dimmed: {s:?}");
+        // Color codes are zero-width, so the painted row still measures `cols`.
+        assert_eq!(visible_cols(&s) as usize, 40);
+    }
+
+    #[test]
+    fn rule_label_state_drives_the_current_rule() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock();
+        let prev = rule_label();
+        set_rule_label(None);
+        assert_eq!(rule_label(), None);
+        assert_eq!(
+            separator_line_current(40, true),
+            separator_line(40, true, crate::style::colors_enabled())
+        );
+        // Blank labels are treated as "no label" so a cleared :rename can't
+        // paint an empty gap into the rule.
+        set_rule_label(Some("  ".to_string()));
+        assert_eq!(rule_label(), None);
+        set_rule_label(Some("sprint-42 🤖".to_string()));
+        assert_eq!(rule_label().as_deref(), Some("sprint-42 🤖"));
+        let cur = separator_line_current(40, true);
+        assert!(cur.contains("sprint-42 🤖"), "label missing: {cur:?}");
+        assert_eq!(
+            visible_cols(&cur) as usize,
+            40,
+            "labeled row width: {cur:?}"
+        );
+        set_rule_label(prev);
+    }
 
     #[test]
     fn hint_tray_repaint_completes_on_tty() {
