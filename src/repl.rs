@@ -7542,14 +7542,59 @@ fn attach_rotation_ids(worker_ids: &[String], goal_active: bool) -> Vec<String> 
     ids
 }
 
+/// Reorder the Shift-Tab rotation so it reads UP the escalation tray: slot 1 is
+/// the tray's BOTTOM row (the banner sitting nearest the prompt), and each
+/// further press climbs one row until the TOP row, after which the cycle wraps
+/// back to the interactive session. The tray is what the operator is actually
+/// looking at, so "first press lands on the tray row just above the prompt" is
+/// the only ordering that matches the eye; raw spawn order (`worker_jobs`
+/// reversed) drifts from it as soon as the tray groups rows by phase or nests a
+/// fan-out under its parent.
+///
+/// `tray_top_to_bottom` is [`crate::escalation::tray_order_ids`] (tray paint
+/// order). Rotation MEMBERSHIP is never changed — ids not present in the tray
+/// (evicted banners, durable sub-workers that never pinned a row) keep their
+/// incoming relative order and are appended AFTER the tray rows, so every
+/// coordinator stays reachable. Pure, so the ordering is unit-testable without a
+/// live Session or a painted tray.
+fn tray_cycle_order(worker_ids: &[String], tray_top_to_bottom: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(worker_ids.len());
+    // Bottom row first, then upward — the tray's paint order, reversed.
+    for id in tray_top_to_bottom.iter().rev() {
+        if worker_ids.iter().any(|w| w == id) && !out.iter().any(|o| o == id) {
+            out.push(id.clone());
+        }
+    }
+    // Anything the tray doesn't know about keeps its incoming order at the tail.
+    for id in worker_ids {
+        if !out.iter().any(|o| o == id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+/// Sort a collected rotation row list (id, terminal, task) into
+/// [`tray_cycle_order`], i.e. bottom-of-tray first. Shared by the at-the-prompt
+/// and mid-turn cycle paths so both agree on slot numbering.
+fn sort_rows_tray_order(rows: &mut [(String, bool, String)]) {
+    let ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
+    let order = tray_cycle_order(&ids, &crate::escalation::tray_order_ids());
+    rows.sort_by_key(|(id, _, _)| order.iter().position(|o| o == id).unwrap_or(usize::MAX));
+}
+
 /// `Shift-Tab` — cycle the interactive session's attach cursor across the
-/// coordinators it launched, NEWEST first. The cycle is `interactive → newest
-/// → … → oldest → interactive` (reverse spawn order): the first press from the
-/// interactive prompt lands on the most recently spawned coordinator — the one
-/// a just-escalated worker — and each further press walks back toward the
-/// oldest. Each Shift-Tab advances to the next coordinator (streaming its
-/// activity + steering input to it,
-/// exactly like `:attach`), and one more press past the last detaches back to
+/// coordinators it launched, walking UP the escalation tray. The cycle is
+/// `interactive → bottom tray row → … → top tray row → interactive`: the first
+/// press from the interactive prompt lands on the FIRST item in the tray (the
+/// banner immediately above the prompt), each further press climbs one row, and
+/// one press past the top row drops back to the interactive prompt. The order
+/// comes from the tray itself ([`crate::escalation::tray_order_ids`] via
+/// [`tray_cycle_order`]), so the rotation always matches what the operator sees
+/// painted — including phase grouping and sub-workers nested under their parent
+/// — instead of raw spawn order. Each Shift-Tab advances to the next
+/// coordinator (streaming its activity + steering input to it, exactly like
+/// `:attach`), and one more press past the last detaches back to
 /// the interactive prompt. With a single worker it toggles attach/detach of that
 /// one; with none it's a silent no-op (no screen redraw, no hint).
 ///
@@ -7606,7 +7651,7 @@ fn cycle_worker(session: &mut Session) -> bool {
     // its parent, pre-order) — so Shift-Tab cycles into subworkers too. Attach
     // resolves a subworker id via the store fallback in `attach_worker` and
     // reviews it durably (`backfill_attached_durable` + `print_attached_result`).
-    let workers: Vec<(String, bool, String)> = collect_worker_rows(session)
+    let mut workers: Vec<(String, bool, String)> = collect_worker_rows(session)
         .into_iter()
         .map(|r| {
             (
@@ -7616,6 +7661,12 @@ fn cycle_worker(session: &mut Session) -> bool {
             )
         })
         .collect();
+    // Re-key the rotation to the TRAY's geometry: slot 1 is the bottom tray row
+    // (nearest the prompt) and each further press climbs toward the top row.
+    // `collect_worker_rows` hands back forest order (newest parent first, each
+    // sub-worker after its parent), which only coincides with the painted tray
+    // while nothing is phase-grouped — so sort by what's actually on screen.
+    sort_rows_tray_order(&mut workers);
     // `workers` MAY be empty here (goal-only session, or a stale attach with no
     // live workers): in that case `ids` is empty and `next_attach_index` returns
     // 0, so we take the index-0 branch below and drop back to interactive — the
@@ -7757,7 +7808,7 @@ fn cycle_worker_live(
     interactive_tail: &[String],
 ) {
     let goal_active = goal.is_some_and(|g| g.is_active());
-    let workers_v: Vec<(String, bool, String)> = workers
+    let mut workers_v: Vec<(String, bool, String)> = workers
         .lock()
         .unwrap()
         .iter()
@@ -7770,6 +7821,11 @@ fn cycle_worker_live(
             )
         })
         .collect();
+    // Same tray-anchored slot numbering as the at-the-prompt path: slot 1 is the
+    // bottom tray row, climbing to the top row. Mid-turn and post-turn presses
+    // MUST agree, or a Shift-Tab during a streaming reply would jump somewhere
+    // different from the identical press a second later.
+    sort_rows_tray_order(&mut workers_v);
     // Stale-attach escape (mirrors `cycle_worker`): only no-op when there's
     // nothing to attach to AND we're not currently attached. If the goal
     // completed mid-turn while attached (goal_active now false, no workers), fall
@@ -14517,6 +14573,85 @@ mod tests {
         // `:close`d) is treated as interactive, so the next press lands on the
         // first worker rather than panicking or skipping.
         assert_eq!(next_attach_index(&running, Some("w_gone")), 1);
+    }
+
+    // ---- Shift-Tab rotation order (tray_cycle_order) --------------------
+
+    #[test]
+    fn cycle_order_starts_at_bottom_tray_row_and_climbs() {
+        // Tray paints top-to-bottom [top, mid, bottom]; the first Shift-Tab must
+        // land on `bottom` (the row nearest the prompt) and climb to `top`.
+        let worker_ids = ids(&["w_top", "w_mid", "w_bottom"]);
+        let tray = ids(&["w_top", "w_mid", "w_bottom"]);
+        assert_eq!(
+            tray_cycle_order(&worker_ids, &tray),
+            ids(&["w_bottom", "w_mid", "w_top"])
+        );
+    }
+
+    #[test]
+    fn cycle_order_follows_tray_not_spawn_order() {
+        // Spawn order and tray order disagree (phase grouping moved the failed
+        // row up); the rotation follows the TRAY, bottom row first.
+        let worker_ids = ids(&["w_new", "w_mid", "w_old"]);
+        let tray = ids(&["w_old", "w_new", "w_mid"]);
+        assert_eq!(
+            tray_cycle_order(&worker_ids, &tray),
+            ids(&["w_mid", "w_new", "w_old"])
+        );
+    }
+
+    #[test]
+    fn cycle_order_keeps_untrayed_workers_reachable_at_the_tail() {
+        // A coordinator with no tray row (evicted banner / durable sub-worker)
+        // must stay in the rotation, after the tray rows, in its incoming order.
+        let worker_ids = ids(&["w_a", "w_ghost1", "w_b", "w_ghost2"]);
+        let tray = ids(&["w_a", "w_b"]);
+        assert_eq!(
+            tray_cycle_order(&worker_ids, &tray),
+            ids(&["w_b", "w_a", "w_ghost1", "w_ghost2"])
+        );
+    }
+
+    #[test]
+    fn cycle_order_ignores_tray_rows_with_no_live_worker() {
+        // Tray ids the rotation doesn't own (queued row, already-closed worker)
+        // are skipped rather than injected as phantom slots.
+        let worker_ids = ids(&["w_a"]);
+        let tray = ids(&["w_stale", "w_a", "w_queued"]);
+        assert_eq!(tray_cycle_order(&worker_ids, &tray), ids(&["w_a"]));
+    }
+
+    #[test]
+    fn cycle_order_empty_tray_preserves_incoming_order() {
+        // No tray painted yet (first press before any banner): fall back to the
+        // caller's order so Shift-Tab still works.
+        let worker_ids = ids(&["w_a", "w_b"]);
+        assert_eq!(tray_cycle_order(&worker_ids, &[]), ids(&["w_a", "w_b"]));
+    }
+
+    #[test]
+    fn cycle_order_full_rotation_wraps_back_to_interactive() {
+        // End-to-end with `next_attach_index`: tray [top, bottom] rotates
+        // interactive -> bottom -> top -> interactive.
+        let order = tray_cycle_order(&ids(&["w_top", "w_bottom"]), &ids(&["w_top", "w_bottom"]));
+        assert_eq!(next_attach_index(&order, None), 1);
+        assert_eq!(order[0], "w_bottom");
+        assert_eq!(next_attach_index(&order, Some("w_bottom")), 2);
+        assert_eq!(order[1], "w_top");
+        assert_eq!(next_attach_index(&order, Some("w_top")), 0);
+    }
+
+    #[test]
+    fn sort_rows_tray_order_is_stable_without_a_tray() {
+        // `sort_rows_tray_order` reads the live tray; with no banners pinned in
+        // the test process the row order must be preserved exactly.
+        let mut rows = workers(&[("w_a", false), ("w_b", true), ("w_c", false)]);
+        sort_rows_tray_order(&mut rows);
+        assert_eq!(
+            rows.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>(),
+            ids(&["w_a", "w_b", "w_c"])
+        );
     }
 
     // ---- 2nd-statusline coordinator status message ----------------------
