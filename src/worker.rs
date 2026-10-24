@@ -1684,7 +1684,16 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     // re-dumps history that an `:attach` already replayed via the SEPARATE
     // backfill cursor). Both cursors read the SAME ring — the attach replay
     // can't drift from the live stream (TASK-298).
-    let mut live_cursor = LiveCursor::default();
+    //
+    // Seated at the ring's CURRENT write pointer, not at 0: a RESUMED worker
+    // now KEEPS its prior thread's rows (so `:attach` still replays its
+    // output-to-date), and a cursor at 0 would re-dump that retained history
+    // into the live stream the moment the resumed thread's first line landed.
+    // For a fresh run the ring is empty, so this equals `LiveCursor::default()`.
+    let mut live_cursor = pulse
+        .as_ref()
+        .map(|job| job.live_cursor_now())
+        .unwrap_or_default();
     while let Ok(Some(line)) = lines.next_line().await {
         // A `message_console` note (📣) is the coordinator's ONE always-surfaced
         // channel: it reaches the operator's terminal IMMEDIATELY, bypassing the
@@ -3423,6 +3432,16 @@ impl WorkerJob {
     pub fn read_live_activity(&self, cursor: &mut LiveCursor) -> Vec<(String, String)> {
         self.inner.lock().unwrap().transcript.read_live(cursor)
     }
+
+    /// A live cursor seated at the ring's CURRENT write pointer — "new output
+    /// only". A resumed worker's stderr stream starts from here instead of
+    /// [`LiveCursor::default`]: the ring now RETAINS the pre-resume rows so
+    /// `:attach` can still replay a resumed worker's output-to-date, and a
+    /// default cursor would re-dump that whole history into the live stream on
+    /// the resumed thread's first forwardable line.
+    pub fn live_cursor_now(&self) -> LiveCursor {
+        self.inner.lock().unwrap().transcript.live_cursor_now()
+    }
     /// Begin an ANIMATED "thinking…" row for this worker in the attach pane when
     /// an `:attach` lands before the coordinator has produced any forwardable
     /// activity (empty transcript). Mirrors the live-stream thinking spinner: a
@@ -3519,7 +3538,18 @@ impl WorkerJob {
         i.error = None;
         i.displayed = false;
         i.branch = None;
-        i.transcript.clear();
+        // NOTE: the transcript ring is deliberately NOT cleared. The ring is
+        // what `:attach` replays, so wiping it made a resumed worker attach to
+        // an EMPTY pane — the operator lost the output-to-date that motivated
+        // the resume in the first place (the reported bug). Instead we RETAIN
+        // the prior thread's rows and push a visible thread boundary; the
+        // ring's own line/byte caps still bound growth across resumes. The
+        // resumed stderr stream seats its live cursor at the current write
+        // pointer (`live_cursor_now`), so these retained rows are replayed by
+        // the `:attach` backfill only — never re-forwarded into the live stream.
+        let thread = i.resumes + 1;
+        i.transcript
+            .push("", &format!("━━ resumed · thread {thread} ━━"));
         if let Some(spin) = i.backfill_spinner.take() {
             spin.stop();
         }
@@ -5076,6 +5106,57 @@ for operator after 4 auto-recovery attempt(s)";
                 finished: None,
             }),
         })
+    }
+
+    // ── Resume keeps the attachable history (the `:attach` replay bug) ─────
+    //
+    // An in-place resume used to `clear()` the transcript ring, so an operator
+    // who `:attach`ed to a RESUMED worker got an empty pane — the
+    // output-to-date they attached FOR was gone. The ring now retains the prior
+    // thread's rows and marks the boundary; the resumed live stream seats its
+    // cursor past them so nothing is double-printed.
+
+    #[test]
+    fn resume_retains_the_transcript_for_attach_replay() {
+        let job = barrier_test_job("w_resume_replay", Some(4242));
+        job.record_activity("🛠️", "pre-resume line one");
+        job.record_activity("🛠️", "pre-resume line two");
+
+        let thread = job.reset_for_resume();
+        assert_eq!(thread, 2, "the original run is thread 1, first resume is 2");
+
+        let replay = job.transcript_rows();
+        assert!(
+            replay.iter().any(|(_, t)| t == "pre-resume line one"),
+            "resume dropped the pre-resume history: {replay:?}"
+        );
+        assert!(
+            replay.iter().any(|(_, t)| t == "pre-resume line two"),
+            "resume dropped the pre-resume history: {replay:?}"
+        );
+        assert!(
+            replay.iter().any(|(_, t)| t.contains("resumed · thread 2")),
+            "resume must mark the thread boundary: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn resumed_live_cursor_emits_only_post_resume_output() {
+        let job = barrier_test_job("w_resume_cursor", Some(4243));
+        job.record_activity("🛠️", "pre-resume line");
+        job.reset_for_resume();
+
+        // Exactly what the resumed run's stderr stream seats its cursor at.
+        let mut cursor = job.live_cursor_now();
+        assert!(
+            job.read_live_activity(&mut cursor).is_empty(),
+            "a freshly seated cursor must not re-emit the retained history"
+        );
+
+        job.record_activity("🛠️", "post-resume line");
+        let live = job.read_live_activity(&mut cursor);
+        assert_eq!(live.len(), 1, "exactly the one new row: {live:?}");
+        assert_eq!(live[0].1, "post-resume line");
     }
 
     #[test]
