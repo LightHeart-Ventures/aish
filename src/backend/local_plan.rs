@@ -69,15 +69,31 @@ impl PromptPlan {
     }
 }
 
-/// Batch slots per `decode` call. 512 matches llama.cpp's own default
-/// `n_batch`; the planner treats it as a *chunk size*, not a prompt limit.
+/// Batch slots per `decode` call, and the `n_batch`/`n_ubatch` the context is
+/// built with. 512 is llama.cpp's own default; the planner treats it as a
+/// *chunk size*, not a prompt limit. Raising it lets prefill submit more
+/// tokens per GPU dispatch (the caller clamps to 32..=4096).
 pub const DEFAULT_BATCH_CAPACITY: usize = 512;
 
-/// Context window requested for the local context.
-pub const DEFAULT_N_CTX: usize = 4096;
+/// Context window requested for the local context. 4096 — llama.cpp's default
+/// — truncated aish's own system prompt plus a couple of turns, so the window
+/// is opened to 8192: still a modest KV-cache footprint (a few hundred MB on a
+/// 32B model) but enough to hold a real conversation.
+pub const DEFAULT_N_CTX: usize = 8192;
 
 /// Tokens reserved for the model's reply (and thus withheld from the prompt).
-pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 512;
+/// This is a *reservation*, not an earned budget: it is subtracted from
+/// `n_ctx` before the prompt is fitted, and it hard-caps generation.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 1024;
+
+/// Length of the longest common prefix of `a` and `b`.
+///
+/// Used to decide how much of a warm KV cache survives into the next turn: the
+/// cache holds tokens at positions `0..a.len()`, the new prompt wants
+/// `0..b.len()`, and everything from the first divergence on must be evicted.
+pub fn common_prefix_len<T: PartialEq>(a: &[T], b: &[T]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
 
 /// Clamp an optional raw string into `[min, max]`, falling back to `default`
 /// when it is absent or unparseable.
@@ -322,5 +338,23 @@ mod tests {
         // Out-of-range values clamp instead of failing the turn.
         assert_eq!(parse_usize(Some("999999"), 512, 1, 8192), 8192);
         assert_eq!(parse_usize(Some("0"), 512, 1, 8192), 1);
+    }
+
+    #[test]
+    fn common_prefix_len_finds_the_divergence() {
+        // Identical: the whole cache is reusable.
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3]), 3);
+        // Pure append (the common case between turns): everything reusable.
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]), 3);
+        // Cache longer than the prompt (history was trimmed): prefix capped.
+        assert_eq!(common_prefix_len(&[1, 2, 3, 4], &[1, 2]), 2);
+        // Divergence mid-way: only the matching head survives.
+        assert_eq!(common_prefix_len(&[1, 2, 9, 4], &[1, 2, 3, 4]), 2);
+        // Divergence at token 0 (new system prompt): full re-prefill.
+        assert_eq!(common_prefix_len(&[9, 2, 3], &[1, 2, 3]), 0);
+        // Empty inputs.
+        assert_eq!(common_prefix_len::<i32>(&[], &[]), 0);
+        assert_eq!(common_prefix_len(&[], &[1, 2]), 0);
+        assert_eq!(common_prefix_len(&[1, 2], &[]), 0);
     }
 }
