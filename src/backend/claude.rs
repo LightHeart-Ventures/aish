@@ -108,13 +108,13 @@ fn is_auth_error(status: u16, msg: &str) -> bool {
 
 /// Print the Claude subscription (OAuth) token-refresh guidance to stderr.
 fn eprint_oauth_expired_hint() {
-    eprintln!("\x1b[1m\n⚠ Claude OAuth token expired\x1b[0m");
-    eprintln!(
+    crate::status_eprintln!("\x1b[1m\n⚠ Claude OAuth token expired\x1b[0m");
+    crate::status_eprintln!(
         "  Your Claude Max/Pro subscription token needs to be refreshed.\n\
   Run: \x1b[1mclaude setup-token\x1b[0m\n\
   Then set CLAUDE_CODE_OAUTH_TOKEN in your shell or ~/.aishrc"
     );
-    eprintln!();
+    crate::status_eprintln!();
 }
 
 /// Subscription OAuth tokens (Claude Max/Pro, via `claude setup-token`) are only
@@ -325,7 +325,7 @@ impl ClaudeBackend {
         match reloaded_oauth_swap(&current, &rc.env) {
             Some(fresh) => {
                 *self.cred.write().unwrap() = fresh;
-                eprintln!(
+                crate::status_eprintln!(
                     "\x1b[2m  reloaded CLAUDE_CODE_OAUTH_TOKEN from ~/.aishrc — retrying…\x1b[0m"
                 );
                 true
@@ -351,7 +351,7 @@ impl ClaudeBackend {
             None => return false, // non-OAuth credential, nothing to wait for
         };
 
-        eprintln!(
+        crate::status_eprintln!(
             "\x1b[1m\n⏳ Waiting for a refreshed OAuth token (up to 10 min)…\x1b[0m\n\
   Run \x1b[1mclaude setup-token\x1b[0m in another terminal, then aish will \
 auto-resume.\n"
@@ -369,7 +369,9 @@ auto-resume.\n"
             let rc = crate::rc::load();
             if let Some(fresh) = reloaded_oauth_swap(&current, &rc.env) {
                 *self.cred.write().unwrap() = fresh;
-                eprintln!("\x1b[2m  fresh OAuth token detected — resuming work…\x1b[0m");
+                crate::status_eprintln!(
+                    "\x1b[2m  fresh OAuth token detected — resuming work…\x1b[0m"
+                );
                 return true;
             }
         }
@@ -522,7 +524,7 @@ auto-resume.\n"
                         Ok(p) => p,
                         Err(e) => match budget.next_transient() {
                             Some(wait) => {
-                                eprintln!(
+                                crate::status_eprintln!(
                                     "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
                                 );
                                 tokio::time::sleep(wait).await;
@@ -538,7 +540,7 @@ auto-resume.\n"
                         // it like any other transient error rather than aborting.
                         Err(snippet) => match budget.next_transient() {
                             Some(wait) => {
-                                eprintln!(
+                                crate::status_eprintln!(
                                     "\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m"
                                 );
                                 tokio::time::sleep(wait).await;
@@ -588,7 +590,7 @@ please refresh your token with `claude setup-token`"
                     if status == 429 {
                         match budget.next_rate_limit(retry_after) {
                             Some(wait) => {
-                                eprintln!(
+                                crate::status_eprintln!(
                                     "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
                                     wait.as_secs()
                                 );
@@ -605,7 +607,7 @@ ride-out budget: {msg}"
                     if status >= 500 {
                         match budget.next_transient() {
                             Some(wait) => {
-                                eprintln!(
+                                crate::status_eprintln!(
                                     "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
                                     wait.as_secs()
                                 );
@@ -621,7 +623,7 @@ ride-out budget: {msg}"
                 // Transport-level error (connect reset, timeout, dns): transient.
                 Err(e) => match budget.next_transient() {
                     Some(wait) => {
-                        eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
+                        crate::status_eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
                         tokio::time::sleep(wait).await;
                     }
                     None => return Err(e).context("request to claude api failed"),
@@ -655,7 +657,7 @@ ride-out budget: {msg}"
             let resp = match cred.apply(req).json(body).send().await {
                 Ok(r) => r,
                 Err(e) if !last => {
-                    eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
+                    crate::status_eprintln!("\x1b[2m  network error ({e}), retrying…\x1b[0m");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(MAX_DELAY);
                     continue;
@@ -681,7 +683,9 @@ ride-out budget: {msg}"
             let (status, parsed) = match super::read_status_and_json(resp).await {
                 Ok(p) => p,
                 Err(e) if !last => {
-                    eprintln!("\x1b[2m  network error reading body ({e}), retrying…\x1b[0m");
+                    crate::status_eprintln!(
+                        "\x1b[2m  network error reading body ({e}), retrying…\x1b[0m"
+                    );
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(MAX_DELAY);
                     continue;
@@ -692,7 +696,9 @@ ride-out budget: {msg}"
                 Ok(v) => v,
                 Err(snippet) => {
                     if !last {
-                        eprintln!("\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m");
+                        crate::status_eprintln!(
+                            "\x1b[2m  api returned non-JSON ({status}), retrying…\x1b[0m"
+                        );
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(MAX_DELAY);
                         continue;
@@ -737,7 +743,7 @@ please refresh your token with `claude setup-token`"
                 } else {
                     delay
                 };
-                eprintln!(
+                crate::status_eprintln!(
                     "\x1b[2m  api {kind} ({status}), retrying in {}s…\x1b[0m",
                     wait.as_secs()
                 );
@@ -1174,7 +1180,7 @@ same oversized call.]",
         // a single animated line, and this dim telemetry would scroll over it.
         if total_input > 0 && !crate::engine::quiet_summary() {
             let hit_pct = (cache_read as f64 / total_input as f64) * 100.0;
-            eprintln!(
+            crate::status_eprintln!(
                 "\x1b[2m  cache: {cache_read} read + {cache_creation} write + {uncached} uncached \
                  in ({hit_pct:.0}% hit) → {out} out\x1b[0m",
                 out = g("output_tokens"),

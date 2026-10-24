@@ -110,6 +110,7 @@ impl QuietSummary {
         // Open a FRESH row first — without this, frame 0 lands on whatever is on
         // the current row and `\r\x1b[2K` erases it (the prompt).
         eprint!("\n\x1b[?25l"); // own a row; hide the cursor — restored on drop
+        ANIM_ROW_LIVE.store(true, AtomicOrdering::Release);
         Self(Some(tokio::spawn(async {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(QUIET_FRAME_MS));
             let mut i = 0usize;
@@ -129,6 +130,7 @@ impl Drop for QuietSummary {
     fn drop(&mut self) {
         if let Some(h) = self.0.take() {
             h.abort();
+            ANIM_ROW_LIVE.store(false, AtomicOrdering::Release);
             eprint!("\r\x1b[2K\x1b[?25h"); // erase the line, restore the cursor
         }
         QUIET_SUMMARY.store(false, AtomicOrdering::SeqCst);
@@ -1862,6 +1864,46 @@ fn truncate_to_cols(s: &str, max: usize) -> String {
     out
 }
 
+/// True while an in-place animation (the [`Spinner`] or the raw-path
+/// [`QuietSummary`]) owns the current stderr row. Both paint `\r<frame>` with
+/// NO trailing newline, so anything else written to stderr meanwhile (the
+/// backend's per-turn cache telemetry, retry / rate-limit / token-refresh
+/// notices) would be APPENDED to the frame — and the drop-time erase then hits
+/// the row BELOW it, leaving a dead `⠏ thinking…  cache: …` row stuck in the
+/// transcript above the tool calls. [`status_eprint_line`] consults this to
+/// clear the row first.
+static ANIM_ROW_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Print one status line to stderr WITHOUT colliding with a live in-place
+/// animation. When one owns the row, the row is erased first (`\r\x1b[2K`) so
+/// the line starts at column 0 on a clean row; the animation's next frame then
+/// lands on the fresh row below and is erased normally when it drops.
+///
+/// The erase and the line go out under ONE stderr lock, so an animation tick
+/// (which also locks stderr via `eprint!`) can't slip a frame in between them.
+/// Use via [`status_eprintln!`] anywhere that may run while the spinner is up
+/// — in practice every `eprintln!` reachable from `Backend::complete`.
+pub fn status_eprint_line(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    if ANIM_ROW_LIVE.load(AtomicOrdering::Acquire) {
+        let _ = err.write_all(b"\r\x1b[2K");
+    }
+    let _ = writeln!(err, "{args}");
+}
+
+/// Drop-in `eprintln!` replacement that is safe to call while the model
+/// "thinking…" spinner is animating — see [`status_eprint_line`].
+#[macro_export]
+macro_rules! status_eprintln {
+    () => {
+        $crate::engine::status_eprint_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::engine::status_eprint_line(format_args!($($arg)*))
+    };
+}
+
 /// Transient "⠋ thinking…" line on stderr while the model is working — the
 /// model-reasoning phase indicator. TTY-gated; erased on drop (first token,
 /// tool call, or turn abort).
@@ -1878,6 +1920,7 @@ impl Spinner {
             return Self(None);
         }
         eprint!("\x1b[?25l"); // hide the cursor while thinking; restored on drop
+        ANIM_ROW_LIVE.store(true, AtomicOrdering::Release);
         Self(Some(tokio::spawn(async {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(80));
@@ -1895,6 +1938,7 @@ impl Drop for Spinner {
     fn drop(&mut self) {
         if let Some(h) = self.0.take() {
             h.abort();
+            ANIM_ROW_LIVE.store(false, AtomicOrdering::Release);
             eprint!("\r\x1b[2K\x1b[?25h"); // erase the spinner line + restore the cursor
         }
     }
@@ -3055,5 +3099,25 @@ mod tests {
         assert_eq!(physical_rows("", 80), 1);
         // Unknown width degrades to a single row.
         assert_eq!(physical_rows("anything at all", 0), 1);
+    }
+}
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::{ANIM_ROW_LIVE, AtomicOrdering};
+
+    /// The flag is the whole contract between the animations and
+    /// `status_eprintln!`: it must be set while a frame owns the row and
+    /// cleared on drop. (Spinner::start is TTY-gated, so drive the flag the way
+    /// start/drop do and assert the helper is callable either way.)
+    #[test]
+    fn status_eprintln_is_safe_with_and_without_a_live_animation() {
+        ANIM_ROW_LIVE.store(true, AtomicOrdering::Release);
+        crate::status_eprintln!(
+            "\x1b[2m  cache: 1 read + 0 write + 0 uncached in (100% hit) → 1 out\x1b[0m"
+        );
+        ANIM_ROW_LIVE.store(false, AtomicOrdering::Release);
+        crate::status_eprintln!();
+        crate::status_eprintln!("plain {}", 1);
     }
 }
