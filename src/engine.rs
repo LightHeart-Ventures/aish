@@ -630,6 +630,18 @@ async fn run_turn_inner(
     let (call_budget_soft, call_budget_hard) = call_budget(&session.env);
     let mut call_budget_guard =
         crate::loopguard::CallBudgetGuard::with_budget(call_budget_soft, call_budget_hard);
+    // No-op turn guard: counts CONSECUTIVE rounds that produced text and zero
+    // tool calls while the turn has executed nothing at all. Every other
+    // degenerate turn shape (loop, deep serial chain, spent call budget, spent
+    // iteration budget) already has a guard; this covers the inverse —
+    // *narrated intent, invoked nothing* — which an unattended run would
+    // otherwise report as a successful final answer. Unattended only: in
+    // interactive chat a text-only reply IS the answer.
+    let mut noop_guard = crate::loopguard::NoOpGuard::default();
+    // Canonical "nobody is at the keyboard" spelling (see `tools::is_unattended`):
+    // the broader of the two axes, because a run that declares itself unattended
+    // through the environment has nobody to ask whether it is also nested.
+    let unattended = session.nested || crate::sensitive::is_unattended();
 
     for iteration in 1..=MAX_ITERATIONS {
         // ── Operator interrupt seam (Ctrl-C on an `:attach`ed worker). A
@@ -866,7 +878,57 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
                     continuing = true;
                     continue;
                 }
-                return Ok(turn.text);
+
+                // No-op guard. An unattended turn that has executed ZERO tool
+                // calls and now emits bare prose ("I'll start with Phase 0 —
+                // verify this isn't already done.") has not answered anything:
+                // there is no human reading that preamble, and the run would be
+                // persisted as a SUCCESS having done no work. Don't return it.
+                // Fold a corrective note into the prompt and CONTINUE the turn —
+                // the same recovery dance as the `truncated_tool_call` path just
+                // above. After NOOP_TURN_LIMIT consecutive no-op rounds, yield
+                // with a `no-op-turn` banner (Disposition::Nudge) so the
+                // condition is durably recorded rather than retried forever.
+                //
+                // `call_budget_guard.total()` is the turn's CUMULATIVE tally, so
+                // a legitimate wrap-up answer after real work is untouched; only
+                // a turn that has done literally nothing can trip this.
+                match noop_guard.record_no_call_round(unattended, call_budget_guard.total()) {
+                    crate::loopguard::NoOpAction::Accept => return Ok(turn.text),
+                    crate::loopguard::NoOpAction::Correct { round } => {
+                        eprintln!(
+                            "\x1b[2m  ⚠ no-op-guard: round {round} produced text but no tool calls \
+and this turn has executed none — not accepting it as an answer; nudging to act\x1b[0m"
+                        );
+                        if !turn.text.trim().is_empty() {
+                            emit_narration(session, &turn.text);
+                        }
+                        // Deliver the correction as a USER message, not a system
+                        // suffix: history currently ends with this bare assistant
+                        // text, and a trailing assistant message is a PREFILL to
+                        // the backend — the model would keep writing that same
+                        // preamble instead of starting a fresh message with tool
+                        // calls. A user turn restores alternation and makes the
+                        // next message a new assistant turn.
+                        session.history.push(crate::backend::Msg::user(
+                            crate::loopguard::noop_corrective_note(round),
+                        ));
+                        continue;
+                    }
+                    crate::loopguard::NoOpAction::Yield { rounds } => {
+                        let reason = crate::loopguard::ExitReason::NoOpTurn { rounds };
+                        eprintln!("\x1b[2maish: {}\x1b[0m", reason.log_line());
+                        let partial = if turn.text.trim().is_empty() {
+                            format!(
+                                "Stopped after {rounds} consecutive rounds that produced no tool \
+calls and no work."
+                            )
+                        } else {
+                            turn.text.clone()
+                        };
+                        return Ok(crate::loopguard::with_banner(&reason, &partial));
+                    }
+                }
             }
         }
 
@@ -877,6 +939,9 @@ clamped {clamped} tool result(s), retrying\x1b[0m"
         if !turn.text.trim().is_empty() {
             emit_narration(session, &turn.text);
         }
+
+        // This round IS executing tool calls, so the no-op streak is broken.
+        noop_guard.reset();
 
         // TASK-324 AC2: record this executing turn's tool-call shape. When the
         // model has drip-fed a lone batchable read for `BATCH_NUDGE_STREAK` turns
