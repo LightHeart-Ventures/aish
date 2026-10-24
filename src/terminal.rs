@@ -1416,6 +1416,57 @@ pub fn separator_line_labeled(cols: u16, utf8: bool, color_on: bool, label: &str
     }
 }
 
+/// The same rule as `sep`, minus any welded label: a bare run of `sep`'s own
+/// glyph at `sep`'s visible width, keeping the dim wrapper when it had one.
+///
+/// The session label + badges belong on exactly ONE rule — the footer's MAIN
+/// rule, the 4th row from the bottom. The bracket rules that frame the pinned
+/// tray block ([`FooterLayout::spacer_row`] above it, [`FooterLayout::tray_sep_row`]
+/// between the trays) reuse the main rule's glyph run so the block reads as a
+/// framed panel, but they must stay PLAIN — otherwise a `:rename`d session
+/// paints its name and badges up to three times in one footer.
+///
+/// Derived purely from the argument — no locale or color globals — so
+/// [`footer_seq_with`] stays a pure escape-sequence builder and the geometry
+/// tests keep passing their own `"----"` separators through unchanged.
+fn plain_rule_like(sep: &str) -> String {
+    let width = visible_cols(sep) as usize;
+    // First VISIBLE char is the rule glyph (`─`, or `-` on the ASCII fallback):
+    // the labeled rule always opens with its left-hand run, so this recovers the
+    // glyph without having to know which variant built the string.
+    let mut chars = sep.chars().peekable();
+    let mut glyph = None;
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if let Some(&n) = chars.peek() {
+                if n == '[' {
+                    chars.next();
+                    while let Some(&p) = chars.peek() {
+                        chars.next();
+                        if ('\x40'..='\x7e').contains(&p) {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        glyph = Some(c);
+        break;
+    }
+    let Some(glyph) = glyph.filter(|_| width > 0) else {
+        return sep.to_string();
+    };
+    let body = glyph.to_string().repeat(width);
+    if sep.starts_with("\x1b[2m") {
+        format!("\x1b[2m{body}\x1b[0m")
+    } else {
+        body
+    }
+}
+
 /// The footer's main rule as it should be painted RIGHT NOW: labeled when a
 /// session name is set (see [`set_rule_label`]), plain otherwise. Every footer
 /// paint site goes through here so the label can never land on one row plan and
@@ -1604,6 +1655,10 @@ pub fn footer_seq_with(
     let top_row = layout.top_row();
     let max = cols as usize;
     let sep = clip_visible(separator, max);
+    // Bracket rules around the pinned tray block: same glyph run, label stripped
+    // (see [`plain_rule_like`]) so the session name shows up on the MAIN rule
+    // only, never three times stacked.
+    let plain = plain_rule_like(&sep);
     let msg = clip_visible(status_msg, max);
     let bar = clip_visible(statusline, max);
     let mut s = String::with_capacity(sep.len() + msg.len() + bar.len() + 48);
@@ -1644,12 +1699,12 @@ pub fn footer_seq_with(
     // text floating at the end of the transcript. It occupies the row the layout
     // already reserved as the tray spacer, so framing the block costs nothing.
     if let Some(row) = layout.spacer_row {
-        s.push_str(&format!("\x1b[{row};1H\x1b[2K{sep}"));
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K{plain}"));
     }
     // BETWEEN-TRAYS rule — present only when both trays are up, dividing the
     // escalation banners above from the `:`-hint tray below.
     if let Some(row) = layout.tray_sep_row {
-        s.push_str(&format!("\x1b[{row};1H\x1b[2K{sep}"));
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K{plain}"));
     }
     // The `:`-command hint tray: directly BELOW the escalation block and
     // directly ABOVE the rule, so the menu reads as the last thing the body said
@@ -2722,6 +2777,45 @@ mod tests {
             40,
             "labeled row width: {cur:?}"
         );
+        set_rule_label(prev);
+    }
+
+    #[test]
+    fn plain_rule_like_strips_the_label_and_keeps_the_width() {
+        // ASCII fallback: bare glyph run, same width, no label text.
+        assert_eq!(plain_rule_like("--- label ---"), "-".repeat(13));
+        // Colored unicode rule: dim wrapper preserved, label gone, width kept.
+        let dim = plain_rule_like("\x1b[2m───\x1b[0m \x1b[1;35mx\x1b[0m \x1b[2m──\x1b[0m");
+        assert_eq!(visible_cols(&dim), 8, "width drifted: {dim:?}");
+        assert!(!dim.contains('x'), "label survived: {dim:?}");
+        assert!(dim.starts_with("\x1b[2m"), "lost dim wrapper: {dim:?}");
+    }
+
+    #[test]
+    fn only_the_main_rule_carries_the_session_label() {
+        // Regression: the bracket rules that frame the pinned tray block reuse
+        // the main rule's glyph run, so a `:rename`d session painted its name
+        // and badges on up to THREE rows of one footer.
+        let _g = FOOTER_STATE_TEST_LOCK.lock();
+        let prev = rule_label();
+        set_rule_label(Some("sprint-42 🤖 ⏰".to_string()));
+        let sep = separator_line_current(80, true);
+        assert!(
+            sep.contains("sprint-42"),
+            "label missing from rule: {sep:?}"
+        );
+        // Banners force `spacer_row` (top bracket) and the hint tray forces
+        // `tray_sep_row` (between-trays bracket) — all three rules in one paint.
+        let banners = vec![("🚀 one".to_string(), "   ⠋ status".to_string())];
+        let hints = vec![":help".to_string()];
+        let seq = footer_seq_with(24, 80, &sep, "msg", "bar", banners, Some("❯ "), &hints);
+        for needle in ["sprint-42", "🤖", "⏰"] {
+            assert_eq!(
+                seq.matches(needle).count(),
+                1,
+                "{needle} painted on more than one rule"
+            );
+        }
         set_rule_label(prev);
     }
 
