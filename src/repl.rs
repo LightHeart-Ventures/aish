@@ -756,6 +756,11 @@ pub async fn run(
             // clears the SecondStatusLine flash so the fresh coordinator hint
             // (which IS that event's recent message) resurfaces (most-recent wins).
             let mut last_attached: Option<String> = None;
+            // Last stale-alert sweep. An armed row whose watcher is gone would
+            // otherwise pin the ⏰ badge forever (the badge reads ALL armed
+            // rows, not just this session's), so the presenter re-sweeps
+            // periodically for sessions that stay up for days.
+            let mut last_reap = std::time::Instant::now();
             loop {
                 tick.tick().await;
                 if busy.load(Ordering::SeqCst) {
@@ -785,6 +790,13 @@ pub async fn run(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
+                    // Sweep orphaned monitors hourly (startup does the first
+                    // pass): nothing else can retire a semantic alert whose
+                    // coordinator died, and one such row keeps ⏰ lit forever.
+                    if last_reap.elapsed() >= Duration::from_secs(3600) {
+                        last_reap = std::time::Instant::now();
+                        let _ = store.expire_stale_alerts(crate::db::AlertStore::STALE_ALERT_SECS);
+                    }
                     if let Ok(armed) = store.armed_alerts() {
                         for a in armed {
                             if a.due(now) {
@@ -10406,7 +10418,8 @@ async fn handle_colon(
                  :suggest [hint]                     AI-suggest the next command from session context, prefilled to edit/accept before it runs (alias :sg)\n\
                  :whatnext [focus]                   ask the model what to do next from session context — an answer, not a command (aliases :next, :wn)\n\
                  :alert <condition>                  monitor for a condition and surface it in the console when met (native file/PR/command probe,\n\
-                                                     or a delegated agent for free-form conditions); distinct audible cue. :alert list, :alert clear <id|all>\n\
+                                                     or a delegated agent for free-form conditions); distinct audible cue. :alert list,\n\
+                                                     :alert clear <id|all>, :alert prune [days] (retire orphaned monitors keeping ⏰ lit)\n\
                  :activity [n|clear]                 recoverable tray of fired :alerts / notable events (last N) with severity-tiered badges; :activity clear\n\
                  :goal <condition>                   pursue a goal in the background until met (requires :batch);\n\
                                                      a verifier judges each turn. :goal status, :goal clear\n\
@@ -11009,13 +11022,60 @@ async fn handle_colon(
                             "no alerts — `:alert <condition>` to arm one (e.g. `:alert let me know when PR 333 is merged`)"
                         ),
                         Ok(rows) => {
-                            println!("\x1b[1m ID  STATE      KIND      CONDITION\x1b[0m");
-                            for (id, state, kind, condition, _short) in rows {
-                                println!("{id:>3}  {state:<9} {kind:<8}  {condition}");
+                            // AGE is the diagnostic that makes a stuck ⏰
+                            // self-explanatory: an armed monitor that is days
+                            // old is an orphan whose watcher is gone, not work
+                            // in flight.
+                            println!("\x1b[1m ID  STATE      KIND      AGE    CONDITION\x1b[0m");
+                            let now = crate::db::AlertStore::now();
+                            let mut stale = 0usize;
+                            for (id, state, kind, condition, _short, created) in rows {
+                                let age = now.saturating_sub(created);
+                                let aged = crate::tools::human_age(age);
+                                if state == "armed"
+                                    && age >= crate::db::AlertStore::STALE_ALERT_SECS
+                                {
+                                    stale += 1;
+                                }
+                                println!("{id:>3}  {state:<9} {kind:<8}  {aged:<5}  {condition}");
                             }
-                            println!("\x1b[2m:alert clear <id|all> to cancel\x1b[0m");
+                            if stale > 0 {
+                                println!(
+                                    "\x1b[2m{stale} armed alert(s) older than 7d — likely orphaned (watcher gone); `:alert prune` to retire them\x1b[0m"
+                                );
+                            }
+                            println!(
+                                "\x1b[2m:alert clear <id|all> to cancel · :alert prune to retire stale monitors\x1b[0m"
+                            );
                         }
                         Err(e) => println!("alert list failed: {e:#}"),
+                    }
+                }
+                // `:alert prune [<days>]` — retire orphaned monitors: armed rows
+                // older than the horizon (default 7d) whose watcher is gone.
+                // This is the operator's manual handle on the same sweep that
+                // runs at startup and hourly in the presenter; it exists because
+                // the ⏰ badge is global, so one orphan lights the icon in every
+                // session until something retires it.
+                Some(store) if lower == "prune" || lower.starts_with("prune ") => {
+                    let arg = lower.strip_prefix("prune").unwrap_or("").trim();
+                    let days = if arg.is_empty() {
+                        Some(7i64)
+                    } else {
+                        arg.trim_end_matches('d').parse::<i64>().ok()
+                    };
+                    match days {
+                        None => println!("usage: :alert prune [<days>]   (default 7)"),
+                        Some(d) => {
+                            let secs = d.max(0) * 24 * 60 * 60;
+                            match store.expire_stale_alerts(secs) {
+                                Ok(0) => println!("no armed alerts older than {d}d"),
+                                Ok(n) => println!(
+                                    "pruned {n} orphaned alert(s) older than {d}d — ⏰ clears once no armed monitors remain"
+                                ),
+                                Err(e) => println!("prune failed: {e:#}"),
+                            }
+                        }
                     }
                 }
                 // `:alert clear|cancel [<id>|all]`.

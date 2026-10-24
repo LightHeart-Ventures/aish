@@ -705,7 +705,23 @@ async fn main() -> Result<()> {
     // polls native alerts and surfaces fired ones; a delegated coordinator fires
     // semantic ones via the `set_alert` tool. Non-fatal on failure.
     match db::AlertStore::open(&db_paths::main_db_path()) {
-        Ok(store) => session.alert_store = Some(store),
+        Ok(store) => {
+            // Reap orphaned monitors before anything reads the table. The ⏰
+            // badge is driven by `armed_alerts()`, which is GLOBAL — so a
+            // single armed row whose watcher is gone (a semantic alert whose
+            // delegated coordinator exited, or one armed by a session that no
+            // longer polls) pins the alarm icon on in every future session.
+            // Nothing else can retire such a row, so sweep on startup.
+            match store.expire_stale_alerts(db::AlertStore::STALE_ALERT_SECS) {
+                Ok(0) => {}
+                Ok(n) => startup_notices.push(format!(
+                    "\x1b[2maish: retired {n} orphaned alert monitor(s) older than 7d (`:alert list all`)\x1b[0m"
+                )),
+                Err(e) => startup_notices
+                    .push(format!("\x1b[33maish:\x1b[0m alert sweep failed: {e:#}")),
+            }
+            session.alert_store = Some(store);
+        }
         Err(e) => startup_notices.push(format!(
             "\x1b[33maish:\x1b[0m alert store unavailable: {e:#}"
         )),

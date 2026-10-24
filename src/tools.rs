@@ -6166,7 +6166,9 @@ fn grep_files(call: &ToolCall, session: &Session) -> Result<(String, serde_json:
     Ok((truncate_middle(out.join("\n"), MAX_OUTPUT), payload))
 }
 
-fn human_age(secs: i64) -> String {
+/// Compact age rendering (`45s` / `12m` / `3h` / `9d`) shared by `stat_file`
+/// and `:alert list`, so an armed monitor's age reads the same as a file's.
+pub(crate) fn human_age(secs: i64) -> String {
     let s = secs.max(0);
     if s < 60 {
         format!("{s}s")
