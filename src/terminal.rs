@@ -1106,6 +1106,10 @@ struct HeartbeatState {
     size_changed: bool,
     /// A pinned escalation banner is animating and needs frame advances.
     animating: bool,
+    /// A tracked escalation row's CONTENT changed since the last tick (status
+    /// flip, terminal verdict, relabel) and the tray must repaint even though
+    /// nothing is animating.
+    tray_dirty: bool,
 }
 
 /// Decide whether this heartbeat tick should repaint the footer.
@@ -1153,7 +1157,7 @@ fn heartbeat_should_paint(s: HeartbeatState) -> bool {
     // Idle-timed-out heals a scrolled-away footer; the resize and animation
     // cases bypass the idle gate so the footer tracks a new canvas size within
     // one tick and a pinned banner's emoji advances smoothly.
-    s.idle_elapsed || s.size_changed || s.animating
+    s.idle_elapsed || s.size_changed || s.animating || s.tray_dirty
 }
 
 /// Spawn the footer heartbeat thread (idempotent — only the first call spawns).
@@ -1185,6 +1189,14 @@ pub fn spawn_footer_heartbeat() {
                     idle_elapsed: idle >= idle_ms,
                     size_changed: size_changed_since_paint(),
                     animating: crate::escalation::animating(),
+                    // Take-and-clear: a content change (a worker's status
+                    // flipping, a verdict landing) buys exactly ONE extra
+                    // frame, so a tray of finished rows repaints on the flip
+                    // and then goes quiet again. The two veto paths below the
+                    // sample are harmless places to drop the flag — no region
+                    // means nothing to paint, and a mid-edit prompt repaints
+                    // the footer on the operator's next keystroke anyway.
+                    tray_dirty: crate::escalation::take_dirty(),
                 }) {
                     // Refresh the footer's CONTENT before redrawing it, so a
                     // pinned banner's status row tracks the live worker list
@@ -3703,6 +3715,7 @@ mod tests {
             idle_elapsed: true,
             size_changed: false,
             animating: false,
+            tray_dirty: false,
         }
     }
 
@@ -3793,10 +3806,28 @@ mod tests {
 
     #[test]
     fn heartbeat_holds_still_when_nothing_changed() {
-        // Idle not elapsed, no resize, no animation ⇒ no repaint. Keeps the
-        // mid-turn relaxation from turning into a 2 Hz footer rewrite.
+        // Idle not elapsed, no resize, no animation, no content change ⇒ no
+        // repaint. Keeps the mid-turn relaxation from turning into a 2 Hz
+        // footer rewrite.
         assert!(!heartbeat_should_paint(HeartbeatState {
             idle_elapsed: false,
+            ..beat()
+        }));
+    }
+
+    #[test]
+    fn heartbeat_paints_a_content_change_with_nothing_animating() {
+        // THE REGRESSION: the tray's repaint gate was "something is animating",
+        // which is true for a spinner and false for a tray of FINISHED rows. A
+        // late status flip (running → failed, or the last status line landing
+        // after the animation stopped) therefore sat unpainted — and, with
+        // phase-ordered rows, an unpainted flip also means a STALE ORDER —
+        // until the operator happened to press a key. The dirty flag is the
+        // missing wake-up.
+        assert!(heartbeat_should_paint(HeartbeatState {
+            idle_elapsed: false,
+            animating: false,
+            tray_dirty: true,
             ..beat()
         }));
     }
