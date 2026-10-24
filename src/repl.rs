@@ -5781,7 +5781,7 @@ pub(crate) fn dispatch_coordinator_ctx(task: &str, ctx: &OpsCtx) -> Dispatched {
             // `dispatch_background` re-renders this with the liftoff animation on
             // a TTY; a mid-turn `:dispatch` (which can only return a string) uses
             // this static final-frame line as-is.
-            let message = liftoff_banner_line("dispatched to", crate::batch::short_id(&id));
+            let message = liftoff_banner_line("dispatched to", crate::batch::short_id(&id), task);
             Dispatched {
                 id: Some(id),
                 message,
@@ -5860,48 +5860,76 @@ pub(crate) fn run_midturn_command(line: &str, ctx: &OpsCtx) -> Option<String> {
 
 /// Leading glyph of the banner's FINAL frame — the one the liftoff animation
 /// settles on, and the only one a non-TTY ever sees.
-const LIFTOFF_GLYPH: &str = "\u{2934}\u{fe0f}";
+///
+/// Deliberately THE SAME rocket the escalation tray paints on a live worker's
+/// head row ([`crate::escalation::LIVE_GLYPH`]) rather than a second glyph that
+/// means the same thing: the line announcing the launch and the pinned banner
+/// the operator then watches are the same piece of work, so they wear the same
+/// mark. Aliased (not re-typed) so they cannot drift.
+const LIFTOFF_GLYPH: &str = crate::escalation::LIVE_GLYPH;
 
-/// Body of a liftoff banner: everything after the animating arrow glyph.
+/// Condense a task brief into the one-line summary the liftoff banner carries
+/// after the worker id. Whitespace is COLLAPSED first — a multi-line brief
+/// pasted into `:dispatch` must not break a single-line banner (or smear the
+/// animation's in-place `\r` rewrites across rows) — then clipped on a word
+/// boundary to `budget`. Pure → testable.
+fn liftoff_summary(task: &str, budget: usize) -> String {
+    let flat = task.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::activity_summary::clip_words(&flat, budget)
+}
+
+/// Body of a liftoff banner: everything after the animating glyph.
 /// `verb` is the offload phrasing — `"escalated to"` when the agent offloaded
 /// the work itself, `"dispatched to"` when the operator typed `:dispatch`. The
 /// rest is deliberately IDENTICAL for both: either way the work now lives on a
 /// background worker the operator can keep working alongside, so the two notices
-/// read as one visual family instead of two unrelated lines. Pure → testable.
-fn liftoff_banner_body(verb: &str, short: &str) -> String {
-    format!(
-        "  {verb} background worker {short}\x1b[0m \x1b[2m— keep working here; Shift-Tab to see work.\x1b[0m"
-    )
+/// read as one visual family instead of two unrelated lines.
+///
+/// The tail is the WORK, not instructions: a static "keep working here;
+/// Shift-Tab to see work" reprinted on every launch is chrome the operator
+/// learns once and then reads past, and it is strictly worse than the one fact
+/// the line cannot be reconstructed without — *which* task just left. So the id
+/// is followed by `: <summary>`. An empty `summary` drops the colon with it.
+/// Pure → testable.
+fn liftoff_banner_body(verb: &str, short: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        format!("  {verb} background worker {short}\x1b[0m")
+    } else {
+        format!("  {verb} background worker {short}:\x1b[0m \x1b[2m{summary}\x1b[0m")
+    }
 }
 
 /// The banner as ONE static line (its final frame, no motion). Used off a TTY
 /// and by callers that can only hand back a string instead of printing — the
 /// mid-turn `:dispatch` path, which returns `Dispatched::message`.
-pub(crate) fn liftoff_banner_line(verb: &str, short: &str) -> String {
+pub(crate) fn liftoff_banner_line(verb: &str, short: &str, task: &str) -> String {
+    let summary = liftoff_summary(task, crate::activity_summary::current_title_budget());
     format!(
         "\x1b[1;33m{LIFTOFF_GLYPH}{}",
-        liftoff_banner_body(verb, short)
+        liftoff_banner_body(verb, short, &summary)
     )
 }
 
 /// Print the liftoff banner, animating the leading arrow so it "lifts off"
-/// the way the work does — a right→up-right→curve-up glyph sweep that settles on
-/// the ⤴️ emoji, then the static banner text. The animation runs ONLY on an
-/// interactive terminal (a piped/redirected stdout gets the final frame in one
-/// clean write, no escape/`\r` noise — same TTY-gating contract as
-/// `clear_screen`). Each frame rewrites the line in place with `\r\x1b[2K`; the
-/// final frame is left on screen followed by a newline.
-fn print_liftoff_banner(verb: &str, short: &str) {
-    // Body of the banner, minus the leading arrow glyph (which is what animates).
-    let body = liftoff_banner_body(verb, short);
+/// the way the work does — a right→up-right→up glyph sweep that settles on the
+/// 🚀 the escalation tray then shows against that same worker, followed by the
+/// static banner text. The animation runs ONLY on an interactive terminal (a
+/// piped/redirected stdout gets the final frame in one clean write, no
+/// escape/`\r` noise — same TTY-gating contract as `clear_screen`). Each frame
+/// rewrites the line in place with `\r\x1b[2K`; the final frame is left on
+/// screen followed by a newline.
+fn print_liftoff_banner(verb: &str, short: &str, task: &str) {
+    // Body of the banner, minus the leading glyph (which is what animates).
+    let summary = liftoff_summary(task, crate::activity_summary::current_title_budget());
+    let body = liftoff_banner_body(verb, short, &summary);
     // SAFETY: plain isatty query. Off a TTY, skip the motion entirely.
     let is_tty = unsafe { libc::isatty(1) } == 1;
     if !is_tty {
         println!("\x1b[1;33m{LIFTOFF_GLYPH}{body}");
         return;
     }
-    // Liftoff frames: a flat arrow tilts upward, then curls into the final
-    // curve-up emoji — reads as the escalated work taking off.
+    // Liftoff frames: a flat arrow tilts upward, then hands off to the rocket —
+    // reads as the escalated work taking off.
     const FRAMES: &[&str] = &["\u{2192}", "\u{2197}", "\u{2b06}\u{fe0f}", LIFTOFF_GLYPH];
     let mut out = std::io::stdout();
     for frame in FRAMES {
@@ -5928,9 +5956,9 @@ fn print_liftoff_banner(verb: &str, short: &str) {
 /// (`escalation == true`) is the agent offloading heavy work on its own — either
 /// because it decided to, or because the typed line carried a work signal
 /// (outside `:dispatch`) — and reads "escalated to background worker …". Both
-/// print the same liftoff banner (⤴️ + "keep working here; Shift-Tab to see
-/// work"), leaving the operator free to keep working in the interactive session
-/// with the newly-spawned worker (a `w_########` id) one Shift-Tab away.
+/// print the same liftoff banner (🚀 + id + a clipped summary of the task that
+/// just left), leaving the operator free to keep working in the interactive
+/// session with the newly-spawned worker (a `w_########` id) one Shift-Tab away.
 fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     let Dispatched { id, message } = dispatch_coordinator(task, session);
     // A guard failure (empty/nested/no-credential/no-binary) carries no id —
@@ -5942,20 +5970,19 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     let short = crate::batch::short_id(&id);
     if escalation {
         // The agent escalated this on its own (or via a work-signal line). Run it
-        // as a background worker, tell the operator they can keep working, and
-        // point them at Shift-Tab to watch it — newest worker is one press away.
-        // The leading ⤴️ "lifts off" with a brief liftoff animation on a TTY.
-        print_liftoff_banner("escalated to", short);
+        // as a background worker and name the work that left, so the operator can
+        // tell this launch apart from the others already in the tray. The leading
+        // 🚀 "lifts off" with a brief liftoff animation on a TTY.
+        print_liftoff_banner("escalated to", short, task);
         return;
     }
     // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or turn
     // `:output` on. An operator-typed `:dispatch` gets the SAME banner as an
     // escalation (only the verb differs) — same glyph, same liftoff animation,
-    // same "keep working here; Shift-Tab to see work" tail — because it means
-    // the same thing to the operator. `message` already holds this line's static
-    // form (so the mid-turn path matches); printing it through the banner adds
-    // the animation on a TTY.
-    print_liftoff_banner("dispatched to", short);
+    // same task summary — because it means the same thing to the operator.
+    // `message` already holds this line's static form (so the mid-turn path
+    // matches); printing it through the banner adds the animation on a TTY.
+    print_liftoff_banner("dispatched to", short, task);
 }
 
 /// Sentinel id `:attach goal` resolves to. Equal to the goal loop's live
@@ -8384,13 +8411,13 @@ enum TellTarget {
 }
 
 /// Leading glyph of the `:tell` banner — the operator calling out to work
-/// that's already in flight. Sibling of [`LIFTOFF_GLYPH`] (⤴️), which marks the
+/// that's already in flight. Sibling of [`LIFTOFF_GLYPH`] (🚀), which marks the
 /// moment work LEAVES for a background worker.
 const TELL_GLYPH: &str = "\u{1f4e3}";
 
 /// Build the `:tell` confirmation banner — the steering sibling of the
-/// escalation / `:dispatch` liftoff lines ("⤴️  escalated to background worker
-/// w_abc1234 — keep working here…"), so every operator-facing worker event
+/// escalation / `:dispatch` liftoff lines ("🚀  escalated to background worker
+/// w_abc1234: fix the flaky test"), so every operator-facing worker event
 /// reads as one visual family: glyph, two spaces, `<verb> background worker
 /// <short-id>`, then a dim `—` tail. `:tell` differs only in the glyph (📣, the
 /// megaphone) and the tail, which carries the pending-message count so repeated
@@ -14856,7 +14883,7 @@ mod tests {
             "unexpected shape: {line}"
         );
         assert!(
-            liftoff_banner_body("escalated to", "w_abc1234")
+            liftoff_banner_body("escalated to", "w_abc1234", "fix the flaky test")
                 .contains("  escalated to background worker w_abc1234"),
             "liftoff family shape drifted — keep tell_banner in step"
         );
@@ -15031,19 +15058,25 @@ mod tests {
     fn liftoff_banner_is_one_family_for_dispatch_and_escalation() {
         // The whole point of the change: an operator-typed `:dispatch` and an
         // agent-initiated escalation render the SAME banner — same leading
-        // glyph, same "keep working here; Shift-Tab to see work" tail, same
+        // glyph (the escalation tray's rocket), same task-summary tail, same
         // worker id — differing only in the verb. If these ever drift apart the
         // operator sees two unrelated notices again.
-        let esc = liftoff_banner_line("escalated to", "w_2WjMgbqm");
-        let dis = liftoff_banner_line("dispatched to", "w_2WjMgbqm");
+        let task = "rename the dispatch glyph to the escalation rocket";
+        let esc = liftoff_banner_line("escalated to", "w_2WjMgbqm", task);
+        let dis = liftoff_banner_line("dispatched to", "w_2WjMgbqm", task);
         for line in [&esc, &dis] {
             assert!(
                 line.contains(LIFTOFF_GLYPH),
                 "missing liftoff glyph: {line}"
             );
-            assert!(line.contains("background worker w_2WjMgbqm"), "{line}");
-            assert!(line.contains("Shift-Tab to see work"), "{line}");
-            // No leftovers from the old dispatch notice.
+            // Same rocket the escalation tray paints on a live worker.
+            assert!(line.contains("🚀"), "glyph is not the tray rocket: {line}");
+            assert!(line.contains("background worker w_2WjMgbqm:"), "{line}");
+            // The tail is the WORK, not instructions.
+            assert!(line.contains("rename the dispatch glyph"), "{line}");
+            // No leftovers from the old dispatch notice / old chrome tail.
+            assert!(!line.contains("Shift-Tab"), "{line}");
+            assert!(!line.contains("keep working here"), "{line}");
             assert!(!line.contains("auto-delivers"), "{line}");
             assert!(!line.contains(":workers"), "{line}");
         }
@@ -15054,6 +15087,23 @@ mod tests {
             esc.replace("escalated to", "VERB"),
             dis.replace("dispatched to", "VERB")
         );
+    }
+
+    #[test]
+    fn liftoff_summary_collapses_and_clips_the_brief() {
+        // A multi-line brief pasted into `:dispatch` must not break the
+        // single-line banner (or smear the animation's in-place rewrites).
+        let flat = liftoff_summary("fix\n  the  failing\ttest", 80);
+        assert_eq!(flat, "fix the failing test");
+        // Clipped on a word boundary, never mid-word.
+        let clipped = liftoff_summary("alpha beta gamma delta epsilon", 14);
+        assert!(clipped.len() <= 14 + 1, "{clipped}");
+        assert!(clipped.starts_with("alpha beta"), "{clipped}");
+        assert!(!clipped.contains("epsilon"), "{clipped}");
+        // No summary → no dangling colon after the worker id.
+        let bare = liftoff_banner_body("dispatched to", "w_2WjMgbqm", "");
+        assert!(bare.contains("background worker w_2WjMgbqm"), "{bare}");
+        assert!(!bare.contains("w_2WjMgbqm:"), "{bare}");
     }
 
     #[test]
