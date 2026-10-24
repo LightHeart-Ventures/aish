@@ -55,12 +55,15 @@
 //! the pinned ids) and pins each with [`pin_sub`], which files the child UNDER
 //! its parent. The forest walk in [`ordered_rows`] then paints a child directly
 //! beneath its parent, indented behind a dim bent arrow, with the same
-//! summary-and-heartbeat status row every root gets:
+//! summary-and-heartbeat status row every root gets — minus the id, which a
+//! nested row deliberately drops (see [`render_sub`]): the indent and arrow
+//! already say whose work it is, and nothing the operator can reach for takes a
+//! sub-worker id, so the columns go to the timer, status and summary instead:
 //!
 //! ```text
 //!   🚀 w_a7k3m2 · ship the sprint
 //!      ♥ 4m02s · running · fanning out the card work
-//!     ↳ 🚀 w_c41d88 · wire the tray rows        <- sub-work, one indent in
+//!     ↳ 🚀 wire the tray rows                   <- sub-work, one indent in
 //!        ♥ 1m12s · running · 🔧 read_file src/escalation.rs
 //! ```
 //!
@@ -140,7 +143,8 @@ pub const IDLE_PREFIX: &str = "↳";
 /// The bent arrow that marks a SUB-WORKER's banner — a coordinator spawned BY
 /// another pinned coordinator (see the SUB-WORKERS note in the module docs). It
 /// leads the child's head row so the nesting reads at a glance:
-/// `  ↳ 🚀 w_child · …`.
+/// `  ↳ 🚀 reviewing the diff`. The child's own `w_…` is NOT painted — the arrow
+/// and indent already attribute the work, so see [`render_sub`].
 pub const SUB_ARROW: &str = "↳";
 
 /// Columns a sub-worker's rows are indented by, relative to its parent's. Four
@@ -773,6 +777,58 @@ pub fn render(
     beat_age_secs: Option<i64>,
     color_on: bool,
 ) -> (String, String) {
+    render_banner(
+        elapsed_ms,
+        Some(id),
+        task,
+        status,
+        terminal,
+        beat_age_secs,
+        color_on,
+    )
+}
+
+/// Build ONE SUB-WORKER's two rows — identical to [`render`] except the head row
+/// carries NO worker id.
+///
+/// A child's `w_…` is pure noise in the tray: it is already positioned under its
+/// parent by the indent and the bent arrow, and nothing the operator can do
+/// takes a sub-worker id (Shift-Tab cycles the PINNED roots, `:workers` lists
+/// the session's own jobs). What the operator actually reads off a nested row is
+/// the TIMER, the STATUS and the SUMMARY — so the row spends its columns on
+/// those instead, which also buys back the 9 columns the id was costing at the
+/// deepest indent. There is no `id` parameter at all, so a caller cannot
+/// accidentally paint one.
+pub fn render_sub(
+    elapsed_ms: u64,
+    task: &str,
+    status: &str,
+    terminal: Option<bool>,
+    beat_age_secs: Option<i64>,
+    color_on: bool,
+) -> (String, String) {
+    render_banner(
+        elapsed_ms,
+        None,
+        task,
+        status,
+        terminal,
+        beat_age_secs,
+        color_on,
+    )
+}
+
+/// Shared body of [`render`] and [`render_sub`]: `id` is `Some` for a root
+/// banner and `None` for a nested sub-worker row.
+fn render_banner(
+    elapsed_ms: u64,
+    id: Option<&str>,
+    task: &str,
+    status: &str,
+    terminal: Option<bool>,
+    beat_age_secs: Option<i64>,
+    color_on: bool,
+) -> (String, String) {
     use crate::style::{Color, paint_with};
     // IDENTITY, not motion: the head glyph is stable for the whole life of the
     // banner so the operator's eye can lock onto it. The animation lives in the
@@ -782,15 +838,18 @@ pub fn render(
         Some(false) => "✅",
         Some(true) => "⚠️",
     };
-    let short = crate::batch::short_id(id);
+    let short = id.map(crate::batch::short_id);
     // Peel an auto-offloaded brief's quoted-conversation digest / resume
     // scaffolding down to the operator's ask before clipping, so the banner
     // reads as the WORK instead of `=== Recent conversation context (for refe…`.
     let hint = one_line(&crate::worker::task_headline(task), TASK_HINT_MAX);
-    let head = if hint.is_empty() {
-        format!("{glyph} {short}")
-    } else {
-        format!("{glyph} {short} · {hint}")
+    // A sub-worker row has no id cell at all, so the hint slides left into the
+    // glyph — never leaving a ` · ` dangling off an empty column.
+    let head = match (short, hint.as_str()) {
+        (Some(short), "") => format!("{glyph} {short}"),
+        (Some(short), hint) => format!("{glyph} {short} · {hint}"),
+        (None, "") => glyph.to_string(),
+        (None, hint) => format!("{glyph} {hint}"),
     };
     let top = paint_with(&head, Color::Cyan, color_on);
     let indicator = match terminal {
@@ -916,15 +975,29 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
             // Age the absolute beat here, on the paint path, so each heart keeps
             // ticking (and can go yellow → red) between the REPL's throttled polls.
             let beat_age = b.beat.map(|t| (now_unix_secs() - t).max(0));
-            let pair = render(
-                elapsed_ms,
-                &b.id,
-                &b.task,
-                &format!("{}{extra}", b.status),
-                terminal,
-                beat_age,
-                color_on,
-            );
+            // Roots carry their short id; nested sub-workers deliberately do
+            // NOT — the indent + arrow already say whose work it is, so the row
+            // spends its columns on the timer, status and summary instead.
+            let pair = if depth == 0 {
+                render(
+                    elapsed_ms,
+                    &b.id,
+                    &b.task,
+                    &format!("{}{extra}", b.status),
+                    terminal,
+                    beat_age,
+                    color_on,
+                )
+            } else {
+                render_sub(
+                    elapsed_ms,
+                    &b.task,
+                    &format!("{}{extra}", b.status),
+                    terminal,
+                    beat_age,
+                    color_on,
+                )
+            };
             indent_pair(pair, depth, color_on)
         })
         .collect()
@@ -1179,6 +1252,28 @@ mod tests {
         // The status row is indented under the message, led by one heart.
         assert!(bottom.starts_with("   ♥ "), "{bottom}");
         assert!(bottom.contains("coordinating · 1m12s"), "{bottom}");
+    }
+
+    #[test]
+    /// A nested row spends its columns on the TIMER, STATUS and SUMMARY — the
+    /// child's own `w_…` is noise under a parent that already locates it.
+    fn sub_rows_drop_the_id_and_keep_timer_status_and_summary() {
+        let (top, bottom) = render_sub(
+            72_000,
+            "build   and\nopen pr",
+            "coordinating",
+            None,
+            Some(0),
+            false,
+        );
+        // No id — neither the raw run id nor its short form.
+        assert!(!top.contains("w_"), "{top}");
+        // …but the summary survives, flush against the glyph (no dangling ` · `).
+        assert!(top.contains("build and open pr"), "{top}");
+        assert!(!top.contains(" ·  "), "{top}");
+        // Timer and status still ride the second row.
+        assert!(bottom.contains("1m12s"), "{bottom}");
+        assert!(bottom.contains("coordinating"), "{bottom}");
     }
 
     #[test]
@@ -1573,8 +1668,12 @@ mod tests {
         // a sub-worker never jumps above the coordinator that spawned it, even
         // though it was pinned later than that parent.
         assert!(heads[0].contains("w_parent"), "{heads:#?}");
-        assert!(heads[1].contains("w_kid_b"), "{heads:#?}");
-        assert!(heads[2].contains("w_kid_a"), "{heads:#?}");
+        assert!(heads[1].contains("second child"), "{heads:#?}");
+        assert!(heads[2].contains("first child"), "{heads:#?}");
+        // A nested row is identified by its PLACE, not by a `w_…` the operator
+        // can't do anything with: the child ids never reach the tray.
+        assert!(!heads[1].contains("w_kid_b"), "{heads:#?}");
+        assert!(!heads[2].contains("w_kid_a"), "{heads:#?}");
 
         // Roots keep the flat tray's shape byte for byte; children lead with the
         // indent + arrow, and their status row lines up under their own glyph.
@@ -1598,22 +1697,23 @@ mod tests {
     fn nesting_depth_is_capped_and_orphans_fall_back_to_roots() {
         let _g = lock();
         clear();
-        pin("w_g0", "root");
-        pin_sub("w_g0", "w_g1", "child", 0);
-        pin_sub("w_g1", "w_g2", "grandchild", 0);
+        pin("w_g0", "root row");
+        pin_sub("w_g0", "w_g1", "kid row", 0);
+        pin_sub("w_g1", "w_g2", "deep leaf", 0);
 
         let painted = rows(false, MAX_VISIBLE);
-        let depth_of = |id: &str| {
+        // Nested rows carry no id, so a row is located by its task text.
+        let depth_of = |needle: &str| {
             let h = painted
                 .iter()
-                .find(|(h, _)| h.contains(id))
+                .find(|(h, _)| h.contains(needle))
                 .map(|(h, _)| h.clone())
-                .unwrap_or_else(|| panic!("{id} missing from {painted:#?}"));
+                .unwrap_or_else(|| panic!("{needle} missing from {painted:#?}"));
             (h.len() - h.trim_start().len()) / SUB_INDENT.len()
         };
-        assert_eq!(depth_of("w_g0"), 0);
-        assert_eq!(depth_of("w_g1"), 1);
-        assert_eq!(depth_of("w_g2"), MAX_SUB_DEPTH);
+        assert_eq!(depth_of("root row"), 0);
+        assert_eq!(depth_of("kid row"), 1);
+        assert_eq!(depth_of("deep leaf"), MAX_SUB_DEPTH);
 
         // Past the cap the indent STOPS growing — the row still paints (and
         // still counts), it just stops marching toward the right edge.
@@ -1653,7 +1753,7 @@ mod tests {
         let painted = rows(false, MAX_VISIBLE);
         let child = painted
             .iter()
-            .find(|(h, _)| h.contains("w_c"))
+            .find(|(h, _)| h.contains("child task"))
             .expect("child row");
         assert!(child.1.contains("turn 3 · building"), "{child:?}");
         // The backdated clock survives too — a child discovered mid-run keeps
