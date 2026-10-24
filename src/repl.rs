@@ -14783,7 +14783,10 @@ mod tests {
         let esc = liftoff_banner_line("escalated to", "w_2WjMgbqm");
         let dis = liftoff_banner_line("dispatched to", "w_2WjMgbqm");
         for line in [&esc, &dis] {
-            assert!(line.contains(LIFTOFF_GLYPH), "missing liftoff glyph: {line}");
+            assert!(
+                line.contains(LIFTOFF_GLYPH),
+                "missing liftoff glyph: {line}"
+            );
             assert!(line.contains("background worker w_2WjMgbqm"), "{line}");
             assert!(line.contains("Shift-Tab to see work"), "{line}");
             // No leftovers from the old dispatch notice.
