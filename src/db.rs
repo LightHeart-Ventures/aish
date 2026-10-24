@@ -1308,7 +1308,9 @@ impl AlertStore {
         })
     }
 
-    fn now() -> i64 {
+    /// Unix seconds. `pub(crate)` so `:alert list` can age rows against the
+    /// same clock the store stamps `created_at` with.
+    pub(crate) fn now() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1459,20 +1461,55 @@ impl AlertStore {
         Ok(n)
     }
 
+    /// Staleness horizon for an armed alert: once a monitor has been armed
+    /// longer than this with nothing resolving it, its watcher is gone — a
+    /// semantic alert's delegated coordinator has long since exited, and a
+    /// native one was armed by a session that is no longer polling — so the row
+    /// can never fire on its own. 7 days.
+    ///
+    /// This matters beyond tidiness: `status_badges` lights the ⏰ badge on the
+    /// SecondStatusLine from `armed_alerts()`, which is GLOBAL (not scoped to
+    /// the current session). One orphaned row therefore pins the alarm icon on
+    /// in every future session until something cancels it.
+    pub const STALE_ALERT_SECS: i64 = 7 * 24 * 60 * 60;
+
+    /// Sweep orphaned monitors: every row still `armed` whose `created_at` is
+    /// older than `max_age_secs` flips to `cancelled`. Returns how many were
+    /// swept. Rows from before `created_at` existed (default `0`) are always
+    /// stale — they can never fire — so they are swept too.
+    ///
+    /// Idempotent and cheap (one indexed UPDATE); safe to call on every startup
+    /// and periodically from the presenter.
+    pub fn expire_stale_alerts(&self, max_age_secs: i64) -> Result<usize> {
+        let cutoff = Self::now().saturating_sub(max_age_secs.max(0));
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE alerts SET state='cancelled'
+                 WHERE state='armed' AND created_at < ?1",
+                [cutoff],
+            )
+            .context("expire stale alerts failed")?;
+        Ok(n)
+    }
+
     /// Display rows for `:alert list` — `(id, state, kind_tag, condition,
-    /// fired_short)`, newest first, excluding cancelled/done unless `include_all`.
+    /// fired_short, created_at)`, newest first, excluding cancelled/done unless
+    /// `include_all`. `created_at` lets the caller show each monitor's age, which
+    /// is what makes an orphaned ⏰ self-explanatory at a glance.
     // The tuple mirrors the SELECT column list 1:1; a named alias would add a
     // layer of indirection between the SQL and the row without adding clarity.
     #[allow(clippy::type_complexity)]
     pub fn list_alerts(
         &self,
         include_all: bool,
-    ) -> Result<Vec<(i64, String, String, String, Option<String>)>> {
+    ) -> Result<Vec<(i64, String, String, String, Option<String>, i64)>> {
         let conn = self.conn.lock().unwrap();
         let sql = if include_all {
-            "SELECT id, state, kind, condition, fired_short FROM alerts ORDER BY created_at DESC"
+            "SELECT id, state, kind, condition, fired_short, created_at
+             FROM alerts ORDER BY created_at DESC"
         } else {
-            "SELECT id, state, kind, condition, fired_short FROM alerts
+            "SELECT id, state, kind, condition, fired_short, created_at FROM alerts
              WHERE state IN ('armed','fired') ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -1483,6 +1520,7 @@ impl AlertStore {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -2054,5 +2092,55 @@ mod tests {
         assert!(!db.revoke("git").unwrap()); // already gone
         assert!(!db.is_allowed("git").unwrap());
         assert_eq!(names(&db), vec!["npm"]);
+    }
+
+    /// The orphaned-⏰ fix: a monitor armed long ago (or predating `created_at`)
+    /// can never fire, so the sweep must cancel it — while a freshly-armed one
+    /// is left strictly alone. `armed_alerts()` is what lights the badge, so the
+    /// assertions are made through it.
+    #[test]
+    fn stale_armed_alerts_are_swept_fresh_ones_survive() {
+        use crate::alert::AlertKind;
+        let path =
+            std::env::temp_dir().join(format!("aish_test_alert_expire_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = AlertStore::open(&path).unwrap();
+
+        let kind = AlertKind::Semantic {
+            description: "when the build finishes".into(),
+        };
+        let stale = store
+            .insert_alert("when the build finishes", &kind, true, None)
+            .unwrap();
+        let fresh = store
+            .insert_alert("when the deploy lands", &kind, true, None)
+            .unwrap();
+        assert_eq!(store.armed_alerts().unwrap().len(), 2);
+
+        // Backdate one row past the horizon (and zero it out, as pre-created_at
+        // rows are stored) to simulate an orphan from a long-gone session.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE alerts SET created_at = 0 WHERE id = ?1", [stale])
+                .unwrap();
+        }
+
+        let swept = store
+            .expire_stale_alerts(AlertStore::STALE_ALERT_SECS)
+            .unwrap();
+        assert_eq!(swept, 1, "exactly the orphaned row should be cancelled");
+
+        let armed = store.armed_alerts().unwrap();
+        assert_eq!(armed.len(), 1, "the fresh monitor must survive the sweep");
+        assert_eq!(armed[0].id, fresh);
+
+        // Idempotent: a second sweep has nothing left to do.
+        assert_eq!(
+            store
+                .expire_stale_alerts(AlertStore::STALE_ALERT_SECS)
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

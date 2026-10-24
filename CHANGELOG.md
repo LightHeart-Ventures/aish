@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Fixed
+- **The ⏰ alarm badge no longer stays lit forever from orphaned monitors.** The SecondStatusLine alarm glyph is driven by `AlertStore::armed_alerts()`, which is **global** — it reads every row whose `state='armed'`, not just the current session's — and nothing in aish could ever retire a row whose watcher was gone. A semantic `:alert` is resolved by a delegated background coordinator calling `set_alert`; when that coordinator exits without firing (the run ends, the host restarts, the condition is already moot), the row stays `armed` for good. Native probes are polled only by the session that armed them, so they orphan the same way. The live database had **35** such rows, the oldest armed 2026-07-07 — so every new session started with the alarm icon on, pointing at CI runs and PRs from three months earlier. New `AlertStore::expire_stale_alerts(max_age_secs)` flips `armed` → `cancelled` for every row older than the horizon (`STALE_ALERT_SECS` = 7d; rows predating the `created_at` column default to `0` and are therefore always swept) in one indexed UPDATE — idempotent, so it is safe to call repeatedly. It runs at **startup** before anything reads the table (with a dim startup notice naming the count, so the sweep is never silent) and **hourly** from the presenter loop, so a session left up for days doesn't re-accumulate a stuck badge. `:alert list` grows an **AGE** column (via `tools::human_age`, the same renderer `stat_file` uses) and footers a warning when any armed row is past the horizon — an aged armed monitor is the diagnostic that makes a stuck ⏰ self-explanatory rather than mysterious. `:alert prune [days]` is the operator's manual handle on the same sweep, defaulting to 7 days.
+
 ## [0.70.1] - 2026-10-24
 
 ### Added
