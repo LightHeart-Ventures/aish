@@ -694,6 +694,52 @@ pub fn visible_cols(s: &str) -> usize {
     width
 }
 
+/// Default xterm-256 background for the submitted-input highlight band — a grey
+/// that reads as a light band on the dark terminals aish targets while leaving
+/// the prompt's own cyan/green foregrounds legible. Override the shade with
+/// `AISH_INPUT_HIGHLIGHT_BG=<0-255>` (any xterm-256 index: `250` for a
+/// genuinely pale grey, `0` for black).
+pub const INPUT_HIGHLIGHT_BG: &str = "\x1b[48;5;237m";
+
+/// The SGR background to paint the input band with right now: the
+/// `AISH_INPUT_HIGHLIGHT_BG` override when it parses as an xterm-256 index,
+/// else [`INPUT_HIGHLIGHT_BG`].
+pub fn input_highlight_bg() -> String {
+    std::env::var("AISH_INPUT_HIGHLIGHT_BG")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .map(|idx| format!("\x1b[48;5;{idx}m"))
+        .unwrap_or_else(|| INPUT_HIGHLIGHT_BG.to_string())
+}
+
+/// The three transcript lines that record one submitted input: a blank
+/// highlighted line, the `prompt + line` echo, and a second blank highlighted
+/// line — each padded with spaces out to the full terminal `cols` so the band
+/// spans the row edge to edge. Pure form: the caller decides color and shade,
+/// so the layout is unit-testable without a TTY.
+///
+/// Embedded resets inside `echo` (the prompt paints its own colors) would end
+/// the band mid-line, so every `ESC[0m` / `ESC[m` is re-armed with `bg`
+/// immediately after. With `color_on` false the band is dropped and the two
+/// framing lines come back empty — still blank, just unpainted.
+pub fn input_echo_block_with(echo: &str, cols: usize, color_on: bool, bg: &str) -> Vec<String> {
+    if !color_on {
+        return vec![String::new(), echo.to_string(), String::new()];
+    }
+    let blank = format!("{bg}{}{RESET}", " ".repeat(cols));
+    let rearmed = echo
+        .replace(RESET, &format!("{RESET}{bg}"))
+        .replace("\x1b[m", &format!("\x1b[m{bg}"));
+    let pad = " ".repeat(cols.saturating_sub(visible_cols(echo)));
+    vec![blank.clone(), format!("{bg}{rearmed}{pad}{RESET}"), blank]
+}
+
+/// Runtime form of [`input_echo_block_with`]: reads [`colors_enabled`] and the
+/// `AISH_INPUT_HIGHLIGHT_BG` shade for the given terminal width.
+pub fn input_echo_block(echo: &str, cols: usize) -> Vec<String> {
+    input_echo_block_with(echo, cols, colors_enabled(), &input_highlight_bg())
+}
+
 /// Compose the footer's 2nd statusline (row H-1): the already-styled `left`
 /// coordinator message stays on the LEFT and the session `name` (set via
 /// `:rename`) is right-justified on the RIGHT, in bold magenta (the accent it
@@ -1470,5 +1516,53 @@ Watch for this condition and call the `set_alert` tool with alert_id=7 …";
             notice_flash("history cleared", true),
             "\x1b[2mhistory cleared\x1b[0m"
         );
+    }
+
+    #[test]
+    fn input_echo_block_frames_echo_with_blank_band_lines() {
+        let block = input_echo_block_with("❯ :jobs", 20, true, "\x1b[48;5;237m");
+        assert_eq!(block.len(), 3, "blank + echo + blank");
+        // Every row carries the background and spans the full width, so the
+        // highlight is a solid rectangle rather than a ragged right edge.
+        for row in &block {
+            assert!(row.starts_with("\x1b[48;5;237m"), "row armed: {row:?}");
+            assert!(row.ends_with(RESET), "row reset: {row:?}");
+            assert_eq!(visible_cols(row), 20, "row padded: {row:?}");
+        }
+        // The framing lines are blank — only the middle row carries text.
+        assert_eq!(block[0], block[2]);
+        assert!(!block[0].contains(':'));
+        assert!(block[1].contains("❯ :jobs"));
+    }
+
+    #[test]
+    fn input_echo_block_rearms_bg_after_embedded_resets() {
+        // The prompt paints its own colors and resets mid-line; a bare reset
+        // would end the band early, so each one is followed by the bg again.
+        let echo = format!("\x1b[1m❯{RESET} hi");
+        let block = input_echo_block_with(&echo, 10, true, "\x1b[48;5;237m");
+        assert!(block[1].contains("\x1b[0m\x1b[48;5;237m"));
+        assert_eq!(visible_cols(&block[1]), 10);
+    }
+
+    #[test]
+    fn input_echo_block_plain_mode_keeps_blank_framing() {
+        // NO_COLOR / non-tty: no SGR anywhere, but the blank lines above and
+        // below stay so the transcript spacing is identical either way.
+        let block = input_echo_block_with("❯ :jobs", 20, false, "\x1b[48;5;237m");
+        assert_eq!(
+            block,
+            vec![String::new(), "❯ :jobs".to_string(), String::new()]
+        );
+        assert!(!block.iter().any(|r| r.contains('\x1b')));
+    }
+
+    #[test]
+    fn input_highlight_bg_honors_env_override() {
+        // Default shade when unset/garbage; any xterm-256 index when valid.
+        assert_eq!(INPUT_HIGHLIGHT_BG, "\x1b[48;5;237m");
+        // Narrow, env-free check of the formatting the override produces.
+        let shade = |idx: u8| format!("\x1b[48;5;{idx}m");
+        assert_eq!(shade(250), "\x1b[48;5;250m");
     }
 }

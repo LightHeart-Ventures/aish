@@ -2448,10 +2448,20 @@ pub fn unpark_input_row(echo: Option<&str>) {
     // Wipe the editor's leftovers so the resting-prompt repaint starts clean.
     let _ = write!(out, "\x1b[{input_row};1H\x1b[2K\x1b[{row};1H");
     if let Some(line) = echo {
-        // At the last body row this `\r\n` scrolls the region (correct); above it
-        // it just steps down a row.
-        let _ = write!(out, "{line}\r\n");
-        BODY_ROW.store((row + 1).min(layout.body_bottom), Ordering::Relaxed);
+        // Frame the echo with a blank highlighted row above and below, each
+        // padded to the full terminal width, so the operator can spot where
+        // their last input was at a glance. At the last body row these `\r\n`s
+        // scroll the region (correct); above it they just step down a row.
+        let cols = term_size().map(|(_, c)| c as usize).unwrap_or(80);
+        let block = crate::style::input_echo_block(line, cols);
+        for row_text in &block {
+            let _ = write!(out, "{row_text}\r\n");
+        }
+        BODY_ROW.store(
+            row.saturating_add(block.len() as u16)
+                .min(layout.body_bottom),
+            Ordering::Relaxed,
+        );
     } else {
         BODY_ROW.store(row, Ordering::Relaxed);
     }
