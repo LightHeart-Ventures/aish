@@ -10,7 +10,11 @@
 #   docker run -p 8080:8080 -v aish_broker_data:/var/lib aish-webhook-broker:latest
 #
 # ---- builder ----------------------------------------------------------------
-FROM rust:1.88-slim-bookworm AS builder
+# Intentionally UNPINNED to the latest stable Rust: this crate's Cargo.lock is
+# kept current by Dependabot, and modern deps (e.g. uuid >= 1.28 needs rustc
+# 1.89) routinely raise the MSRV faster than a pinned tag can follow. Pinning
+# the toolchain here made every dependency bump a red CI run.
+FROM rust:slim-bookworm AS builder
 
 WORKDIR /build
 
