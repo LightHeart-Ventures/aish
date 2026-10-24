@@ -46,6 +46,30 @@
 //! [`crate::terminal::FooterLayout`] additionally drops whole banners (newest
 //! kept) on a window too short to hold them all.
 //!
+//! SUB-WORKERS (fan-out). A pinned coordinator can escalate in turn — fanning
+//! a big task out to sub-workers is the whole point of a coordinator — and those
+//! children run in their OWN processes, so the launching session's worker list
+//! never sees them. They used to be invisible: the operator saw one banner for a
+//! worker that was really driving four. The REPL now discovers them from the
+//! durable `coordinator_runs` table (walking `parent_run_id` transitively from
+//! the pinned ids) and pins each with [`pin_sub`], which files the child UNDER
+//! its parent. The forest walk in [`ordered_rows`] then paints a child directly
+//! beneath its parent, indented behind a dim bent arrow, with the same
+//! summary-and-heartbeat status row every root gets:
+//!
+//! ```text
+//!   🚀 w_a7k3m2 · ship the sprint
+//!      ♥ 4m02s · running · fanning out the card work
+//!     ↳ 🚀 w_c41d88 · wire the tray rows        <- sub-work, one indent in
+//!        ♥ 1m12s · running · 🔧 read_file src/escalation.rs
+//! ```
+//!
+//! Nesting stops at [`MAX_SUB_DEPTH`] so a deep chain can't walk the rows off
+//! the right edge; deeper descendants are still tracked (they count toward the
+//! `+N more` tail). Only a LIVE child is pinned — a finished one keeps its
+//! durable row forever, so pinning on phase alone would resurrect a verdict that
+//! had already aged out and give the tray an immortal row.
+//!
 //! ANIMATION AND LIVENESS. The head row keeps its static rocket identity.
 //! The status row uses one heart for both the heartbeat animation and worker
 //! liveness. A current durable heartbeat pulses the heart's intensity twice
@@ -113,6 +137,24 @@ pub const LIVE_GLYPH: &str = "🚀";
 /// which has nothing running behind it to animate.
 pub const IDLE_PREFIX: &str = "↳";
 
+/// The bent arrow that marks a SUB-WORKER's banner — a coordinator spawned BY
+/// another pinned coordinator (see the SUB-WORKERS note in the module docs). It
+/// leads the child's head row so the nesting reads at a glance:
+/// `  ↳ 🚀 w_child · …`.
+pub const SUB_ARROW: &str = "↳";
+
+/// Columns a sub-worker's rows are indented by, relative to its parent's. Four
+/// on the head row (`"  ↳ "`) and the same four prepended to the already
+/// 3-space-indented status row, so the child's heart lands under the child's
+/// glyph rather than under its parent's.
+pub(crate) const SUB_INDENT: &str = "    ";
+
+/// How deep the tray will nest sub-workers. A sub-worker can itself fan out, and
+/// the durable parent chain is walked transitively, but past this depth the rows
+/// are mostly indent — so deeper descendants are tracked (they still count
+/// toward the `+N more` tail) rather than painted with a runaway margin.
+pub const MAX_SUB_DEPTH: usize = 2;
+
 /// The head-row glyph for a QUEUED mid-turn line. Matches the hourglass the
 /// body receipt (`keywatch::print_midturn_queued`) prints, so the operator can
 /// tie the tray row to the line that acknowledged their keystroke.
@@ -163,6 +205,15 @@ struct Banner {
     /// Coordinator run id (`w_…`) — rendered short, and the key the REPL uses to
     /// find the live worker when it refreshes the status row.
     id: String,
+    /// The run id of the coordinator that SPAWNED this one, when this banner
+    /// tracks a sub-worker (`coordinator_runs.parent_run_id`). `None` at a root
+    /// — an escalation the operator's own session launched, or a queued line.
+    ///
+    /// Display-only: it decides where the row sorts and how far it indents (see
+    /// [`ordered_rows`]). A child whose parent is no longer tracked (evicted, or
+    /// retired after its [`DWELL`]) renders as a root rather than disappearing —
+    /// live work is never dropped in favour of a stale verdict.
+    parent: Option<String>,
     /// The escalated task, rendered as a compact one-line hint.
     task: String,
     /// When the banner was pinned — drives the animation frame.
@@ -214,7 +265,34 @@ pub fn pin(id: &str, task: &str) {
     crate::terminal::repaint_escalation_around(|| push_banner(id, task));
 }
 
+/// Pin a SUB-WORKER's banner: coordinator `id`, spawned by the already-pinned
+/// coordinator `parent`, running `task` and started `age_ms` ago.
+///
+/// Rendered as an indented `↳` row directly beneath its parent (see
+/// [`ordered_rows`]) so a fan-out reads as the parent's work rather than as
+/// unexplained new escalations at the top of the tray.
+///
+/// INSERT-ONLY, unlike [`pin`]. The REPL discovers sub-workers by polling the
+/// durable `coordinator_runs` table, so this is called repeatedly for the SAME
+/// child; refreshing in place (as `pin` does for an operator-driven retry)
+/// would restart the child's elapsed clock and wipe the verdict
+/// [`note_terminal`] just stamped, so a finished sub-worker could never age out
+/// of the tray. Subsequent passes therefore fall through to
+/// [`set_status`]/[`note_terminal`], which are the update path.
+///
+/// `age_ms` backdates the banner's own clock to the child's real start time, so
+/// a sub-worker discovered a minute into its run shows `1m04s`, not `0s`.
+pub fn pin_sub(parent: &str, id: &str, task: &str, age_ms: u64) {
+    crate::terminal::repaint_escalation_around(|| {
+        push_banner_inner(id, task, Some(parent), age_ms);
+    });
+}
+
 fn push_banner(id: &str, task: &str) {
+    push_banner_inner(id, task, None, 0);
+}
+
+fn push_banner_inner(id: &str, task: &str, parent: Option<&str>, age_ms: u64) {
     let Ok(mut banners) = BANNERS.lock() else {
         return;
     };
@@ -222,7 +300,13 @@ fn push_banner(id: &str, task: &str) {
         kind: Kind::Escalation,
         id: id.to_string(),
         task: task.to_string(),
-        pinned_at: Instant::now(),
+        parent: parent.map(str::to_string),
+        // Backdate to the run's real start when the caller knows it. Saturating:
+        // a clock skew that puts the start in the "future" just reads as 0s
+        // rather than panicking on an Instant underflow.
+        pinned_at: Instant::now()
+            .checked_sub(Duration::from_millis(age_ms))
+            .unwrap_or_else(Instant::now),
         terminal_at: None,
         failed: false,
         status: "queued — waiting for the coordinator to start".into(),
@@ -232,10 +316,22 @@ fn push_banner(id: &str, task: &str) {
         .iter_mut()
         .find(|b| b.kind == Kind::Escalation && b.id == id)
     {
+        // A sub-worker's pin is a DISCOVERY, not a relaunch — leave the existing
+        // row (and its clock, status and verdict) exactly as it is.
+        if parent.is_some() {
+            return;
+        }
         // Same coordinator: its durable heartbeat is still valid evidence, so
         // keep it rather than flashing the hollow "no claim" heart on a retry.
+        // The parent link survives too: a re-`pin` of a child (a retry routed
+        // through the root path) must not promote it to a root row.
         let beat = slot.beat;
-        *slot = Banner { beat, ..fresh };
+        let parent = slot.parent.take();
+        *slot = Banner {
+            beat,
+            parent,
+            ..fresh
+        };
         return;
     }
     banners.push(fresh);
@@ -281,6 +377,7 @@ pub fn pin_queued(line: &str) -> String {
             kind: Kind::Queued,
             id,
             task: line.to_string(),
+            parent: None,
             pinned_at: Instant::now(),
             terminal_at: None,
             failed: false,
@@ -440,6 +537,67 @@ pub fn pinned_ids() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The tray's paint order: a depth-first FOREST over the parent links.
+///
+/// Roots keep the tray's established newest-first ordering; each root is
+/// immediately followed by its sub-workers (also newest first), recursively.
+/// Returns `(index, depth)` pairs so the caller can indent without re-walking
+/// the chain. A banner whose parent is no longer in the store sorts as a root.
+fn ordered_rows(banners: &[Banner]) -> Vec<(usize, usize)> {
+    let is_live_parent = |id: &str| {
+        banners
+            .iter()
+            .any(|b| b.kind == Kind::Escalation && b.id == id)
+    };
+    // Newest first, matching the flat tray's historical order.
+    let newest_first: Vec<usize> = (0..banners.len()).rev().collect();
+    let children_of = |parent_id: &str| -> Vec<usize> {
+        newest_first
+            .iter()
+            .copied()
+            .filter(|&i| banners[i].parent.as_deref() == Some(parent_id))
+            .collect()
+    };
+
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(banners.len());
+    // Stack of rows still to emit, each with the depth it renders at.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for &i in newest_first.iter().rev() {
+        let orphan = banners[i]
+            .parent
+            .as_deref()
+            .is_none_or(|p| !is_live_parent(p));
+        if orphan {
+            // Pushed in reverse so popping yields newest-first roots.
+            stack.push((i, 0));
+        }
+    }
+    let mut guard = banners.len().saturating_mul(2) + 8;
+    while let Some((idx, depth)) = stack.pop() {
+        guard = guard.saturating_sub(1);
+        if guard == 0 {
+            break;
+        }
+        if out.iter().any(|&(seen, _)| seen == idx) {
+            continue;
+        }
+        out.push((idx, depth));
+        let child_depth = (depth + 1).min(MAX_SUB_DEPTH);
+        let kids = children_of(&banners[idx].id);
+        for &child in kids.iter().rev() {
+            stack.push((child, child_depth));
+        }
+    }
+    // Anything unreachable (a cycle, or a child of an evicted parent we failed
+    // to classify) still gets painted — never swallow a live row.
+    for i in newest_first {
+        if !out.iter().any(|&(seen, _)| seen == i) {
+            out.push((i, 0));
+        }
+    }
+    out
 }
 
 /// Replace coordinator `id`'s status row text (already composed by the caller —
@@ -725,14 +883,16 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
         .enumerate()
         .map(|(n, b)| (b.id.as_str(), n + 1))
         .collect();
-    // Newest first: the top banner is the escalation the operator just launched,
-    // and it matches `cycle_worker`'s newest-first Shift-Tab ordering.
-    banners
-        .iter()
-        .rev()
+    // Newest first, with each coordinator's sub-workers pulled up directly
+    // beneath it: the top banner is the escalation the operator just launched
+    // (matching `cycle_worker`'s newest-first Shift-Tab ordering), and a
+    // fan-out reads as that banner's own nested work.
+    ordered_rows(&banners)
+        .into_iter()
         .take(visible)
         .enumerate()
-        .map(|(i, b)| {
+        .map(|(i, (idx, depth))| {
+            let b = &banners[idx];
             // The overflow tail rides the LAST painted status row (the oldest
             // visible banner) rather than claiming a row of its own, so the
             // block height stays an exact multiple of ROWS_PER_BANNER.
@@ -756,7 +916,7 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
             // Age the absolute beat here, on the paint path, so each heart keeps
             // ticking (and can go yellow → red) between the REPL's throttled polls.
             let beat_age = b.beat.map(|t| (now_unix_secs() - t).max(0));
-            render(
+            let pair = render(
                 elapsed_ms,
                 &b.id,
                 &b.task,
@@ -764,9 +924,34 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
                 terminal,
                 beat_age,
                 color_on,
-            )
+            );
+            indent_pair(pair, depth, color_on)
         })
         .collect()
+}
+
+/// Nest one already-rendered banner pair under its parent: `depth` levels of
+/// indent plus a bent arrow on the escalation row, so a sub-worker reads as the
+/// row above's own work rather than as another top-level escalation.
+///
+/// Depth 0 is returned untouched — a root keeps the tray's established shape,
+/// byte for byte.
+fn indent_pair(pair: (String, String), depth: usize, color_on: bool) -> (String, String) {
+    use crate::style::{Color, paint_with};
+    if depth == 0 {
+        return pair;
+    }
+    let (top, bottom) = pair;
+    let pad = SUB_INDENT.repeat(depth.min(MAX_SUB_DEPTH));
+    // The arrow is dim so the eye reads the worker's own glyph first; the status
+    // row gets matching whitespace only, keeping the two rows left-aligned.
+    let arrow = paint_with(SUB_ARROW, Color::Dim, color_on);
+    (
+        format!("{pad}{arrow} {top}"),
+        // The two extra columns line the status row up under the escalation
+        // row's glyph: the arrow and the space that follows it.
+        format!("{pad}  {bottom}"),
+    )
 }
 
 #[cfg(test)]
@@ -1366,6 +1551,114 @@ mod tests {
         let alive = painted.iter().find(|r| r.0.contains("a retry")).unwrap();
         assert!(alive.1.contains('♥'), "{alive:?}");
         assert!(!alive.1.contains('♡'), "{alive:?}");
+        clear();
+    }
+
+    /// A fan-out must read as the PARENT's work: each sub-worker paints directly
+    /// beneath the coordinator that spawned it, indented behind a bent arrow,
+    /// instead of surfacing as another unexplained top-level escalation at the
+    /// top of the tray. Siblings keep the tray's newest-first order.
+    #[test]
+    fn sub_workers_paint_indented_under_their_parent() {
+        let _g = lock();
+        clear();
+        pin("w_parent", "the fan-out");
+        pin_sub("w_parent", "w_kid_a", "first child", 0);
+        pin_sub("w_parent", "w_kid_b", "second child", 0);
+
+        let painted = rows(false, MAX_VISIBLE);
+        let heads: Vec<&str> = painted.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(heads.len(), 3, "{heads:#?}");
+        // The parent first, then its children newest-first directly under it —
+        // a sub-worker never jumps above the coordinator that spawned it, even
+        // though it was pinned later than that parent.
+        assert!(heads[0].contains("w_parent"), "{heads:#?}");
+        assert!(heads[1].contains("w_kid_b"), "{heads:#?}");
+        assert!(heads[2].contains("w_kid_a"), "{heads:#?}");
+
+        // Roots keep the flat tray's shape byte for byte; children lead with the
+        // indent + arrow, and their status row lines up under their own glyph.
+        assert!(!heads[0].starts_with(' '), "{:?}", heads[0]);
+        let want = format!("{SUB_INDENT}{SUB_ARROW} ");
+        assert!(heads[1].starts_with(&want), "{:?}", heads[1]);
+        assert!(heads[2].starts_with(&want), "{:?}", heads[2]);
+        assert!(
+            painted[1].1.starts_with(&format!("{SUB_INDENT}  ")),
+            "{:?}",
+            painted[1].1
+        );
+        clear();
+    }
+
+    /// Sub-workers fan out too, so the walk is transitive — but the indent is
+    /// CAPPED: past [`MAX_SUB_DEPTH`] a row would be mostly margin, so deeper
+    /// descendants still paint (and still count) at the deepest indent rather
+    /// than marching off the right edge.
+    #[test]
+    fn nesting_depth_is_capped_and_orphans_fall_back_to_roots() {
+        let _g = lock();
+        clear();
+        pin("w_g0", "root");
+        pin_sub("w_g0", "w_g1", "child", 0);
+        pin_sub("w_g1", "w_g2", "grandchild", 0);
+
+        let painted = rows(false, MAX_VISIBLE);
+        let depth_of = |id: &str| {
+            let h = painted
+                .iter()
+                .find(|(h, _)| h.contains(id))
+                .map(|(h, _)| h.clone())
+                .unwrap_or_else(|| panic!("{id} missing from {painted:#?}"));
+            (h.len() - h.trim_start().len()) / SUB_INDENT.len()
+        };
+        assert_eq!(depth_of("w_g0"), 0);
+        assert_eq!(depth_of("w_g1"), 1);
+        assert_eq!(depth_of("w_g2"), MAX_SUB_DEPTH);
+
+        // Past the cap the indent STOPS growing — the row still paints (and
+        // still counts), it just stops marching toward the right edge.
+        let pair = ("row".to_string(), "status".to_string());
+        let (deep_top, deep_bottom) = indent_pair(pair.clone(), MAX_SUB_DEPTH + 7, false);
+        let (cap_top, cap_bottom) = indent_pair(pair, MAX_SUB_DEPTH, false);
+        assert_eq!(deep_top, cap_top);
+        assert_eq!(deep_bottom, cap_bottom);
+
+        // A child whose parent isn't tracked (evicted, or already retired) is
+        // still LIVE work — it renders as a root rather than vanishing.
+        clear();
+        pin_sub("w_never_pinned", "w_orphan", "orphaned child", 0);
+        let painted = rows(false, MAX_VISIBLE);
+        assert_eq!(painted.len(), 1, "{painted:#?}");
+        assert!(!painted[0].0.starts_with(' '), "{:?}", painted[0].0);
+        assert!(painted[0].0.contains("w_orphan"), "{:?}", painted[0].0);
+        clear();
+    }
+
+    /// `pin_sub` is INSERT-ONLY. The REPL discovers sub-workers by polling the
+    /// durable run table, so it re-pins the same child every tick; refreshing
+    /// in place would restart the child's clock and wipe the verdict, leaving a
+    /// finished sub-worker that can never age out of the tray.
+    #[test]
+    fn repinning_a_sub_worker_is_a_discovery_not_a_relaunch() {
+        let _g = lock();
+        clear();
+        pin("w_p", "parent");
+        pin_sub("w_p", "w_c", "child task", 90_000);
+        set_status("w_c", "turn 3 · building");
+        note_terminal("w_c", false);
+
+        // Same child, polled again: no duplicate row, verdict and status intact.
+        pin_sub("w_p", "w_c", "child task", 0);
+        assert_eq!(count(), 2, "no duplicate row for the same child");
+        let painted = rows(false, MAX_VISIBLE);
+        let child = painted
+            .iter()
+            .find(|(h, _)| h.contains("w_c"))
+            .expect("child row");
+        assert!(child.1.contains("turn 3 · building"), "{child:?}");
+        // The backdated clock survives too — a child discovered mid-run keeps
+        // its real elapsed time instead of resetting to 0s.
+        assert!(child.1.contains("1m"), "{child:?}");
         clear();
     }
 }

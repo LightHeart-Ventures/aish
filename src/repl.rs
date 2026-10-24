@@ -2617,7 +2617,159 @@ fn refresh_escalation_status_from(
             crate::escalation::note_terminal(&id, status == "failed");
         }
     }
-    refresh_escalation_beats(store, &ids);
+    // FAN-OUT: a pinned coordinator's own children run in their own processes,
+    // so they are nowhere in `jobs` — they come from the durable table instead.
+    refresh_escalation_subworkers(store);
+    // Re-read the ids: the pass above may have pinned fresh sub-worker rows, and
+    // each needs its heart fed in the SAME pass or it paints hollow ("no
+    // liveness claim") until the next poll window opens.
+    refresh_escalation_beats(store, &crate::escalation::pinned_ids());
+}
+
+/// Discover and refresh the tray's SUB-WORKER rows: coordinators spawned BY a
+/// pinned coordinator.
+///
+/// A worker's fan-out runs in its own process, so this session's `worker_jobs`
+/// never sees it — the only shared evidence is the durable `coordinator_runs`
+/// table, where every child carries its `parent_run_id`. So we walk that table
+/// transitively from the pinned ids and pin each descendant via
+/// [`crate::escalation::pin_sub`], which files it under its parent; the tray's
+/// forest walk indents it behind a bent arrow. Same labels the root rows use:
+/// the model-written title on the head row, the activity summary on the status
+/// row (see [`crate::activity_summary`]), with the heart fed by
+/// [`refresh_escalation_beats`] from the child's own durable heartbeat.
+///
+/// Throttled, like the beats pass and for the same reason: this runs on the
+/// footer paint path — several times a second — while the table it reads only
+/// changes on a heartbeat cadence.
+///
+/// Only a NON-TERMINAL, recently-beating child is newly pinned. A finished child
+/// keeps its durable row forever, so pinning on parentage alone would re-pin a
+/// verdict that already aged out of the tray ([`crate::escalation::DWELL`]) on
+/// the very next poll — an immortal row that outlives the work. A child ALREADY
+/// pinned keeps getting refreshed either way, so one that finishes while on
+/// screen still shows its verdict and then retires for good.
+fn refresh_escalation_subworkers(store: Option<&crate::db::CoordinatorStore>) {
+    const SUB_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    /// How stale a non-terminal row may be and still count as live work. A
+    /// coordinator killed mid-run leaves `phase = "running"` behind forever;
+    /// without this guard that corpse would pin itself under a live parent.
+    const SUB_STALE_SECS: i64 = 600;
+    /// Cap on the parent-link walk. Bounds both a pathological chain and a
+    /// cyclic `parent_run_id` (self-parent is skipped outright).
+    const MAX_PASSES: usize = 8;
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    let Some(store) = store else { return };
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|t| t.elapsed() < SUB_POLL) {
+        return; // inside the throttle window — rows keep their last values
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+
+    let pinned = crate::escalation::pinned_ids();
+    if pinned.is_empty() {
+        return;
+    }
+    let Ok(all) = store.load_all() else { return };
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // Collect every descendant of a pinned row, breadth-first: a child found in
+    // one pass can itself be a parent in the next. A candidate that is NOT live
+    // is skipped WITHOUT being marked shown, so its own children can't pin
+    // either — a grandchild whose parent is absent from the tray would otherwise
+    // render as a bogus root.
+    let mut shown: std::collections::HashSet<&str> = pinned.iter().map(String::as_str).collect();
+    let mut subs: Vec<&crate::coordinator_store::CoordinatorRow> = Vec::new();
+    for _ in 0..MAX_PASSES {
+        let mut added = false;
+        for r in &all {
+            let Some(parent) = r.parent_run_id.as_deref() else {
+                continue; // a root coordinator — the in-mem path owns those
+            };
+            if parent == r.run_id || !shown.contains(parent) {
+                continue;
+            }
+            if subs.iter().any(|s| s.run_id == r.run_id) {
+                continue; // already collected this pass
+            }
+            let already_pinned = pinned.contains(&r.run_id);
+            if !already_pinned && !subworker_is_live(r, now_epoch, SUB_STALE_SECS) {
+                continue;
+            }
+            shown.insert(r.run_id.as_str());
+            subs.push(r);
+            added = true;
+        }
+        if !added {
+            break;
+        }
+    }
+
+    for r in subs {
+        let Some(parent) = r.parent_run_id.as_deref() else {
+            continue;
+        };
+        let label = [r.title.as_deref(), r.activity_summary.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| r.task.split_whitespace().collect::<Vec<_>>().join(" "));
+        // Age the child's clock from its own `created_at` so a row pinned late
+        // (discovered on a poll well after the child started) still shows the
+        // true runtime instead of restarting from zero.
+        let age_ms = r
+            .created_at
+            .as_deref()
+            .and_then(crate::style::parse_sqlite_utc)
+            .map(|t| (now_epoch - t).max(0) as u64 * 1000)
+            .unwrap_or(0);
+        crate::escalation::pin_sub(parent, &r.run_id, &label, age_ms);
+        // Keep the head row's identity current: `title` lands on the durable row
+        // a beat after the child starts, and `set_task` ignores an empty label.
+        crate::escalation::set_task(&r.run_id, &label);
+        let activity = r
+            .activity_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let text = match activity {
+            Some(a) => format!("{} · {a}", r.phase),
+            None => r.phase.clone(),
+        };
+        crate::escalation::set_status(&r.run_id, &text);
+        if matches!(r.phase.as_str(), "done" | "failed") {
+            crate::escalation::note_terminal(&r.run_id, r.phase == "failed" || r.error.is_some());
+        }
+    }
+}
+
+/// Is this durable row a sub-worker worth PINNING — i.e. work that is plausibly
+/// still running? Terminal rows are excluded (see the immortal-row note on
+/// [`refresh_escalation_subworkers`]), as are rows whose last evidence of life
+/// is older than `stale_secs` — a coordinator killed mid-run leaves its phase at
+/// `running` forever, and that corpse must not pin itself under a live parent.
+fn subworker_is_live(
+    r: &crate::coordinator_store::CoordinatorRow,
+    now_epoch: i64,
+    stale_secs: i64,
+) -> bool {
+    if matches!(r.phase.as_str(), "done" | "failed") {
+        return false;
+    }
+    r.heartbeat_at
+        .as_deref()
+        .or(r.created_at.as_deref())
+        .and_then(crate::style::parse_sqlite_utc)
+        // No parseable timestamp at all: trust the phase rather than hide live
+        // work — the row was written by a coordinator that claims to be running.
+        .is_none_or(|seen| now_epoch - seen <= stale_secs)
 }
 
 /// Feed every pinned banner's liveness heart from its worker's DURABLE heartbeat
