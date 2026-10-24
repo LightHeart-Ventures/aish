@@ -285,7 +285,129 @@ as a share of the whole run.
 
 ---
 
-## 7. Open questions
+## 7. Interactive ↔ worker context handoff
+
+The planner above decides *who gets spawned*. This section covers the other half of the
+same seam: what the **interactive session** keeps in context once it has spawned them.
+
+### 7.1 What aish does today (verified against the source)
+
+| Concern | Mechanism today | Verdict |
+| --- | --- | --- |
+| "What did I dispatch?" | `coordinator_runs.task` holds the brief **verbatim**; `background_status` re-serves every job's full task brief in a `Full task briefs` section | **covered** — re-readable at any time, even after compaction |
+| "Which session dispatched it?" | `coordinator_runs.session_id` / `session_name`; `parent_run_id` for the tree (`docs/workers-hierarchy.md`) | **covered** |
+| "*Why* did I dispatch it?" | nothing. The rationale lives only in the live message history | **gap** |
+| "What context produced that decision?" | the reads/greps that justified the dispatch are ordinary history messages | **gap** — they are the *first* thing compaction evicts |
+| Compacted context | `offloads (id, ts, content)` — a dedicated table, deliberately quarantined from curated `memories`; retrieved by `recall_offloads(limit)` (newest-first) and bounded by `reap_offloads(keep_recent, max_age_days)` | **addressable only by recency**; no `run_id`, no `session_id`, and old anchors can be **reaped outright** |
+| When compaction happens | token-pressure-reactive: `plan_compaction` plus the pre-flight ceiling guard | **not aligned to the dispatch boundary** |
+
+So the session remembers **what** it called and **who** it was, but not **why**, and the
+evidence behind the decision is an anonymous blob reachable only by "most recent" — which
+is exactly wrong when three fan-outs are in flight.
+
+### 7.2 Principle: the brief is the retained artifact
+
+dai's router writes **one bounded brief and builds nothing**; progress back up the tree is
+**metadata only** (#130). Carry that to the parent's own memory:
+
+> If the ≤600-char brief was sufficient to make a worker do the job, it is sufficient for
+> the parent to remember the job. The discovery context *behind* the brief is **evictable
+> but must stay addressable**.
+
+That makes the dispatch boundary the natural compaction seam — the one moment where the
+session provably no longer needs the raw reads it just distilled.
+
+### 7.3 Dispatch ledger (`dispatch_records`)
+
+One durable row per dispatch, written at spawn time:
+
+```
+dispatch_records(
+  run_id        TEXT PRIMARY KEY,   -- joins coordinator_runs
+  session_id    TEXT NOT NULL,
+  ts            TEXT NOT NULL,
+  cwd           TEXT,
+  role          TEXT,               -- from the §3.1 registry ("impl", "docs", …)
+  fanout_id     TEXT,               -- groups one wave of siblings
+  brief         TEXT NOT NULL,      -- the shared brief (§3.3)
+  rationale     TEXT NOT NULL,      -- <=200 chars: WHY this was offloaded, not inlined
+  expectation   TEXT,               -- what the parent intends to do with the result
+  offload_id    INTEGER             -- anchor into `offloads`: the context that produced it
+)
+```
+
+`rationale` + `expectation` are written by the model **at dispatch**, when the reasoning is
+still in context — never reconstructed afterwards. This also feeds `dispatch_stats`, which
+today can measure that a job finished in 20 s (a likely missed inline opportunity) but
+cannot say what the coordinator *thought* it was buying.
+
+### 7.4 Handoff checkpoint — compact at the fan-out boundary, not per call
+
+1. **After the last dispatch of a wave** (not after each `run_in_background` — the parent
+   needs the same context to spawn siblings in the same turn), compact the history segment
+   that existed only to produce the brief: the discovery reads, greps, and candidate-path
+   listings.
+2. Persist it to `offloads` with the new `run_id` / `fanout_id` columns → the link becomes
+   **bidirectional**: run → context, and context → run.
+3. Replace it in-context with a three-line stub:
+
+```
+[dispatched w_Z8lsahxQ role=docs fanout=f_41  why: needs the dai PR bodies re-read; 6-min job
+ expect: merge its §7 into the design doc, then answer inline
+ context: offload #184  (recall tag=context-offload run=w_Z8lsahxQ)]
+```
+
+That stub is the operator-visible answer to "does the session remember what it called and
+why, with a link to the context?" — yes, in ~40 tokens instead of ~8k.
+
+### 7.5 Retention guard
+
+`reap_offloads` must not delete an **anchored** offload while its run is non-terminal:
+
+- skip rows whose `run_id` maps to a `coordinating` / `awaiting_batch` / `checkpoint` run;
+- keep anchored rows for a grace window (7 days) past terminal, then reap normally;
+- unanchored transcripts keep today's recency bound unchanged.
+
+Compaction is only a *reversible* act if the evicted content is still addressable. Without
+this guard the stub can point at a deleted row — the worst outcome of the whole design.
+
+### 7.6 Rehydration protocol (result delivery)
+
+When a worker's result lands, the parent rehydrates **in cost order**, stopping at the
+first sufficient rung:
+
+| Rung | Read | Cost |
+| --- | --- | --- |
+| 1 | the stub already in context (role, why, expectation) | free |
+| 2 | `dispatch_records` row + `coordinator_runs.task` / `result` | ~1 call |
+| 3 | targeted `recall(tag=context-offload, run=<run_id>)` — *this* run's context, not "the newest blob" | 1 call, bounded |
+| 4 | re-read the source files named in the dispatch record | N calls |
+
+Rung 3 is the part that does not exist today: `recall_offloads` is recency-only, so a
+parent juggling three fan-outs can only ask for "the most recent transcript" and hope.
+
+### 7.7 What stays out
+
+- **No child transcripts in the parent.** Metadata-only progress (dai #130). The child's
+  reasoning stays in its own run row; the parent gets result + status + counters.
+- **No compaction mid-fan-out.** Siblings in one wave share the parent's context by design
+  (the batching rule); compacting between them would force re-discovery.
+- **No semantic summarization of the brief.** The brief is already the summary. Re-summarizing
+  a summary is how the "what did I ask for?" drift starts; `coordinator_runs.task` stays
+  verbatim, as it is today.
+- **No new recall surface for curated memories.** `offloads` stays quarantined from
+  `memories` — anchoring adds an index, not a merge.
+
+### 7.8 Phasing (folds into §4)
+
+| Phase | Deliverable | Acceptance |
+| --- | --- | --- |
+| P0+ | `dispatch_records` table + `offloads.run_id` / `fanout_id` columns + retention guard | migration idempotent; `reap_offloads` test proves an in-flight anchor survives |
+| P1+ | rationale/expectation captured at dispatch; stub emitted; `:dispatch log` and `:workers --why` render the ledger | a compacted session can still answer "why is w_… running?" from context alone |
+| P2+ | fan-out-boundary checkpoint; run-scoped `recall` | measured: parent context tokens at fan-out+1 turn, before vs after; zero stub→reaped-offload dangles |
+
+
+## 8. Open questions
 
 1. Where does the registry live — compiled-in defaults only, or overridable per repo via
    `.aish/roles.toml` (with the coverage test run against the override)?
@@ -295,3 +417,10 @@ as a share of the whole run.
    process (cleaner span boundary, one more spawn)?
 4. For `analysis` programs, is "disjoint report headings" enough, or do we need dai's
    stricter key-level contract for structured outputs?
+5. Who writes `rationale` — the model at dispatch (honest but costs a few tokens per spawn)
+   or a deterministic template from the router's role + brief (free but shallow)?
+6. Should the handoff checkpoint be **mandatory** at a fan-out boundary, or only fire when
+   the session is already above a context watermark (say 50%)? Mandatory is predictable;
+   watermark-gated is cheaper for short sessions.
+7. Does the stub belong in the message history (evictable again later) or in a pinned
+   block alongside the verbatim task (never evictable, grows with fan-out count)?
