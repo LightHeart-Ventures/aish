@@ -5608,10 +5608,14 @@ pub(crate) fn dispatch_coordinator_ctx(task: &str, ctx: &OpsCtx) -> Dispatched {
                 .lock()
                 .unwrap()
                 .insert(task_hash(task), (id.clone(), now));
-            let message = format!(
-                "\x1b[2mdispatched background coordinator \x1b[0m\x1b[1;36m{id}\x1b[0m\x1b[2m \
-— runs here with the full toolset; result auto-delivers. \x1b[0m\x1b[36m:workers\x1b[0m\x1b[2m to check.\x1b[0m"
-            );
+            // Same SHAPE as the agent-initiated escalation banner (see
+            // `liftoff_banner_body`): a deliberate `:dispatch` and an escalation
+            // both mean "this work now lives on a background worker", so they
+            // read as ONE visual family instead of two unrelated notices.
+            // `dispatch_background` re-renders this with the liftoff animation on
+            // a TTY; a mid-turn `:dispatch` (which can only return a string) uses
+            // this static final-frame line as-is.
+            let message = liftoff_banner_line("dispatched to", crate::batch::short_id(&id));
             Dispatched {
                 id: Some(id),
                 message,
@@ -5688,49 +5692,51 @@ pub(crate) fn run_midturn_command(line: &str, ctx: &OpsCtx) -> Option<String> {
     }
 }
 
-/// Launch a background coordinator for `task` and report it — WITHOUT
-/// auto-attaching. The coordinator runs quietly in the background (its result
-/// auto-delivers); the interactive session keeps its plain prompt and the
-/// `:output` stream is NOT turned on. This mirrors the `run_in_background`
-/// tool's fire-and-forget contract: dispatching does not commandeer the prompt
-/// or start streaming the worker's activity. Use `:attach <id>` afterwards to
-/// watch + steer it, or `:output on` to stream every coordinator's activity.
-///
-/// `escalation` distinguishes the two ways we reach here. An explicit
-/// `:dispatch <task>` (`escalation == false`) is a deliberate launch and prints
-/// the neutral "dispatched … :attach/:output" guidance. An ESCALATION
-/// (`escalation == true`) is the agent offloading heavy work on its own — either
-/// because it decided to, or because the typed line carried a work signal
-/// (outside `:dispatch`). An escalation prints the dedicated escalating banner
-/// (emoji + "Shift-Tab to see work") and leaves the operator free to keep
-/// working in the interactive session, the newly-spawned worker (a `w_########`
-/// id) waiting one Shift-Tab away.
-/// Print the escalation banner, animating the leading arrow so it "lifts off"
+/// Leading glyph of the banner's FINAL frame — the one the liftoff animation
+/// settles on, and the only one a non-TTY ever sees.
+const LIFTOFF_GLYPH: &str = "\u{2934}\u{fe0f}";
+
+/// Body of a liftoff banner: everything after the animating arrow glyph.
+/// `verb` is the offload phrasing — `"escalated to"` when the agent offloaded
+/// the work itself, `"dispatched to"` when the operator typed `:dispatch`. The
+/// rest is deliberately IDENTICAL for both: either way the work now lives on a
+/// background worker the operator can keep working alongside, so the two notices
+/// read as one visual family instead of two unrelated lines. Pure → testable.
+fn liftoff_banner_body(verb: &str, short: &str) -> String {
+    format!(
+        "  {verb} background worker {short}\x1b[0m \x1b[2m— keep working here; Shift-Tab to see work.\x1b[0m"
+    )
+}
+
+/// The banner as ONE static line (its final frame, no motion). Used off a TTY
+/// and by callers that can only hand back a string instead of printing — the
+/// mid-turn `:dispatch` path, which returns `Dispatched::message`.
+pub(crate) fn liftoff_banner_line(verb: &str, short: &str) -> String {
+    format!(
+        "\x1b[1;33m{LIFTOFF_GLYPH}{}",
+        liftoff_banner_body(verb, short)
+    )
+}
+
+/// Print the liftoff banner, animating the leading arrow so it "lifts off"
 /// the way the work does — a right→up-right→curve-up glyph sweep that settles on
 /// the ⤴️ emoji, then the static banner text. The animation runs ONLY on an
 /// interactive terminal (a piped/redirected stdout gets the final frame in one
 /// clean write, no escape/`\r` noise — same TTY-gating contract as
 /// `clear_screen`). Each frame rewrites the line in place with `\r\x1b[2K`; the
 /// final frame is left on screen followed by a newline.
-fn print_escalation_banner(short: &str) {
+fn print_liftoff_banner(verb: &str, short: &str) {
     // Body of the banner, minus the leading arrow glyph (which is what animates).
-    let body = format!(
-        "  escalated to background worker {short}\x1b[0m \x1b[2m— keep working here; Shift-Tab to see work.\x1b[0m"
-    );
+    let body = liftoff_banner_body(verb, short);
     // SAFETY: plain isatty query. Off a TTY, skip the motion entirely.
     let is_tty = unsafe { libc::isatty(1) } == 1;
     if !is_tty {
-        println!("\x1b[1;33m⤴\u{fe0f}{body}");
+        println!("\x1b[1;33m{LIFTOFF_GLYPH}{body}");
         return;
     }
     // Liftoff frames: a flat arrow tilts upward, then curls into the final
     // curve-up emoji — reads as the escalated work taking off.
-    const FRAMES: &[&str] = &[
-        "\u{2192}",
-        "\u{2197}",
-        "\u{2b06}\u{fe0f}",
-        "\u{2934}\u{fe0f}",
-    ];
+    const FRAMES: &[&str] = &["\u{2192}", "\u{2197}", "\u{2b06}\u{fe0f}", LIFTOFF_GLYPH];
     let mut out = std::io::stdout();
     for frame in FRAMES {
         let _ = write!(out, "\r\x1b[2K\x1b[1;33m{frame}{body}");
@@ -5742,6 +5748,23 @@ fn print_escalation_banner(short: &str) {
     let _ = out.flush();
 }
 
+/// Launch a background coordinator for `task` and report it — WITHOUT
+/// auto-attaching. The coordinator runs quietly in the background (its result
+/// auto-delivers); the interactive session keeps its plain prompt and the
+/// `:output` stream is NOT turned on. This mirrors the `run_in_background`
+/// tool's fire-and-forget contract: dispatching does not commandeer the prompt
+/// or start streaming the worker's activity. Use `:attach <id>` afterwards to
+/// watch + steer it, or `:output on` to stream every coordinator's activity.
+///
+/// `escalation` distinguishes the two ways we reach here, and now changes only
+/// the VERB in the banner. An explicit `:dispatch <task>` (`escalation == false`)
+/// is a deliberate launch ("dispatched to background worker …"); an ESCALATION
+/// (`escalation == true`) is the agent offloading heavy work on its own — either
+/// because it decided to, or because the typed line carried a work signal
+/// (outside `:dispatch`) — and reads "escalated to background worker …". Both
+/// print the same liftoff banner (⤴️ + "keep working here; Shift-Tab to see
+/// work"), leaving the operator free to keep working in the interactive session
+/// with the newly-spawned worker (a `w_########` id) one Shift-Tab away.
 fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     let Dispatched { id, message } = dispatch_coordinator(task, session);
     // A guard failure (empty/nested/no-credential/no-binary) carries no id —
@@ -5756,13 +5779,17 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
         // as a background worker, tell the operator they can keep working, and
         // point them at Shift-Tab to watch it — newest worker is one press away.
         // The leading ⤴️ "lifts off" with a brief liftoff animation on a TTY.
-        print_escalation_banner(short);
+        print_liftoff_banner("escalated to", short);
         return;
     }
     // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or turn
-    // `:output` on. The one-line `message` already carries the :attach/:output
-    // guidance (built in dispatch_coordinator), so print it and we're done.
-    println!("{message}");
+    // `:output` on. An operator-typed `:dispatch` gets the SAME banner as an
+    // escalation (only the verb differs) — same glyph, same liftoff animation,
+    // same "keep working here; Shift-Tab to see work" tail — because it means
+    // the same thing to the operator. `message` already holds this line's static
+    // form (so the mid-turn path matches); printing it through the banner adds
+    // the animation on a TTY.
+    print_liftoff_banner("dispatched to", short);
 }
 
 /// Sentinel id `:attach goal` resolves to. Equal to the goal loop's live
@@ -14742,6 +14769,32 @@ mod tests {
         let d = dispatch_coordinator("fix the failing test", &mut session);
         assert!(d.id.is_none(), "nested dispatch must not spawn");
         assert!(d.message.contains("nested"), "{}", d.message);
+    }
+
+    #[test]
+    fn liftoff_banner_is_one_family_for_dispatch_and_escalation() {
+        // The whole point of the change: an operator-typed `:dispatch` and an
+        // agent-initiated escalation render the SAME banner — same leading
+        // glyph, same "keep working here; Shift-Tab to see work" tail, same
+        // worker id — differing only in the verb. If these ever drift apart the
+        // operator sees two unrelated notices again.
+        let esc = liftoff_banner_line("escalated to", "w_2WjMgbqm");
+        let dis = liftoff_banner_line("dispatched to", "w_2WjMgbqm");
+        for line in [&esc, &dis] {
+            assert!(line.contains(LIFTOFF_GLYPH), "missing liftoff glyph: {line}");
+            assert!(line.contains("background worker w_2WjMgbqm"), "{line}");
+            assert!(line.contains("Shift-Tab to see work"), "{line}");
+            // No leftovers from the old dispatch notice.
+            assert!(!line.contains("auto-delivers"), "{line}");
+            assert!(!line.contains(":workers"), "{line}");
+        }
+        assert!(esc.contains("escalated to background worker"), "{esc}");
+        assert!(dis.contains("dispatched to background worker"), "{dis}");
+        // Identical apart from the verb.
+        assert_eq!(
+            esc.replace("escalated to", "VERB"),
+            dis.replace("dispatched to", "VERB")
+        );
     }
 
     #[test]
