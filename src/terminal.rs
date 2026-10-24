@@ -2613,7 +2613,7 @@ pub fn install_panic_hook() {
 
 /// Query the terminal's `(rows, cols)` via TIOCGWINSZ on stdout. `None` off a
 /// tty or when the ioctl reports a zero-sized window.
-fn term_size() -> Option<(u16, u16)> {
+pub(crate) fn term_size() -> Option<(u16, u16)> {
     // SAFETY: isatty + a read-only TIOCGWINSZ ioctl on stdout (fd 1).
     unsafe {
         if libc::isatty(1) != 1 {
