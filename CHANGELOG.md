@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.61.5] - 2026-10-24
+
+### Changed
+- **Local inference reuses its KV cache across turns and offloads to Metal by default.** `LocalBackend::complete()` built a **fresh `LlamaContext` on every call** and decoded the whole conversation from token 0 each turn — a full prefill per message on a 32B Q6_K, getting worse as the session grew — and `n_gpu_layers` defaulted to `0`, so unless the operator knew to set `AISH_LOCAL_N_GPU_LAYERS=999` a 27 GB model ran entirely on CPU. The context and KV cache now persist in `LocalBackend::session`: each turn computes the longest common token prefix against what is already resident, evicts from the first divergence with `clear_kv_cache_seq`, and decodes **only the new tail**, so steady-state turns prefill just the new user message instead of the entire history; generated tokens are recorded into the cache post-decode (including on early-exit paths) so the cached sequence never claims a position the KV cache does not hold, and the context is rebuilt **only** when `n_ctx` or `n_batch` changes under us — dropping the old context before allocating the replacement so two KV caches are never resident at once. `n_gpu_layers` now defaults to 999 on macOS (every Mac that can hold a GGUF has a Metal device) and `0` elsewhere. `AISH_LOCAL_BATCH_SIZE` was a no-op above 512 because nothing called `with_n_batch`; it is now wired to `n_batch`/`n_ubatch` so a raised value actually reaches the GPU as one dispatch, with the clamp widened `32..=512` → `32..=4096`. `DEFAULT_N_CTX` 4096 → 8192 and `DEFAULT_MAX_OUTPUT_TOKENS` 512 → 1024, which retires the reported `prompt trimmed: dropped 4201 of 7785 tokens` symptom — aish's own system prompt plus a couple of turns did not fit in 3584 tokens, so every turn silently amputated the middle of the conversation. Trimming and reuse interact safely: the cache is compared against the **materialized surviving token sequence** in position order (not the raw prompt), which is exactly what the KV cache holds at `0..kept`, and a trim that shifts positions produces an early divergence and re-decodes from there. New `local_plan::common_prefix_len` covers append, trim, mid-way divergence, divergence at token 0, and empty inputs (#1046).
+
 ## [0.61.4] - 2026-10-24
 
 ### Fixed
