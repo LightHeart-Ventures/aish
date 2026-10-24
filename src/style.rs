@@ -694,45 +694,81 @@ pub fn visible_cols(s: &str) -> usize {
     width
 }
 
-/// Compose the footer's 2nd statusline (row H-1): the already-styled `left`
-/// coordinator message stays on the LEFT and the session `name` (set via
-/// `:rename`) is right-justified on the RIGHT, in bold magenta (the accent it
-/// carried as the prompt `[name]` prefix). When there's no name the `left` is returned
-/// unchanged. Pure — width/color are supplied so it's unit-testable.
-pub fn second_statusline_at(
-    left: &str,
-    name: Option<&str>,
-    width: usize,
-    color_on: bool,
-) -> String {
-    let name = match name {
-        Some(n) if !n.is_empty() => n,
-        _ => return left.to_string(),
-    };
-    let width = width.max(MIN_STATUSLINE_COLS);
-    // `visible_cols` (not chars) so emoji status badges appended to the name —
-    // 🤖 workers / ⏰ alert / 🎯 goal, each 2 display cols — don't push the
-    // right edge past the terminal width.
-    let rw = visible_cols(name);
-    // The RIGHT zone (session name + live badges) is the row's anchored signal:
-    // an armed ⏰ alert or a 🤖 working coordinator must stay visible. So the
-    // LEFT (coordinator hint + plugin segments) is what yields when the two
-    // collide — clipped escape-aware with `…` — instead of letting the overflow
-    // run off the edge and take the badges with it.
-    let left_budget = width.saturating_sub(rw + 1);
-    let clipped = clip_cols_styled(left, left_budget);
-    let left = clipped.as_str();
-    let lw = visible_cols(left);
-    let gap = width.saturating_sub(lw + rw).max(1);
-    let spaces = " ".repeat(gap);
-    if color_on {
-        // Bold magenta — same accent the name carried as the prompt `[name]`
-        // prefix before it moved onto this row (kept deliberately, not dimmed).
-        format!("{left}{spaces}\x1b[1;35m{name}{RESET}")
+/// Default xterm-256 background for the submitted-input highlight band — a grey
+/// that reads as a light band on the dark terminals aish targets while leaving
+/// the prompt's own cyan/green foregrounds legible. Override the shade with
+/// `AISH_INPUT_HIGHLIGHT_BG=<0-255>` (any xterm-256 index: `250` for a
+/// genuinely pale grey, `0` for black).
+pub const INPUT_HIGHLIGHT_BG: &str = "\x1b[48;5;237m";
+
+/// The SGR background to paint the input band with right now: the
+/// `AISH_INPUT_HIGHLIGHT_BG` override when it parses as an xterm-256 index,
+/// else [`INPUT_HIGHLIGHT_BG`].
+pub fn input_highlight_bg() -> String {
+    std::env::var("AISH_INPUT_HIGHLIGHT_BG")
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .map(|idx| format!("\x1b[48;5;{idx}m"))
+        .unwrap_or_else(|| INPUT_HIGHLIGHT_BG.to_string())
+}
+
+/// Lower half block — the glyph that paints the HALF-row band above the echo
+/// (its filled bottom half hugs the echo row; its top half stays terminal bg).
+pub const BAND_LOWER_HALF: char = '\u{2584}'; // ▄
+/// Upper half block — the glyph that paints the HALF-row band below the echo.
+pub const BAND_UPPER_HALF: char = '\u{2580}'; // ▀
+
+/// Re-aim an xterm-256 BACKGROUND SGR (`ESC[48;5;N m`) at the FOREGROUND
+/// (`ESC[38;5;N m`) so the same shade that fills the echo row can be drawn as
+/// half-block glyphs on the framing rows. Anything that isn't a 256-color bg
+/// is handed back unchanged (degrade, never mangle).
+pub fn band_fg_from_bg(bg: &str) -> String {
+    if bg.contains("48;5;") {
+        bg.replacen("48;5;", "38;5;", 1)
     } else {
-        format!("{left}{spaces}{name}")
+        bg.to_string()
     }
 }
+
+/// The three transcript lines that record one submitted input: a HALF-row band
+/// above, the `prompt + line` echo painted edge to edge, and a HALF-row band
+/// below. The framing rows are `▄` / `▀` glyphs in the band shade with NO
+/// background, so only the half of each cell that touches the echo is filled —
+/// the band reads as a thin lip above and below the echo rather than two full
+/// blank rows. Pure form: the caller decides color and shade, so the layout is
+/// unit-testable without a TTY.
+///
+/// Embedded resets inside `echo` (the prompt paints its own colors) would end
+/// the band mid-line, so every `ESC[0m` / `ESC[m` is re-armed with `bg`
+/// immediately after. With `color_on` false the band is dropped and the two
+/// framing lines come back empty — still blank, just unpainted.
+pub fn input_echo_block_with(echo: &str, cols: usize, color_on: bool, bg: &str) -> Vec<String> {
+    if !color_on {
+        return vec![String::new(), echo.to_string(), String::new()];
+    }
+    let fg = band_fg_from_bg(bg);
+    let half = |glyph: char| format!("{fg}{}{RESET}", glyph.to_string().repeat(cols));
+    let rearmed = echo
+        .replace(RESET, &format!("{RESET}{bg}"))
+        .replace("\x1b[m", &format!("\x1b[m{bg}"));
+    let pad = " ".repeat(cols.saturating_sub(visible_cols(echo)));
+    vec![
+        half(BAND_LOWER_HALF),
+        format!("{bg}{rearmed}{pad}{RESET}"),
+        half(BAND_UPPER_HALF),
+    ]
+}
+
+/// Runtime form of [`input_echo_block_with`]: reads [`colors_enabled`] and the
+/// `AISH_INPUT_HIGHLIGHT_BG` shade for the given terminal width.
+pub fn input_echo_block(echo: &str, cols: usize) -> Vec<String> {
+    input_echo_block_with(echo, cols, colors_enabled(), &input_highlight_bg())
+}
+
+// NOTE: the session name no longer rides the 2nd statusline. It is welded into
+// the footer's horizontal RULE (`terminal::separator_line_labeled`), ~2 columns
+// from the right edge with rule glyphs continuing on both sides. This row is now
+// pure left-zone content, clipped to `footer_width()` by its caller.
 
 /// Clip a PLAIN (escape-free) string to at most `max` display columns, marking
 /// a cut with a trailing `…`. Measured by unicode display width, so a CJK or
@@ -1290,20 +1326,6 @@ mod tests {
     }
 
     #[test]
-    fn second_statusline_clips_left_before_dropping_the_name_badges() {
-        let long = "x".repeat(200);
-        let s = second_statusline_at(&long, Some("sprint-42 ⏰"), 80, false);
-        assert!(
-            visible_cols(&s) <= 80,
-            "row overflowed: {}",
-            visible_cols(&s)
-        );
-        // The anchored right zone survives — an armed alert badge must stay visible.
-        assert!(s.ends_with("sprint-42 ⏰"), "lost the name/badges: {s}");
-        assert!(s.contains('…'), "left zone should be clipped: {s}");
-    }
-
-    #[test]
     fn visible_cols_ignores_ansi() {
         assert_eq!(visible_cols("abc"), 3);
         assert_eq!(visible_cols("\x1b[36mabc\x1b[0m"), 3);
@@ -1319,30 +1341,6 @@ mod tests {
             visible_cols("\x1b[36m\x1b]8;;https://x.io\x07ok\x1b]8;;\x07\x1b[39m"),
             2
         );
-    }
-
-    #[test]
-    fn second_statusline_right_justifies_name() {
-        // No name → left returned unchanged.
-        assert_eq!(second_statusline_at("left", None, 80, false), "left");
-        assert_eq!(second_statusline_at("left", Some(""), 80, false), "left");
-        // Plain: name flush right, whole row exactly `width` columns.
-        let s = second_statusline_at("left", Some("myproj"), 80, false);
-        assert!(s.starts_with("left"));
-        assert!(s.ends_with("myproj"));
-        assert_eq!(s.chars().count(), 80);
-    }
-
-    #[test]
-    fn second_statusline_colored_name_is_magenta() {
-        let left = "\x1b[36m⇄ detached\x1b[0m";
-        let s = second_statusline_at(left, Some("proj"), 80, true);
-        assert!(s.starts_with(left)); // left half untouched
-        assert!(s.contains("\x1b[1;35mproj")); // name bold magenta (kept accent)
-        assert!(s.ends_with(RESET));
-        // Alignment is computed from VISIBLE columns, so ANSI in `left` doesn't
-        // push the name off the right edge.
-        assert_eq!(visible_cols(&s), 80);
     }
 
     #[test]
@@ -1470,5 +1468,71 @@ Watch for this condition and call the `set_alert` tool with alert_id=7 …";
             notice_flash("history cleared", true),
             "\x1b[2mhistory cleared\x1b[0m"
         );
+    }
+
+    #[test]
+    fn input_echo_block_frames_echo_with_half_row_band_lines() {
+        let block = input_echo_block_with("❯ :jobs", 20, true, "\x1b[48;5;237m");
+        assert_eq!(block.len(), 3, "half band + echo + half band");
+        // Every row spans the full width and resets, so the band is a solid
+        // rectangle rather than a ragged right edge.
+        for row in &block {
+            assert!(row.ends_with(RESET), "row reset: {row:?}");
+            assert_eq!(visible_cols(row), 20, "row spans cols: {row:?}");
+        }
+        // Only the echo row carries the BACKGROUND; the framing rows paint the
+        // same shade as a half-block FOREGROUND so just the half of the cell
+        // touching the echo is filled.
+        assert!(block[1].starts_with("\x1b[48;5;237m"), "echo armed");
+        assert!(block[1].contains("❯ :jobs"));
+        for row in [&block[0], &block[2]] {
+            assert!(row.starts_with("\x1b[38;5;237m"), "band fg: {row:?}");
+            assert!(!row.contains("48;5;"), "band has no bg: {row:?}");
+            assert!(!row.contains(':'), "band is textless: {row:?}");
+        }
+    }
+
+    #[test]
+    fn input_echo_block_band_rows_use_matching_half_blocks() {
+        // Above the echo the band must fill the cell's LOWER half (▄) and below
+        // it the UPPER half (▀), so both lips hug the echo row.
+        let block = input_echo_block_with("❯ hi", 6, true, "\x1b[48;5;237m");
+        assert_eq!(block[0], format!("\x1b[38;5;237m{}{RESET}", "▄".repeat(6)));
+        assert_eq!(block[2], format!("\x1b[38;5;237m{}{RESET}", "▀".repeat(6)));
+        assert_eq!(BAND_LOWER_HALF, '▄');
+        assert_eq!(BAND_UPPER_HALF, '▀');
+        assert_eq!(band_fg_from_bg("\x1b[48;5;250m"), "\x1b[38;5;250m");
+    }
+
+    #[test]
+    fn input_echo_block_rearms_bg_after_embedded_resets() {
+        // The prompt paints its own colors and resets mid-line; a bare reset
+        // would end the band early, so each one is followed by the bg again.
+        let echo = format!("\x1b[1m❯{RESET} hi");
+        let block = input_echo_block_with(&echo, 10, true, "\x1b[48;5;237m");
+        assert!(block[1].contains("\x1b[0m\x1b[48;5;237m"));
+        assert_eq!(visible_cols(&block[1]), 10);
+    }
+
+    #[test]
+    fn input_echo_block_plain_mode_keeps_blank_framing() {
+        // NO_COLOR / non-tty: no SGR and no half-block glyphs anywhere, but the
+        // blank lines above and below stay so the transcript spacing is
+        // identical either way.
+        let block = input_echo_block_with("❯ :jobs", 20, false, "\x1b[48;5;237m");
+        assert_eq!(
+            block,
+            vec![String::new(), "❯ :jobs".to_string(), String::new()]
+        );
+        assert!(!block.iter().any(|r| r.contains('\x1b')));
+    }
+
+    #[test]
+    fn input_highlight_bg_honors_env_override() {
+        // Default shade when unset/garbage; any xterm-256 index when valid.
+        assert_eq!(INPUT_HIGHLIGHT_BG, "\x1b[48;5;237m");
+        // Narrow, env-free check of the formatting the override produces.
+        let shade = |idx: u8| format!("\x1b[48;5;{idx}m");
+        assert_eq!(shade(250), "\x1b[48;5;250m");
     }
 }

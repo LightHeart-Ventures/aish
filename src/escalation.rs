@@ -183,6 +183,28 @@ pub(crate) const TASK_HINT_MAX: usize = 56;
 /// `↳` prefix on a narrow window).
 pub const STATUS_MAX: usize = 110;
 
+/// Visible width of the status row's RUNTIME column (`0s` … `1h04m`).
+///
+/// The status row is a TABLE, not a sentence: runtime, state and message each
+/// occupy a fixed cell so the same field lands at the same screen column on
+/// every row of the tray. With a ` · `-joined string the message started at a
+/// different offset on every banner (`0s · …` vs `1h04m · …`), which is exactly
+/// the ragged edge the eye has to re-scan on each paint.
+pub(crate) const RUNTIME_COL: usize = 8;
+
+/// Visible width of the status row's STATE column.
+///
+/// Sized to the COMMON phases — `running`, `pending`, `queued`, `done`,
+/// `failed`, `stopped` all fit in 7 cells. The two long ones (`coordinating`,
+/// `awaiting_batch`) clip to `coordi…`, which is still unambiguous and costs
+/// seven fewer cells of indent on every other row in the tray.
+pub(crate) const STATE_COL: usize = 7;
+
+/// Visible width of the status row's MESSAGE column: the free-text cell keeps
+/// the full [`STATUS_MAX`] budget it had before the row became a table, so
+/// adding the fixed columns never shortens an activity line.
+pub(crate) const MESSAGE_COL: usize = STATUS_MAX;
+
 /// What a tray row is tracking.
 ///
 /// The tray holds two kinds of PENDING work, and the distinction is load-bearing
@@ -760,6 +782,67 @@ pub fn one_line(text: &str, max: usize) -> String {
     }
 }
 
+/// Left-align `text` in a `width`-wide cell: clipped with an ellipsis when it
+/// overflows, space-padded when it falls short. Padding is measured in TERMINAL
+/// CELLS (not chars) so a CJK or emoji status can't shove the next column out of
+/// alignment.
+fn col(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let clipped = one_line(text, width);
+    let pad = width.saturating_sub(clipped.width());
+    format!("{clipped}{}", " ".repeat(pad))
+}
+
+/// Split a composed status string into its `(state, message)` columns.
+///
+/// Worker status arrives pre-joined as `"<state> · <activity>"` (and sometimes
+/// `"<state> — <detail>"`), because that's the shape `:workers` prints. The tray
+/// wants the lifecycle word in its own cell, so peel the leading state token off
+/// when it IS one and leave anything else whole as the message — an unrecognised
+/// head is free text, not a state, and must not be silently promoted into the
+/// state column.
+pub(crate) fn split_status(status: &str) -> (&str, &str) {
+    /// The lifecycle words the worker list and the tray itself emit.
+    const STATES: [&str; 8] = [
+        "queued",
+        "pending",
+        "running",
+        "coordinating",
+        "awaiting_batch",
+        "done",
+        "failed",
+        "stopped",
+    ];
+    let s = status.trim();
+    let (head, rest) = match s.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim_start()),
+        None => (s, ""),
+    };
+    if STATES.contains(&head) {
+        // Drop the separator the state was joined to its detail with, so the
+        // message cell starts on the detail itself.
+        (
+            head,
+            rest.trim_start_matches(['·', '—', '-', ':']).trim_start(),
+        )
+    } else {
+        ("", s)
+    }
+}
+
+/// Compose the status row's three fixed cells: runtime, state, message.
+///
+/// Shared by [`render`] and [`render_queued`] so a live banner and a queued line
+/// line up with each other, not just with their own kind.
+fn status_cells(elapsed_ms: u64, state: &str, message: &str) -> String {
+    format!(
+        "{} {} {}",
+        col(&fmt_elapsed(elapsed_ms), RUNTIME_COL),
+        col(state, STATE_COL),
+        one_line(message, MESSAGE_COL)
+    )
+}
+
 /// Build ONE banner's two rows. Pure: the caller supplies the elapsed clock, the
 /// identity, the status text, and the terminal verdict, so the rendering is
 /// unit-testable without touching the global stack or a TTY.
@@ -856,15 +939,12 @@ fn render_banner(
         None => animated_heart(elapsed_ms, beat_age_secs, color_on),
         Some(_) => paint_with(IDLE_PREFIX, Color::Dim, color_on),
     };
+    let (state, message) = split_status(status);
     let bottom = format!(
         "{}{indicator} {}",
         paint_with("   ", Color::Dim, color_on),
         paint_with(
-            &format!(
-                "{} · {}",
-                fmt_elapsed(elapsed_ms),
-                one_line(status, STATUS_MAX)
-            ),
+            &status_cells(elapsed_ms, state, message),
             Color::Dim,
             color_on
         )
@@ -900,15 +980,19 @@ pub fn render_queued(
     // Dim, not cyan: a queued line is WAITING, and the live escalations above it
     // should keep the eye. The whole pair is dim so the row reads as background.
     let top = paint_with(&head, Color::Dim, color_on);
-    let detail = format!(
-        "{} · {position} of {total} — runs when this turn ends{extra_status}",
-        fmt_elapsed(elapsed_ms)
-    );
+    // Same three cells as a live banner (runtime · state · message) so a queued
+    // line's columns land on the live rows' columns instead of starting its own
+    // layout; `queued` IS this row's lifecycle state.
+    let detail = format!("{position} of {total} — runs when this turn ends{extra_status}");
     let bottom = format!(
         "{}{} {}",
         paint_with("   ", Color::Dim, color_on),
         paint_with(IDLE_PREFIX, Color::Dim, color_on),
-        paint_with(&one_line(&detail, STATUS_MAX), Color::Dim, color_on)
+        paint_with(
+            &status_cells(elapsed_ms, QUEUED_LABEL, &detail),
+            Color::Dim,
+            color_on
+        )
     );
     (top, bottom)
 }
@@ -1249,9 +1333,10 @@ mod tests {
         );
         // Internal whitespace/newlines collapse so the hint can't wrap the footer.
         assert!(top.contains("build and open pr"), "{top}");
-        // The status row is indented under the message, led by one heart.
-        assert!(bottom.starts_with("   ♥ "), "{bottom}");
-        assert!(bottom.contains("coordinating · 1m12s"), "{bottom}");
+        // The status row is indented under the message, led by one heart, with
+        // runtime and state each in a fixed cell so every banner's message
+        // column starts at the same screen position.
+        assert_eq!(bottom, "   ♥ 0s       coordi… 1m12s", "{bottom}");
     }
 
     #[test]
@@ -1298,7 +1383,13 @@ mod tests {
         assert!(top.contains('…'), "{top}");
         assert!(top.chars().count() < 120, "escalation row too wide: {top}");
         assert!(bottom.contains('…'), "{bottom}");
-        assert!(bottom.chars().count() < STATUS_MAX + 16, "{bottom}");
+        // The fixed columns add their own width on top of the message budget,
+        // so the row's ceiling is the message cell plus the two cells, their
+        // gutters, and the indent+indicator.
+        assert!(
+            bottom.chars().count() <= MESSAGE_COL + RUNTIME_COL + STATE_COL + 8,
+            "{bottom}"
+        );
     }
 
     #[test]
@@ -1322,7 +1413,7 @@ mod tests {
 
         set_status("w_deadbeefcafe", "coordinating · 12s · 🔧 read_file");
         let (_, bottom) = rows(false, MAX_VISIBLE).remove(0);
-        assert!(bottom.contains("coordinating · 12s"), "{bottom}");
+        assert!(bottom.contains("coordi… 12s"), "{bottom}");
 
         clear();
         assert!(!active());
@@ -1484,9 +1575,11 @@ mod tests {
         let (_, a) = render(0, "w_1", "t", "coordinating", None, Some(0), false);
         let (_, b) = render(72_000, "w_1", "t", "coordinating", None, Some(0), false);
         let (_, c) = render(3_900_000, "w_1", "t", "coordinating", None, Some(0), false);
-        assert!(a.contains("0s · coordinating"), "{a}");
-        assert!(b.contains("1m12s · coordinating"), "{b}");
-        assert!(c.contains("1h05m · coordinating"), "{c}");
+        // Right-hand padding keeps the state cell at a fixed offset no matter
+        // how wide the runtime grows.
+        assert!(a.contains("0s       coordi…"), "{a}");
+        assert!(b.contains("1m12s    coordi…"), "{b}");
+        assert!(c.contains("1h05m    coordi…"), "{c}");
     }
 
     #[test]
@@ -1504,7 +1597,7 @@ mod tests {
         );
         assert!(!bottom.contains('\u{1b}'), "{bottom:?}");
         assert!(
-            bottom.contains("running · 🔧 read_file src/repl.rs"),
+            bottom.contains("running 🔧 read_file src/repl.rs"),
             "{bottom}"
         );
     }
@@ -1565,7 +1658,7 @@ mod tests {
         assert!(unknown.starts_with("   ♡ "), "{unknown}");
 
         // The runtime and status still follow the heart, in that order.
-        assert!(fresh.contains("0s · coordinating"), "{fresh}");
+        assert!(fresh.contains("0s       coordi…"), "{fresh}");
     }
 
     #[test]
@@ -1588,7 +1681,7 @@ mod tests {
         let (_, done) = render(0, "w_1", "t", "done", Some(false), Some(900), false);
         assert!(!done.contains('♥'), "{done}");
         assert!(!done.contains('♡'), "{done}");
-        assert!(done.starts_with("   ↳ 0s · done"), "{done}");
+        assert!(done.starts_with("   ↳ 0s       done"), "{done}");
     }
 
     #[test]
