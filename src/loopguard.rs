@@ -71,6 +71,20 @@ pub const MAX_AUTO_RECOVERIES: usize = 4;
 /// loops and budget exhaustion.
 pub const MAX_SERIAL_CHAIN_RECOVERIES: usize = 12;
 
+/// How many CONSECUTIVE no-op rounds — the model emitted plain text and invoked
+/// NO tools, while the turn as a whole has executed zero tool calls — an
+/// unattended turn tolerates before it yields with [`ExitReason::NoOpTurn`].
+/// The first such round is corrected in-place (a one-shot note is folded in and
+/// the turn continues); the second is a durable yield so the condition is
+/// recorded instead of silently retried forever.
+///
+/// Guards the inverse of every other degenerate shape: *narrated intent,
+/// invoked nothing*. A coordinator that answers "I'll start with Phase 0 …"
+/// and calls nothing was previously recorded as a SUCCESSFUL run in one 6-second
+/// turn (144k tokens in, 23 out, zero work) because the engine treats "text with
+/// no tool calls" as a final answer unconditionally.
+pub const NOOP_TURN_LIMIT: usize = 2;
+
 // ---------------------------------------------------------------------------
 // Iteration budget — soft-warning → forced-summarize before the hard limit
 // ---------------------------------------------------------------------------
@@ -306,6 +320,16 @@ pub enum ExitReason {
     /// soft advisory fires earlier at [`CALL_BUDGET_SOFT`] (logged, no stop).
     /// `count` is the cumulative call tally reached. NOT a failure — auto-resumes.
     CallBudgetExceeded { count: usize },
+    /// The turn produced only NARRATION: [`NOOP_TURN_LIMIT`] consecutive rounds
+    /// of plain assistant text with zero tool calls, while the turn as a whole
+    /// had executed no tool call at all. The inverse degenerate shape of every
+    /// other guard here — the model announced what it was about to do and did
+    /// nothing, so the engine would otherwise return the preamble as a final
+    /// answer and the run would be recorded as a success at phase 0. Only ever
+    /// constructed for an UNATTENDED turn (a coordinator/worker): in interactive
+    /// chat a text-only reply is the normal, correct answer. `rounds` is the
+    /// consecutive no-op streak reached. NOT a failure — nudged.
+    NoOpTurn { rounds: usize },
 }
 
 impl ExitReason {
@@ -319,6 +343,7 @@ impl ExitReason {
             ExitReason::Interrupted => "interrupted",
             ExitReason::SerialChainYield { .. } => "serial-chain-yield",
             ExitReason::CallBudgetExceeded { .. } => "call-budget-exceeded",
+            ExitReason::NoOpTurn { .. } => "no-op-turn",
         }
     }
 
@@ -358,6 +383,12 @@ re-plan toward batching independent calls"
 load across the rate-limit window and resume with fresh context"
                 )
             }
+            ExitReason::NoOpTurn { rounds } => {
+                format!(
+                    "produced only narration for {rounds} consecutive round(s) — it described work \
+but invoked no tool, so the turn did nothing"
+                )
+            }
         }
     }
 
@@ -382,6 +413,8 @@ load across the rate-limit window and resume with fresh context"
             ExitReason::SerialChainYield { depth } => (0, *depth),
             // Carry the cumulative call tally in the banner `count` field.
             ExitReason::CallBudgetExceeded { count } => (0, *count),
+            // Carry the consecutive no-op streak in the banner `count` field.
+            ExitReason::NoOpTurn { rounds } => (0, *rounds),
         };
         format!(
             "[aish-stop tag={} iterations={iters} count={count}] {}",
@@ -415,6 +448,7 @@ load across the rate-limit window and resume with fresh context"
             "interrupted" => Some(ExitReason::Interrupted),
             "serial-chain-yield" => Some(ExitReason::SerialChainYield { depth: count }),
             "call-budget-exceeded" => Some(ExitReason::CallBudgetExceeded { count }),
+            "no-op-turn" => Some(ExitReason::NoOpTurn { rounds: count }),
             "loop-detected" => Some(ExitReason::LoopDetected {
                 call: String::new(),
                 count,
@@ -490,7 +524,10 @@ pub fn classify_disposition(
     match reason {
         ExitReason::Completed | ExitReason::Interrupted => Disposition::None,
         _ if auto_recoveries >= max_auto => Disposition::FlagOperator,
-        ExitReason::LoopDetected { .. } => Disposition::Nudge,
+        // Both are "change what you're doing" stops, not "carry on" stops: a
+        // loop repeated an action; a no-op turn took none at all. Resuming
+        // either as-is would just reproduce the same degenerate round.
+        ExitReason::LoopDetected { .. } | ExitReason::NoOpTurn { .. } => Disposition::Nudge,
         ExitReason::ForcedSummarize { .. }
         | ExitReason::BudgetExhausted { .. }
         | ExitReason::SerialChainYield { .. }
@@ -512,6 +549,21 @@ and give your best partial result.",
             reason.detail()
         )),
         Disposition::Nudge => {
+            // The no-op shape needs the OPPOSITE correction to a loop: a looping
+            // turn must stop repeating an action, a no-op turn must start taking
+            // one. Sharing the loop wording told a model that had called nothing
+            // not to repeat a call it never made.
+            if let ExitReason::NoOpTurn { rounds } = reason {
+                return Some(format!(
+                    "[nudge] Your previous turn ended without doing anything: {rounds} \
+round(s) of narration with ZERO tool calls. Describing an action does not perform it — only a \
+tool call does. Re-read your task, then in your VERY NEXT message issue the actual tool calls for \
+the first concrete step (batch every independent call together). Do not restate your plan, do not \
+re-announce the phase, and do not reply with prose alone. If the task is genuinely already \
+complete or you are truly blocked, say exactly that and why — but a bare preamble is not an \
+answer.",
+                ));
+            }
             let what = match reason {
                 ExitReason::LoopDetected { call, .. } if !call.is_empty() => {
                     format!("you kept repeating the same action ({call})")
@@ -836,6 +888,117 @@ impl CallBudgetGuard {
         }
         CallBudgetAction::Continue
     }
+}
+
+impl CallBudgetGuard {
+    /// The cumulative tool-call tally recorded so far this turn. Read by the
+    /// no-op guard, which must distinguish "this round called nothing" (fine
+    /// mid-turn — the model is summarizing work it already did) from "this turn
+    /// has called nothing at all" (the degenerate narrated-intent shape).
+    pub fn total(&self) -> usize {
+        self.count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// No-op turn guard — narrated intent, invoked nothing
+// ---------------------------------------------------------------------------
+
+/// What the [`NoOpGuard`] wants the caller to do about a round that executed no
+/// tool calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoOpAction {
+    /// Not a degenerate no-op — treat the text as a genuine final answer. Either
+    /// the turn has already done real work, or this is an attended (interactive)
+    /// turn where a text-only reply is the correct response.
+    Accept,
+    /// First no-op round of an unattended turn that has done nothing at all:
+    /// fold a one-shot corrective note into history and CONTINUE the turn, so
+    /// the model gets a chance to actually call something. `round` is the
+    /// consecutive no-op streak (1 here).
+    Correct { round: usize },
+    /// The streak reached [`NOOP_TURN_LIMIT`] — stop and yield with
+    /// [`ExitReason::NoOpTurn`] so the condition is durably recorded rather than
+    /// retried forever. `rounds` is the streak reached.
+    Yield { rounds: usize },
+}
+
+/// Tracks CONSECUTIVE no-op rounds within one `run_turn`. Lives for one turn and
+/// is dropped with it.
+///
+/// Only meaningful when the turn is UNATTENDED: in interactive chat, a reply with
+/// no tool calls is the normal answer ("hi" → "hey"), so the caller passes
+/// `unattended = false` and every round is [`NoOpAction::Accept`]. The guard is
+/// deliberately pure — the `is_unattended()` read stays in the engine, same
+/// discipline as [`SerialChainGuard`] and [`CallBudgetGuard`].
+#[derive(Default)]
+pub struct NoOpGuard {
+    /// Consecutive rounds so far that produced text and no tool calls.
+    streak: usize,
+    /// Yield ceiling. `None` uses [`NOOP_TURN_LIMIT`].
+    limit: Option<usize>,
+}
+
+impl NoOpGuard {
+    /// Construct a guard with an explicit streak ceiling. Test-only: the engine
+    /// always takes the shipped [`NOOP_TURN_LIMIT`] via `default()`.
+    #[cfg(test)]
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            streak: 0,
+            limit: Some(limit),
+        }
+    }
+
+    /// Effective ceiling: the override when set, else [`NOOP_TURN_LIMIT`].
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(NOOP_TURN_LIMIT)
+    }
+
+    /// Record a round that produced NO tool calls.
+    ///
+    /// * `unattended` — true for a coordinator/worker turn (no human to read a
+    ///   text-only reply). False short-circuits to [`NoOpAction::Accept`].
+    /// * `calls_so_far` — the turn's CUMULATIVE tool-call tally
+    ///   ([`CallBudgetGuard::total`]). Non-zero means the turn has done real
+    ///   work and this text is a legitimate wrap-up answer → `Accept`.
+    ///
+    /// Returns `Correct` for the first offending round and `Yield` once the
+    /// streak reaches the limit.
+    pub fn record_no_call_round(&mut self, unattended: bool, calls_so_far: usize) -> NoOpAction {
+        if !unattended || calls_so_far > 0 {
+            return NoOpAction::Accept;
+        }
+        self.streak += 1;
+        if self.streak >= self.limit() {
+            NoOpAction::Yield {
+                rounds: self.streak,
+            }
+        } else {
+            NoOpAction::Correct { round: self.streak }
+        }
+    }
+
+    /// Reset the streak. Called when a round DOES execute tool calls, so the
+    /// counter only ever reflects a consecutive run of empty rounds.
+    pub fn reset(&mut self) {
+        self.streak = 0;
+    }
+}
+
+/// The corrective note folded into history after the first no-op round of an
+/// unattended turn. Mirrors the `truncated_tool_call` recovery path: the model
+/// sees what went wrong and is told exactly what to emit next.
+pub fn noop_corrective_note(round: usize) -> String {
+    format!(
+        "[no-op-guard] Your last message (round {round}) contained text but ZERO tool calls, and \
+this turn has not executed a single tool call yet. You are running UNATTENDED — there is no human \
+reading that preamble, and describing an action does not perform it. Your reply was NOT accepted \
+as an answer.\nIssue the actual tool calls for the first concrete step of your task NOW, batching \
+every independent call into this one message. Do not re-announce your plan or the phase. If the \
+task is genuinely already done — or you are truly blocked — state that explicitly, with the \
+specific evidence or blocker, instead of a bare preamble."
+    )
 }
 
 #[cfg(test)]
@@ -1450,5 +1613,123 @@ mod tests {
             "must tell the model to batch independent calls"
         );
         assert!(low.contains("yield"), "must warn a hard yield is coming");
+    }
+
+    // ---- no-op-turn guard (narrated intent, invoked nothing) ----------------
+
+    // The guard must be INERT for interactive chat and for a turn that already
+    // did real work — those text-only replies are legitimate answers.
+    #[test]
+    fn noop_guard_accepts_attended_and_productive_rounds() {
+        let mut g = NoOpGuard::default();
+        // Attended: a text reply with no calls is the normal answer.
+        assert_eq!(g.record_no_call_round(false, 0), NoOpAction::Accept);
+        // Unattended but the turn already executed calls → wrap-up answer.
+        assert_eq!(g.record_no_call_round(true, 7), NoOpAction::Accept);
+        // Neither case may consume the streak.
+        assert_eq!(
+            g.record_no_call_round(true, 0),
+            NoOpAction::Correct { round: 1 },
+            "accepted rounds must not advance the streak"
+        );
+    }
+
+    // The w_SjU2NYgu shape: round 1 narrates Phase 0 with zero calls. First
+    // offence is corrected in-turn; the limit turns it into a durable yield.
+    #[test]
+    fn noop_guard_corrects_then_yields() {
+        let mut g = NoOpGuard::default();
+        assert_eq!(
+            g.record_no_call_round(true, 0),
+            NoOpAction::Correct { round: 1 },
+            "first no-op round is corrected, not fatal"
+        );
+        assert_eq!(
+            g.record_no_call_round(true, 0),
+            NoOpAction::Yield { rounds: 2 },
+            "streak at NOOP_TURN_LIMIT must yield"
+        );
+        assert_eq!(NOOP_TURN_LIMIT, 2, "tests assume the shipped limit");
+    }
+
+    #[test]
+    fn noop_guard_reset_clears_streak() {
+        let mut g = NoOpGuard::with_limit(3);
+        assert_eq!(
+            g.record_no_call_round(true, 0),
+            NoOpAction::Correct { round: 1 }
+        );
+        g.reset(); // a round DID call tools
+        assert_eq!(
+            g.record_no_call_round(true, 0),
+            NoOpAction::Correct { round: 1 },
+            "reset must restart the consecutive count"
+        );
+    }
+
+    #[test]
+    fn noop_turn_banner_round_trips_and_is_abnormal() {
+        let r = ExitReason::NoOpTurn { rounds: 2 };
+        assert!(r.is_abnormal(), "a turn that did nothing is not a success");
+        let parsed = ExitReason::parse_banner(&r.banner()).expect("must parse its own banner");
+        assert_eq!(parsed.tag(), "no-op-turn");
+        match parsed {
+            ExitReason::NoOpTurn { rounds } => assert_eq!(rounds, 2),
+            other => panic!("variant mismatch: {other:?}"),
+        }
+    }
+
+    // A no-op stop routes to Nudge (change behaviour), and once auto-recoveries
+    // are spent it escalates like every other abnormal stop.
+    #[test]
+    fn noop_turn_routes_to_nudge_then_operator() {
+        let max = MAX_AUTO_RECOVERIES;
+        let r = ExitReason::NoOpTurn { rounds: 2 };
+        assert_eq!(classify_disposition(&r, 0, max), Disposition::Nudge);
+        assert_eq!(
+            classify_disposition(&r, max, max),
+            Disposition::FlagOperator
+        );
+    }
+
+    // The nudge must tell the model to START acting. Reusing the loop wording
+    // ("stop repeating the same action") is actively wrong here — it names a
+    // call the model never made.
+    #[test]
+    fn noop_nudge_directive_demands_action_not_repetition() {
+        let d = recovery_directive(Disposition::Nudge, &ExitReason::NoOpTurn { rounds: 2 })
+            .expect("nudge carries a directive");
+        assert!(d.contains("[nudge]"));
+        let low = d.to_lowercase();
+        assert!(low.contains("tool call"), "must name the missing artifact");
+        assert!(
+            low.contains("zero tool calls") || low.contains("without doing anything"),
+            "must state what went wrong: {d}"
+        );
+        assert!(
+            !low.contains("kept repeating"),
+            "must NOT reuse the loop-detected wording: {d}"
+        );
+    }
+
+    #[test]
+    fn noop_corrective_note_names_round_and_demands_calls() {
+        let n = noop_corrective_note(1);
+        assert!(n.contains("[no-op-guard]"), "must be tagged for the log");
+        assert!(n.contains("round 1"), "must quote the offending round");
+        let low = n.to_lowercase();
+        assert!(low.contains("zero tool calls"));
+        assert!(
+            low.contains("unattended"),
+            "must explain why text is useless"
+        );
+        assert!(
+            low.contains("not accepted"),
+            "must be explicit the reply was rejected: {n}"
+        );
+        assert!(
+            low.contains("batch"),
+            "must ask for batched independent calls"
+        );
     }
 }
