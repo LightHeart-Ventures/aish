@@ -2742,12 +2742,14 @@ fn coordinator_status_message(session: &Session) -> String {
     // alert (⏰) must always be visible in the statusline, not gated behind a
     // `:rename`.
     let decorated = decorate_name(session.name.as_deref(), &status_badges(session, &workers));
-    crate::style::second_statusline_at(
-        &left,
-        decorated.as_deref(),
-        crate::style::footer_width(),
-        color_on,
-    )
+    // The label does NOT ride this row: it is welded into the horizontal RULE
+    // above it, ~2 columns from the right edge, with the rule continuing on both
+    // sides of the name. Hand it to the terminal layer, which frames it into the
+    // rule on the next footer paint (every paint site goes through
+    // `separator_line_current`). This row keeps the full width for the
+    // coordinator hint + plugin segments.
+    crate::terminal::set_rule_label(decorated);
+    crate::style::clip_cols_styled(&left, crate::style::footer_width())
 }
 
 /// Combine the optional session name (`:rename`) with the live status-badge
