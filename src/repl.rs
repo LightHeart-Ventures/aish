@@ -8371,6 +8371,28 @@ enum TellTarget {
     Ambiguous(Vec<String>),
 }
 
+/// Leading glyph of the `:tell` banner — the operator calling out to work
+/// that's already in flight. Sibling of [`LIFTOFF_GLYPH`] (⤴️), which marks the
+/// moment work LEAVES for a background worker.
+const TELL_GLYPH: &str = "\u{1f4e3}";
+
+/// Build the `:tell` confirmation banner — the steering sibling of the
+/// escalation / `:dispatch` liftoff lines ("⤴️  escalated to background worker
+/// w_abc1234 — keep working here…"), so every operator-facing worker event
+/// reads as one visual family: glyph, two spaces, `<verb> background worker
+/// <short-id>`, then a dim `—` tail. `:tell` differs only in the glyph (📣, the
+/// megaphone) and the tail, which carries the pending-message count so repeated
+/// `:tell`s stay legible.
+///
+/// Pure → unit-tested (the glyph, the shared shape, the pending count and the
+/// SGR reset all have to survive the formatting).
+fn tell_banner(short: &str, pending: i64) -> String {
+    format!(
+        "\x1b[1;36m{TELL_GLYPH}  steering background worker {short}\x1b[0m \x1b[2m\
+— message queued ({pending} pending); folded in at its next round.\x1b[0m"
+    )
+}
+
 /// Resolve a `:tell <id>` against the collected `candidates`
 /// (`(run_id, terminal, owner_session)` — the caller derives `terminal` from the
 /// live worker status or, for a durable row, from [`phase_is_live`]) and the
@@ -8518,9 +8540,7 @@ pub(crate) fn tell_coordinator_ctx(
             match store.enqueue_message(&run_id, message, Some(&ctx.session_id)) {
                 Ok(_) => {
                     let pending = store.pending_message_count(&run_id).unwrap_or(0);
-                    out.push(format!(
-                        "\x1b[2m✉ queued for {short} ({pending} pending) — folded in at the start of its next round\x1b[0m"
-                    ));
+                    out.push(tell_banner(short, pending));
                 }
                 Err(e) => out.push(format!("couldn't queue message: {e}")),
             }
@@ -14762,6 +14782,28 @@ mod tests {
             resolve_tell_target(&[live("w_a", Some(me)), live("w_b", Some(me))], me, false),
             TellTarget::Ambiguous(vec!["w_a".to_string(), "w_b".to_string()])
         );
+    }
+
+    #[test]
+    fn tell_banner_matches_the_coordinator_banner_family() {
+        let line = tell_banner("w_abc1234", 2);
+        // Megaphone marker — :tell's sibling of the dispatch / escalation lines.
+        assert!(line.contains("📣"), "missing megaphone: {line}");
+        // Same "<glyph>  <verb> background worker <short-id>" shape the liftoff
+        // banner uses, so the three worker events read as one family.
+        assert!(
+            line.contains("📣  steering background worker w_abc1234"),
+            "unexpected shape: {line}"
+        );
+        assert!(
+            liftoff_banner_body("escalated to", "w_abc1234")
+                .contains("  escalated to background worker w_abc1234"),
+            "liftoff family shape drifted — keep tell_banner in step"
+        );
+        // The pending count stays visible so repeated :tells are legible.
+        assert!(line.contains("(2 pending)"), "missing pending: {line}");
+        // Reset the SGR state so the prompt isn't left colored.
+        assert!(line.ends_with("\x1b[0m"), "unterminated SGR: {line}");
     }
 
     #[test]
