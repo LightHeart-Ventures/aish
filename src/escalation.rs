@@ -41,7 +41,8 @@
 //! NEWEST-FIRST (the same ordering `cycle_worker` uses for Shift-Tab, so the
 //! newest coordinator is both the top banner and one keypress away). Re-pinning
 //! an id that is already on screen REFRESHES it in place instead of duplicating
-//! it. At most [`MAX_VISIBLE`] banners paint — beyond that the oldest visible
+//! it. At most [`max_visible`] banners paint — HALF the terminal height, in
+//! whole banners — and beyond that the oldest visible
 //! status row carries a `+N more` tail, so the footer can never eat the window;
 //! [`crate::terminal::FooterLayout`] additionally drops whole banners (newest
 //! kept) on a window too short to hold them all.
@@ -118,10 +119,40 @@ use std::time::{Duration, Instant};
 /// banners — see [`row_count`].
 pub const ROWS_PER_BANNER: u16 = 2;
 
-/// How many escalations paint at once. Three banners = six footer rows, which
-/// still leaves a usable body on a standard 24-row window; past that the extras
-/// are summarised as a `+N more` tail rather than swallowing the terminal.
+/// Fraction (`1/N`) of the window the pinned block may grow to. The tray tops
+/// out at HALF the terminal: tall enough that a real fan-out is visible all at
+/// once (the old fixed three-banner ceiling hid everything past the third worker
+/// behind a `+N more` tail even on a 50-row window), bounded enough that the
+/// transcript never disappears behind the chrome.
+pub const MAX_VISIBLE_FRACTION: u16 = 2;
+
+/// How many escalations paint at once when the terminal height is UNKNOWN — off
+/// a tty, or a `TIOCGWINSZ` that reports nothing. Three banners = six footer
+/// rows, which still leaves a usable body on a standard 24-row window; past the
+/// live cap the extras are summarised as a `+N more` tail rather than swallowing
+/// the terminal.
 pub const MAX_VISIBLE: usize = 3;
+
+/// How many banners may paint in a window of `rows` rows: half the window
+/// ([`MAX_VISIBLE_FRACTION`]) in WHOLE banners, never fewer than one.
+///
+/// Pure, so the cap can be asserted at any height without a terminal: a 24-row
+/// window seats 6 banners (12 rows), an 80-row window seats 20.
+///
+/// The cap is a CEILING, not a promise — [`crate::terminal::FooterLayout`] still
+/// sheds whole banners when the solved footer would starve the scrolling body,
+/// so asking for half the window stays safe even at height 6.
+pub fn max_visible_for(rows: u16) -> usize {
+    ((rows / MAX_VISIBLE_FRACTION.max(1)) / ROWS_PER_BANNER.max(1)).max(1) as usize
+}
+
+/// [`max_visible_for`] at the LIVE terminal size, falling back to
+/// [`MAX_VISIBLE`] when the window size can't be read.
+pub fn max_visible() -> usize {
+    crate::terminal::term_size()
+        .map(|(rows, _cols)| max_visible_for(rows))
+        .unwrap_or(MAX_VISIBLE)
+}
 
 /// Hard ceiling on TRACKED banners (visible or summarised). A runaway fan-out
 /// can't grow the store without bound; the oldest already-finished banner is
@@ -513,18 +544,18 @@ pub fn active() -> bool {
 }
 
 /// How many banners are tracked right now (including ones summarised past
-/// [`MAX_VISIBLE`]).
+/// [`max_visible`]).
 pub fn count() -> usize {
     BANNERS.lock().map(|b| b.len()).unwrap_or(0)
 }
 
 /// Footer rows the pinned block WANTS: two per visible banner, capped at
-/// [`MAX_VISIBLE`] banners. Zero when nothing is pinned.
+/// [`max_visible`] banners (half the window). Zero when nothing is pinned.
 ///
 /// [`crate::terminal::FooterLayout`] may hand back fewer on a short window —
 /// it drops whole banners rather than splitting one across the rule.
 pub fn row_count() -> u16 {
-    (count().min(MAX_VISIBLE) as u16) * ROWS_PER_BANNER
+    (count().min(max_visible()) as u16) * ROWS_PER_BANNER
 }
 
 /// True while at least one pinned banner is still ANIMATING (an ESCALATION,
@@ -1004,14 +1035,14 @@ pub fn render_queued(
 ///
 /// `max_banners` is how many pairs the CALLER can actually fit (the footer knows
 /// the window height; this module doesn't). It is additionally capped at
-/// [`MAX_VISIBLE`]. Any escalation that doesn't fit is not silently dropped: the
+/// [`max_visible`]. Any escalation that doesn't fit is not silently dropped: the
 /// last painted status row carries a `· +N more escalated` tail, so the operator
 /// always sees that more work is in flight.
 pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
     let Ok(banners) = BANNERS.lock() else {
         return Vec::new();
     };
-    let visible = max_banners.min(MAX_VISIBLE).min(banners.len());
+    let visible = max_banners.min(max_visible()).min(banners.len());
     if visible == 0 {
         return Vec::new();
     }
@@ -1510,6 +1541,29 @@ mod tests {
         assert_eq!(count(), 1, "re-pin must not stack a duplicate row");
         assert_eq!(rows(false, MAX_VISIBLE).len(), 1);
         clear();
+    }
+
+    /// The tray is sized off the WINDOW, not a constant: half the height in
+    /// whole banners, floored at one so even a tiny window still shows the
+    /// newest escalation instead of hiding every worker.
+    #[test]
+    fn visible_cap_tracks_half_the_window_height() {
+        // Half the window, in whole 2-row banners.
+        assert_eq!(max_visible_for(24), 6, "24 rows → 12 rows of tray");
+        assert_eq!(max_visible_for(50), 12);
+        assert_eq!(max_visible_for(80), 20);
+        // Odd heights round DOWN — never reserve half a banner.
+        assert_eq!(max_visible_for(25), 6);
+        // …and the floor holds all the way down, including degenerate sizes the
+        // footer solver would shed anyway.
+        for rows in 0..=5u16 {
+            assert_eq!(max_visible_for(rows), 1, "rows={rows}");
+        }
+        // Strictly better than the old fixed ceiling once the window affords it.
+        assert!(max_visible_for(24) > MAX_VISIBLE);
+        // Off a tty (this test binary's own case) the cap falls back to the
+        // historical constant — which is what every other test here assumes.
+        assert_eq!(max_visible(), MAX_VISIBLE);
     }
 
     #[test]
