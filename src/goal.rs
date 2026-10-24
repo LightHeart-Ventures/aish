@@ -347,16 +347,14 @@ impl GoalLoop {
 
 /// Human-readable elapsed time: `45s`, `4m12s`, `1h03m`. Coarse on purpose —
 /// seconds drop off once we're past an hour.
+///
+/// A thin `Duration` adapter over [`crate::style::fmt_duration`], which is the
+/// ONE duration vocabulary in the codebase. It used to be a second, independent
+/// implementation of the same buckets; two formatters drift, and the tray's
+/// fixed-width BEAT column depends on every duration honouring one width
+/// ceiling, so this now delegates instead of duplicating.
 fn fmt_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}h{m:02}m")
-    } else if m > 0 {
-        format!("{m}m{s:02}s")
-    } else {
-        format!("{s}s")
-    }
+    crate::style::fmt_duration(d.as_secs().min(i64::MAX as u64) as i64)
 }
 
 /// Keep the condition snippet on one line — long goals get an ellipsis.

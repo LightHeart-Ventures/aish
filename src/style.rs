@@ -321,40 +321,6 @@ pub fn severity_badge(banner: &str, sev: Severity, color_on: bool) -> String {
 // Time formatting — start/stop timestamps + durations for the `:workers` table
 // ---------------------------------------------------------------------------
 
-/// Format a whole-second duration compactly, two units at most:
-/// `"45s"`, `"2m 30s"`, `"1h 45m"`, `"2d 3h"`. The trailing sub-unit is dropped
-/// when zero (`"2m"`, `"1h"`, `"3d"`). Pure — unit-tested.
-pub fn fmt_duration(secs: u64) -> String {
-    const MIN: u64 = 60;
-    const HOUR: u64 = 60 * MIN;
-    const DAY: u64 = 24 * HOUR;
-    if secs < MIN {
-        return format!("{secs}s");
-    }
-    if secs < HOUR {
-        let (m, s) = (secs / MIN, secs % MIN);
-        return if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m {s}s")
-        };
-    }
-    if secs < DAY {
-        let (h, m) = (secs / HOUR, (secs % HOUR) / MIN);
-        return if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h {m}m")
-        };
-    }
-    let (d, h) = (secs / DAY, (secs % DAY) / HOUR);
-    if h == 0 {
-        format!("{d}d")
-    } else {
-        format!("{d}d {h}h")
-    }
-}
-
 /// A relative "ago" label for an elapsed delta in whole seconds:
 /// `"just now"` (< 5s), `"30s ago"`, `"5m ago"`, `"2h ago"`, `"3d ago"`. Pure.
 pub fn fmt_ago(secs: u64) -> String {
@@ -421,7 +387,7 @@ pub fn time_cells(started: Option<i64>, finished: Option<i64>, now: i64) -> (Str
     };
     let started_cell = fmt_ago((now - start).max(0) as u64);
     let end = finished.unwrap_or(now);
-    let runtime_cell = fmt_duration((end - start).max(0) as u64);
+    let runtime_cell = fmt_duration(end - start);
     (started_cell, runtime_cell)
 }
 
@@ -437,9 +403,9 @@ pub const HEARTBEAT_STALE_AFTER_SECS: i64 = 15 * 60;
 /// done/failed/checkpoint rows (which have no live beat). `now` is epoch secs.
 /// Returns:
 ///   * `—`            — missing/unparseable beat (nothing is known)
-///   * `· 22m`        — terminal row: how long ago it last beat (i.e. finished)
-///   * `♥ 12s`/`♥ 4m` — alive: age since last beat, under the stale threshold
-///   * `⚠ 22m`        — stale: beat older than `HEARTBEAT_STALE_AFTER_SECS`
+///   * `· 22m00s`     — terminal row: how long ago it last beat (i.e. finished)
+///   * `♥ 12s`        — alive: age since last beat, under the stale threshold
+///   * `⚠ 22m00s`     — stale: beat older than `HEARTBEAT_STALE_AFTER_SECS`
 ///
 /// Terminal rows used to render a flat `—`, which made the Beat column a second
 /// echo of the phase column rather than independent evidence — an empty beat
@@ -452,7 +418,7 @@ pub fn fmt_heartbeat_age(heartbeat_at: Option<&str>, terminal: bool, now: i64) -
         return "—".to_string();
     };
     let age = (now - beat).max(0);
-    let label = compact_age(age);
+    let label = fmt_duration(age);
     if terminal {
         // Finished: no liveness claim, just "last beat was N ago".
         format!("· {label}")
@@ -463,22 +429,33 @@ pub fn fmt_heartbeat_age(heartbeat_at: Option<&str>, terminal: bool, now: i64) -
     }
 }
 
-/// Single-unit compact age: `12s` · `4m` · `2h` · `3d`. The shared vocabulary
-/// behind every heartbeat cell so the `:workers` table, `background_status`, and
-/// the pinned escalation banner all spell "how long ago" the same way.
-pub fn compact_age(age_secs: i64) -> String {
+/// THE duration vocabulary: `45s` · `1m12s` · `3h04m` · `2d03h`.
+///
+/// EVERY elapsed-or-age label in the UI routes through here — the `:workers`
+/// Beat column, `background_status`, the pinned tray's runtime clock and its
+/// liveness heart. One formatter is the whole point: the tray used to print a
+/// two-unit runtime (`3m40s`) immediately beside a single-unit beat age
+/// (`20m`), so two durations on the SAME row were spelled in two different
+/// dialects and the eye had to re-learn the units per column. Two significant
+/// units reads identically wherever it lands, never loses the sub-unit that
+/// `20m` threw away, and never exceeds 6 cells inside a day — which is what
+/// lets a caller size a FIXED column for it ([`crate::escalation::BEAT_COL`]).
+///
+/// Negative input (clock skew) clamps to `0s` rather than printing a nonsense
+/// past-the-future age.
+pub fn fmt_duration(secs: i64) -> String {
     const MIN: i64 = 60;
     const HOUR: i64 = 60 * MIN;
     const DAY: i64 = 24 * HOUR;
-    let age = age_secs.max(0);
-    if age < MIN {
-        format!("{age}s")
-    } else if age < HOUR {
-        format!("{}m", age / MIN)
-    } else if age < DAY {
-        format!("{}h", age / HOUR)
+    let s = secs.max(0);
+    if s < MIN {
+        format!("{s}s")
+    } else if s < HOUR {
+        format!("{}m{:02}s", s / MIN, s % MIN)
+    } else if s < DAY {
+        format!("{}h{:02}m", s / HOUR, (s % HOUR) / MIN)
     } else {
-        format!("{}d", age / DAY)
+        format!("{}d{:02}h", s / DAY, (s % DAY) / HOUR)
     }
 }
 
@@ -534,7 +511,7 @@ pub fn heartbeat_tier(beat_age_secs: Option<i64>) -> (&'static str, Color) {
 pub fn heartbeat_heart(beat_age_secs: Option<i64>, color_on: bool) -> String {
     let (glyph, color) = heartbeat_tier(beat_age_secs);
     let text = match beat_age_secs {
-        Some(age) if missed_heartbeats(age) > 0 => format!("{glyph} {}", compact_age(age)),
+        Some(age) if missed_heartbeats(age) > 0 => format!("{glyph} {}", fmt_duration(age)),
         _ => glyph.to_string(),
     };
     paint_with(&text, color, color_on)
@@ -1043,27 +1020,34 @@ mod tests {
     fn fmt_heartbeat_age_fresh_stale_terminal() {
         let beat = "2026-01-01 00:00:00";
         let base = parse_sqlite_utc(beat).expect("parse beat");
-        // Fresh: under the 15-min stale threshold → ♥ + single-unit age.
+        // Fresh: under the 15-min stale threshold → ♥ + the shared
+        // [`fmt_duration`] vocabulary (NOT a second single-unit dialect).
         assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 10), "♥ 10s");
-        assert_eq!(fmt_heartbeat_age(Some(beat), false, base + 5 * 60), "♥ 5m");
+        assert_eq!(
+            fmt_heartbeat_age(Some(beat), false, base + 5 * 60),
+            "♥ 5m00s"
+        );
         assert_eq!(
             fmt_heartbeat_age(Some(beat), false, base + 14 * 60),
-            "♥ 14m"
+            "♥ 14m00s"
         );
         // Stale: beat older than HEARTBEAT_STALE_AFTER_SECS → ⚠.
         assert_eq!(
             fmt_heartbeat_age(Some(beat), false, base + 20 * 60),
-            "⚠ 20m"
+            "⚠ 20m00s"
         );
         assert_eq!(
             fmt_heartbeat_age(Some(beat), false, base + 3 * 3600),
-            "⚠ 3h"
+            "⚠ 3h00m"
         );
         // Terminal rows, missing/unparseable beats, and clock skew degrade safely.
         // Terminal rows report the real age of their last beat ("finished 20m
         // ago"), NOT a blank. A blank made the Beat column silently re-state
         // the phase column, manufacturing fake corroboration for a stale row.
-        assert_eq!(fmt_heartbeat_age(Some(beat), true, base + 20 * 60), "· 20m");
+        assert_eq!(
+            fmt_heartbeat_age(Some(beat), true, base + 20 * 60),
+            "· 20m00s"
+        );
         assert_eq!(fmt_heartbeat_age(Some(beat), true, base + 30), "· 30s");
         // `—` now means exactly one thing: no beat data at all.
         assert_eq!(fmt_heartbeat_age(None, true, base), "—");
@@ -1116,7 +1100,9 @@ mod tests {
         assert_eq!(heartbeat_heart(None, false), "♡");
         // Missed: the age IS the evidence, so it joins the glyph.
         assert_eq!(heartbeat_heart(Some(45), false), "♥ 45s");
-        assert_eq!(heartbeat_heart(Some(600), false), "♥ 10m");
+        // Format is whatever `fmt_duration` says — one time vocabulary, so the
+        // heart's age reads identically to every other duration cell.
+        assert_eq!(heartbeat_heart(Some(600), false), "♥ 10m00s");
         // Colour is carried by the SGR prefix, not by a different glyph, so a
         // monochrome terminal still gets the age text.
         let painted = heartbeat_heart(Some(10), true);
@@ -1128,26 +1114,36 @@ mod tests {
     }
 
     #[test]
-    fn compact_age_single_unit() {
-        assert_eq!(compact_age(0), "0s");
-        assert_eq!(compact_age(59), "59s");
-        assert_eq!(compact_age(60), "1m");
-        assert_eq!(compact_age(3599), "59m");
-        assert_eq!(compact_age(3600), "1h");
-        assert_eq!(compact_age(86_400), "1d");
-        assert_eq!(compact_age(-5), "0s");
+    fn fmt_duration_is_the_one_time_vocabulary() {
+        // Sub-minute: seconds only — a `0m05s` would be noise.
+        assert_eq!(fmt_duration(0), "0s");
+        assert_eq!(fmt_duration(59), "59s");
+        // Two significant units from a minute up, zero-padded so the cell width
+        // never jitters between consecutive frames.
+        assert_eq!(fmt_duration(60), "1m00s");
+        assert_eq!(fmt_duration(72), "1m12s");
+        assert_eq!(fmt_duration(3599), "59m59s");
+        assert_eq!(fmt_duration(3600), "1h00m");
+        assert_eq!(fmt_duration(11_040), "3h04m");
+        assert_eq!(fmt_duration(86_400), "1d00h");
+        assert_eq!(fmt_duration(183_600), "2d03h");
+        // Clock skew clamps rather than printing a negative age.
+        assert_eq!(fmt_duration(-5), "0s");
     }
 
+    /// The reason [`fmt_duration`] can back a FIXED column: nothing inside a
+    /// day is wider than 6 cells, so `BEAT_COL`/runtime cells can be sized once
+    /// and never reflow mid-frame.
     #[test]
-    fn fmt_duration_compact_two_units() {
-        assert_eq!(fmt_duration(0), "0s");
-        assert_eq!(fmt_duration(45), "45s");
-        assert_eq!(fmt_duration(60), "1m");
-        assert_eq!(fmt_duration(150), "2m 30s");
-        assert_eq!(fmt_duration(3600), "1h");
-        assert_eq!(fmt_duration(6300), "1h 45m"); // 1h45m
-        assert_eq!(fmt_duration(86_400), "1d");
-        assert_eq!(fmt_duration(183_600), "2d 3h"); // 2d3h
+    fn fmt_duration_fits_six_cells_within_a_day() {
+        for secs in [0, 1, 59, 60, 61, 599, 3_599, 3_600, 7_000, 86_399] {
+            let out = fmt_duration(secs);
+            assert!(
+                out.chars().count() <= 6,
+                "{secs}s rendered {out:?} ({} cells) — wider than the column",
+                out.chars().count()
+            );
+        }
     }
 
     #[test]
@@ -1182,10 +1178,10 @@ mod tests {
         // Running: finished=None → runtime is now-start, started shows "ago".
         let (started, runtime) = time_cells(Some(1000), None, 1150);
         assert_eq!(started, "2m ago"); // relative label rounds to the minute
-        assert_eq!(runtime, "2m 30s"); // runtime keeps sub-unit precision
+        assert_eq!(runtime, "2m30s"); // runtime keeps sub-unit precision
         // Terminal: runtime is the FROZEN stop-start span, not now-start.
         let (started, runtime) = time_cells(Some(1000), Some(1090), 5000);
-        assert_eq!(runtime, "1m 30s"); // 90s total, regardless of now
+        assert_eq!(runtime, "1m30s"); // 90s total, regardless of now
         assert!(started.ends_with("ago"));
         // No start → both placeholders.
         assert_eq!(
