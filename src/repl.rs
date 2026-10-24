@@ -5906,6 +5906,73 @@ fn liftoff_banner_body(verb: &str, short: &str, summary: &str) -> String {
     }
 }
 
+/// How long a liftoff banner waits for the worker's model-written TITLE before
+/// settling for a clipped task brief.
+///
+/// The banner and the escalation tray announce the SAME launch, so they must
+/// NAME it the same way. The tray's head row shows the title (see
+/// [`crate::escalation::set_task`], swapped in from the durable row by
+/// `refresh_escalation_status`); a banner that printed the raw brief instead left
+/// one worker wearing two names — and a brief that opens with pasted context
+/// reads as `escalated to background worker w_MvA9HUdU: === Recent conversation
+/// context …` directly above a tray row reading `w_MvA9HUdU · dai-TODO gap
+/// analysis & build plan`. The title is written by the coordinator SUBPROCESS a
+/// moment after it boots (credential + one lightweight model call), so the
+/// parent cannot have it at spawn time — it has to wait for it.
+///
+/// Bounded, because the title is COSMETIC: a run with no Claude credential never
+/// writes one, and the banner must still print. On a TTY the wait is spent
+/// animating the liftoff frames, so it reads as the launch it is, not a stall.
+const LIFTOFF_TITLE_WAIT: Duration = Duration::from_secs(5);
+
+/// Frame cadence of the liftoff animation — and, after the arrow sweep settles,
+/// the spacing of the title poll (a single-column primary-key lookup).
+const LIFTOFF_FRAME: Duration = Duration::from_millis(90);
+
+/// Resolve the label a liftoff banner carries after the worker id: the
+/// coordinator's model-written TITLE once it lands, else the clipped task brief.
+///
+/// Polls `store` for `run_id`'s title every [`LIFTOFF_FRAME`] until it appears or
+/// `wait` elapses, calling `frame(i)` before each sleep so a TTY caller can paint
+/// the animation *while* waiting (`i` is the 0-based frame index). `min_frames`
+/// guarantees the arrow sweep always plays in full before the first poll, so a
+/// title that is already stamped cannot swallow the animation.
+///
+/// Returns immediately with the brief when there is no store (no durable row to
+/// read, e.g. `--no-db`), which is the pre-title behaviour. Either way the result
+/// is whitespace-collapsed and clipped to the live title budget, so a long title
+/// can no more wrap the banner than a long brief could.
+fn liftoff_label(
+    store: Option<&crate::db::CoordinatorStore>,
+    run_id: &str,
+    task: &str,
+    wait: Duration,
+    min_frames: usize,
+    mut frame: impl FnMut(usize),
+) -> String {
+    let budget = crate::activity_summary::current_title_budget();
+    let deadline = Instant::now() + wait;
+    let mut i = 0usize;
+    loop {
+        frame(i);
+        std::thread::sleep(LIFTOFF_FRAME);
+        i += 1;
+        // The sweep is non-negotiable; only afterwards do frames buy title time.
+        if i < min_frames {
+            continue;
+        }
+        let Some(store) = store else {
+            return liftoff_summary(task, budget);
+        };
+        if let Some(title) = store.title(run_id) {
+            return liftoff_summary(&title, budget);
+        }
+        if Instant::now() >= deadline {
+            return liftoff_summary(task, budget);
+        }
+    }
+}
+
 /// The banner as ONE static line (its final frame, no motion). Used off a TTY
 /// and by callers that can only hand back a string instead of printing — the
 /// mid-turn `:dispatch` path, which returns `Dispatched::message`.
@@ -5925,27 +5992,47 @@ pub(crate) fn liftoff_banner_line(verb: &str, short: &str, task: &str) -> String
 /// escape/`\r` noise — same TTY-gating contract as `clear_screen`). Each frame
 /// rewrites the line in place with `\r\x1b[2K`; the final frame is left on
 /// screen followed by a newline.
-fn print_liftoff_banner(verb: &str, short: &str, task: &str) {
-    // Body of the banner, minus the leading glyph (which is what animates).
-    let summary = liftoff_summary(task, crate::activity_summary::current_title_budget());
-    let body = liftoff_banner_body(verb, short, &summary);
+fn print_liftoff_banner(
+    verb: &str,
+    short: &str,
+    task: &str,
+    store: Option<&crate::db::CoordinatorStore>,
+    run_id: &str,
+) {
+    // Liftoff frames: a flat arrow tilts upward, then hands off to the rocket —
+    // reads as the escalated work taking off. The rocket is also the frame the
+    // animation HOLDS while it waits out the worker's title.
+    const FRAMES: &[&str] = &["\u{2192}", "\u{2197}", "\u{2b06}\u{fe0f}", LIFTOFF_GLYPH];
     // SAFETY: plain isatty query. Off a TTY, skip the motion entirely.
     let is_tty = unsafe { libc::isatty(1) } == 1;
     if !is_tty {
-        println!("\x1b[1;33m{LIFTOFF_GLYPH}{body}");
+        // No animation, but still WAIT for the title: a piped transcript must
+        // name the worker the way the tray and `:workers` name it.
+        let label = liftoff_label(store, run_id, task, LIFTOFF_TITLE_WAIT, 0, |_| {});
+        println!(
+            "\x1b[1;33m{LIFTOFF_GLYPH}{}",
+            liftoff_banner_body(verb, short, &label)
+        );
         return;
     }
-    // Liftoff frames: a flat arrow tilts upward, then hands off to the rocket —
-    // reads as the escalated work taking off.
-    const FRAMES: &[&str] = &["\u{2192}", "\u{2197}", "\u{2b06}\u{fe0f}", LIFTOFF_GLYPH];
+    // Animate against the clipped brief so the launch appears INSTANTLY, then
+    // let its name sharpen into the title in the settling frame below.
+    let budget = crate::activity_summary::current_title_budget();
+    let provisional = liftoff_banner_body(verb, short, &liftoff_summary(task, budget));
+    let mut anim = std::io::stdout();
+    let label = liftoff_label(store, run_id, task, LIFTOFF_TITLE_WAIT, FRAMES.len(), |i| {
+        let frame = FRAMES[i.min(FRAMES.len() - 1)];
+        let _ = write!(anim, "\r\x1b[2K\x1b[1;33m{frame}{provisional}");
+        let _ = anim.flush();
+    });
+    // Settle: rewrite the line once more with the RESOLVED label, leave that
+    // final frame on screen, and terminate it.
     let mut out = std::io::stdout();
-    for frame in FRAMES {
-        let _ = write!(out, "\r\x1b[2K\x1b[1;33m{frame}{body}");
-        let _ = out.flush();
-        std::thread::sleep(Duration::from_millis(90));
-    }
-    // Leave the final frame on screen and terminate the line.
-    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "\r\x1b[2K\x1b[1;33m{LIFTOFF_GLYPH}{}",
+        liftoff_banner_body(verb, short, &label)
+    );
     let _ = out.flush();
 }
 
@@ -5980,7 +6067,13 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
         // as a background worker and name the work that left, so the operator can
         // tell this launch apart from the others already in the tray. The leading
         // 🚀 "lifts off" with a brief liftoff animation on a TTY.
-        print_liftoff_banner("escalated to", short, task);
+        print_liftoff_banner(
+            "escalated to",
+            short,
+            task,
+            session.coordinator_store.as_ref(),
+            &id,
+        );
         return;
     }
     // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or turn
@@ -5989,7 +6082,13 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
     // same task summary — because it means the same thing to the operator.
     // `message` already holds this line's static form (so the mid-turn path
     // matches); printing it through the banner adds the animation on a TTY.
-    print_liftoff_banner("dispatched to", short, task);
+    print_liftoff_banner(
+        "dispatched to",
+        short,
+        task,
+        session.coordinator_store.as_ref(),
+        &id,
+    );
 }
 
 /// Sentinel id `:attach goal` resolves to. Equal to the goal loop's live
@@ -15954,5 +16053,108 @@ mod clipboard_paste_tests {
         assert_eq!(helper.expand_pastes("deleted"), "deleted");
         helper.clear_pastes();
         assert_eq!(helper.expand_pastes(&marker), marker);
+    }
+}
+
+/// The liftoff banner and the escalation tray announce the SAME launch, so they
+/// must NAME it the same way: the coordinator's model-written title, not the raw
+/// task brief the operator typed.
+#[cfg(test)]
+mod liftoff_label_tests {
+    use super::{LIFTOFF_FRAME, liftoff_label};
+    use std::time::{Duration, Instant};
+
+    fn store(tag: &str) -> crate::db::CoordinatorStore {
+        let path = std::env::temp_dir().join(format!(
+            "aish_liftoff_{tag}_{}_{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        crate::db::CoordinatorStore::open(&path).unwrap()
+    }
+
+    // The payoff: a brief that opens with pasted context must not become the
+    // banner's name when the worker has already published a title.
+    #[test]
+    fn a_published_title_wins_over_the_raw_brief() {
+        let store = store("title");
+        store.insert("w_1", "task", "s", None).unwrap();
+        store
+            .set_title("w_1", "dai-TODO gap analysis & build plan")
+            .unwrap();
+        let label = liftoff_label(
+            Some(&store),
+            "w_1",
+            "=== Recent conversation context (for reference — do not act on it) ===",
+            Duration::from_secs(5),
+            0,
+            |_| {},
+        );
+        assert_eq!(label, "dai-TODO gap analysis & build plan");
+    }
+
+    // Cosmetic, never load-bearing: no credential ⇒ no title ⇒ the banner still
+    // prints, falling back to the clipped brief once the bounded wait expires.
+    #[test]
+    fn an_absent_title_falls_back_to_the_brief_after_the_deadline() {
+        let store = store("notitle");
+        store.insert("w_2", "ship the thing", "s", None).unwrap();
+        let started = Instant::now();
+        let label = liftoff_label(
+            Some(&store),
+            "w_2",
+            "ship   the\nthing",
+            Duration::from_millis(250),
+            0,
+            |_| {},
+        );
+        assert_eq!(label, "ship the thing", "whitespace-collapsed brief");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "must actually wait out the title window"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "but the wait is BOUNDED: {:?}",
+            started.elapsed()
+        );
+    }
+
+    // No durable row to poll (`--no-db`) ⇒ pre-title behaviour, immediately.
+    #[test]
+    fn no_store_returns_the_brief_without_waiting() {
+        let started = Instant::now();
+        let label = liftoff_label(
+            None,
+            "w_3",
+            "no db here",
+            Duration::from_secs(30),
+            0,
+            |_| {},
+        );
+        assert_eq!(label, "no db here");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    // The arrow sweep is non-negotiable: an already-stamped title must not let
+    // the poll short-circuit the animation on its very first frame.
+    #[test]
+    fn min_frames_plays_the_whole_sweep_before_the_first_poll() {
+        let store = store("frames");
+        store.insert("w_4", "brief", "s", None).unwrap();
+        store.set_title("w_4", "resolved name").unwrap();
+        let mut seen = Vec::new();
+        let label = liftoff_label(
+            Some(&store),
+            "w_4",
+            "brief",
+            Duration::from_secs(5),
+            4,
+            |i| seen.push(i),
+        );
+        assert_eq!(label, "resolved name");
+        assert_eq!(seen, vec![0, 1, 2, 3], "every sweep frame must be painted");
+        assert!(LIFTOFF_FRAME <= Duration::from_millis(120), "stays snappy");
     }
 }
