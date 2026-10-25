@@ -5984,6 +5984,86 @@ pub(crate) fn liftoff_banner_line(verb: &str, short: &str, task: &str) -> String
     )
 }
 
+/// Derive "quiet" terminal attrs from cooked ones: `ICANON` + `ECHO` off so the
+/// tty neither buffers nor PAINTS what the operator types, while `ISIG` is left
+/// untouched so Ctrl-C still raises SIGINT. `VMIN=1`/`VTIME=0` keeps a later
+/// `read` prompt. Split out from [`EchoSuspend::install`] so the load-bearing
+/// bit-twiddling is unit-testable without a controlling terminal.
+fn liftoff_quiet_attrs(cooked: &libc::termios) -> libc::termios {
+    let mut quiet = *cooked;
+    quiet.c_lflag &= !(libc::ICANON | libc::ECHO);
+    quiet.c_cc[libc::VMIN] = 1;
+    quiet.c_cc[libc::VTIME] = 0;
+    quiet
+}
+
+/// Should the liftoff animation take over the terminal discipline? ONLY when
+/// echo is currently ON. Echo already off means another owner holds stdin
+/// (`keywatch`'s mid-turn cbreak, a `workers_modal` raw guard), and a nested
+/// save/restore around their window could hand them back the wrong attrs — so
+/// we leave it alone and let them keep the keystrokes silent on our behalf.
+fn liftoff_should_suspend_echo(lflag: libc::tcflag_t) -> bool {
+    lflag & libc::ECHO != 0
+}
+
+/// RAII guard that silences terminal echo for the duration of a blocking
+/// animation WITHOUT discarding what the operator types into it.
+///
+/// [`print_liftoff_banner`] holds the main thread for up to
+/// [`LIFTOFF_TITLE_WAIT`] waiting out the worker's title, repainting ONE line in
+/// place with `\r\x1b[2K`. At a prompt boundary stdin is still COOKED — the
+/// editor isn't reading yet, so nothing has put it in cbreak — which means the
+/// tty itself echoes every keystroke typed during that window onto the banner's
+/// row. The banner already runs near the terminal width, so that echo wraps the
+/// cursor to a fresh row and the NEXT frame's `\r\x1b[2K` clears and repaints
+/// *that* row instead of the banner's. Each keystroke therefore strands another
+/// copy on screen —
+/// `🚀 dispatched to background worker w_…: build and open pr…^R` — and the
+/// typed text, spent as echo on a line nobody reads, never reaches the input.
+///
+/// Clearing `ECHO`/`ICANON` fixes both halves at once: nothing is painted over
+/// the banner, and the bytes stay QUEUED on fd 0 — we switch with `TCSANOW`,
+/// never `TCSAFLUSH` — so the editor picks them up the instant it takes the
+/// prompt back. Typing through a liftoff now lands in the input buffer like
+/// typing through any other pause.
+struct EchoSuspend {
+    cooked: libc::termios,
+}
+
+impl EchoSuspend {
+    /// Install the guard, or `None` when there's no tty / no echo to suspend.
+    fn install() -> Option<EchoSuspend> {
+        // SAFETY: plain isatty + tcgetattr into a zeroed termios, both checked
+        // before use; tcsetattr is handed a valid termios derived from them.
+        let cooked = unsafe {
+            if libc::isatty(0) != 1 {
+                return None;
+            }
+            let mut cooked: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut cooked) != 0 {
+                return None;
+            }
+            if !liftoff_should_suspend_echo(cooked.c_lflag) {
+                return None;
+            }
+            let quiet = liftoff_quiet_attrs(&cooked);
+            libc::tcsetattr(0, libc::TCSANOW, &quiet);
+            cooked
+        };
+        Some(EchoSuspend { cooked })
+    }
+}
+
+impl Drop for EchoSuspend {
+    fn drop(&mut self) {
+        // SAFETY: restore the saved cooked termios on fd 0. `TCSANOW` again, so
+        // whatever was typed during the banner is STILL queued for the editor.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.cooked);
+        }
+    }
+}
+
 /// Print the liftoff banner, animating the leading arrow so it "lifts off"
 /// the way the work does — a right→up-right→up glyph sweep that settles on the
 /// 🚀 the escalation tray then shows against that same worker, followed by the
@@ -6015,6 +6095,12 @@ fn print_liftoff_banner(
         );
         return;
     }
+    // We're about to BLOCK the main thread for up to `LIFTOFF_TITLE_WAIT` with
+    // the editor not yet reading. Suspend terminal echo first so keystrokes
+    // typed through the launch neither smear duplicate banners across the
+    // scrollback nor get spent as echo — they stay queued for the prompt. Held
+    // through the settling frame below; restored on drop. See `EchoSuspend`.
+    let _echo = EchoSuspend::install();
     // Animate against the clipped brief so the launch appears INSTANTLY, then
     // let its name sharpen into the title in the settling frame below.
     let budget = crate::activity_summary::current_title_budget();
@@ -16244,7 +16330,7 @@ mod clipboard_paste_tests {
 /// task brief the operator typed.
 #[cfg(test)]
 mod liftoff_label_tests {
-    use super::{LIFTOFF_FRAME, liftoff_label};
+    use super::{LIFTOFF_FRAME, liftoff_label, liftoff_quiet_attrs, liftoff_should_suspend_echo};
     use std::time::{Duration, Instant};
 
     fn store(tag: &str) -> crate::db::CoordinatorStore {
@@ -16339,5 +16425,59 @@ mod liftoff_label_tests {
         assert_eq!(label, "resolved name");
         assert_eq!(seen, vec![0, 1, 2, 3], "every sweep frame must be painted");
         assert!(LIFTOFF_FRAME <= Duration::from_millis(120), "stays snappy");
+    }
+
+    fn cooked(lflag: libc::tcflag_t) -> libc::termios {
+        // SAFETY: termios is a plain POD struct; zeroed is a valid value and we
+        // only ever read back the fields we set.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        t.c_lflag = lflag;
+        t
+    }
+
+    // The bug: keystrokes typed during the banner's blocking title wait were
+    // echoed by the tty onto the banner row, wrapping the cursor so each
+    // following frame's `\r\x1b[2K` cleared the WRONG row — stranding a fresh
+    // `🚀 dispatched to background worker …^R` per keypress — and were consumed
+    // as echo instead of reaching the input. Both halves die with ECHO.
+    #[test]
+    fn quiet_attrs_silence_echo_and_canonical_buffering() {
+        let quiet = liftoff_quiet_attrs(&cooked(libc::ECHO | libc::ICANON | libc::ISIG));
+        assert_eq!(
+            quiet.c_lflag & libc::ECHO,
+            0,
+            "tty must not paint keystrokes"
+        );
+        assert_eq!(quiet.c_lflag & libc::ICANON, 0, "no line buffering");
+        assert_eq!(quiet.c_cc[libc::VMIN], 1);
+        assert_eq!(quiet.c_cc[libc::VTIME], 0);
+    }
+
+    // Suspending echo must never cost the operator their escape hatch: a
+    // liftoff can block for LIFTOFF_TITLE_WAIT, and Ctrl-C has to keep working
+    // the whole time.
+    #[test]
+    fn quiet_attrs_keep_signals_live_so_ctrl_c_still_fires() {
+        let quiet = liftoff_quiet_attrs(&cooked(libc::ECHO | libc::ICANON | libc::ISIG));
+        assert_ne!(
+            quiet.c_lflag & libc::ISIG,
+            0,
+            "Ctrl-C must still raise SIGINT"
+        );
+    }
+
+    // Only ONE owner of the terminal discipline at a time. Mid-turn escalations
+    // land while `keywatch` already holds cbreak; nesting a save/restore there
+    // risks handing that session back attrs it never set.
+    #[test]
+    fn echo_is_suspended_only_when_someone_else_isnt_already_holding_it() {
+        assert!(
+            liftoff_should_suspend_echo(libc::ECHO | libc::ICANON),
+            "cooked prompt boundary: ours to quiet"
+        );
+        assert!(
+            !liftoff_should_suspend_echo(libc::ICANON),
+            "echo already off: another owner holds stdin, don't nest"
+        );
     }
 }
