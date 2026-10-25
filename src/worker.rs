@@ -3301,6 +3301,19 @@ struct JobInner {
     /// the worker is live. That mismatch is exactly what made
     /// `background_status` report `done` for a running worker.
     run_id: String,
+    /// EVERY coordinator `run_id` this worker has ever run under, oldest first:
+    /// thread 1's id (== the visible `id`) followed by one entry per
+    /// [`resume_in_place`]. Pushed by [`WorkerJob::set_run_id`].
+    ///
+    /// Needed because a worker's CHILDREN are stamped with the `parent_run_id`
+    /// of whichever THREAD dispatched them, while every display surface (the
+    /// escalation tray, the `:workers` forest) keys rows on the stable VISIBLE
+    /// id. A child dispatched by thread 2 therefore has a `parent_run_id` that
+    /// matches no displayed row, and the parent-walk skips it forever — the
+    /// reported bug: a live sub-worker missing from the tray. `run_id` alone is
+    /// not enough, since it only names the CURRENT thread; a child of an
+    /// earlier thread stays orphaned once the worker is resumed again.
+    threads: Vec<String>,
 }
 
 pub type WorkerJobs = Arc<Mutex<Vec<Arc<WorkerJob>>>>;
@@ -3652,8 +3665,24 @@ impl WorkerJob {
     }
     /// Stamp the current thread's coordinator `run_id`. Called by `run_worker`
     /// as each thread (original or resumed) starts.
+    ///
+    /// Also APPENDS to [`JobInner::threads`], so a child dispatched by any
+    /// thread — not just the newest — can still be traced back to this
+    /// worker's visible row (see [`WorkerJob::thread_run_ids`]).
     pub fn set_run_id(&self, run_id: &str) {
-        self.inner.lock().unwrap().run_id = run_id.to_string();
+        let mut i = self.inner.lock().unwrap();
+        i.run_id = run_id.to_string();
+        if !i.threads.iter().any(|t| t == run_id) {
+            i.threads.push(run_id.to_string());
+        }
+    }
+    /// Every coordinator `run_id` this worker has run under (see
+    /// [`JobInner::threads`]). Display surfaces use these as ALIASES for the
+    /// worker's visible `id` when matching a child's `parent_run_id`, so a
+    /// sub-worker dispatched by an earlier thread still nests under its parent
+    /// instead of vanishing.
+    pub fn thread_run_ids(&self) -> Vec<String> {
+        self.inner.lock().unwrap().threads.clone()
     }
     fn is_displayed(&self) -> bool {
         self.inner.lock().unwrap().displayed
@@ -4031,6 +4060,7 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             // Thread 1's run id IS the visible id; `run_worker` re-stamps this
             // on every in-place resume.
             run_id: id.clone(),
+            threads: vec![id.clone()],
             result: None,
             error: None,
             displayed: false,
@@ -5178,6 +5208,7 @@ for operator after 4 auto-recovery attempt(s)";
                 resumes: 0,
                 worktree: None,
                 run_id: id.to_string(),
+                threads: vec![id.to_string()],
                 result: None,
                 error: None,
                 displayed: false,
@@ -5625,6 +5656,7 @@ for operator after 4 auto-recovery attempt(s)";
                 resumes: 0,
                 worktree: None,
                 run_id: String::new(),
+                threads: Vec::new(),
                 result: None,
                 error: None,
                 displayed: false,
@@ -5651,6 +5683,7 @@ for operator after 4 auto-recovery attempt(s)";
                 resumes: 0,
                 worktree: None,
                 run_id: String::new(),
+                threads: Vec::new(),
                 result: None,
                 error: None,
                 displayed: false,
@@ -6573,6 +6606,7 @@ for operator after 4 auto-recovery attempt(s)";
                 resumes: 0,
                 worktree: None,
                 run_id: String::new(),
+                threads: Vec::new(),
                 result: None,
                 error: None,
                 displayed: false,
