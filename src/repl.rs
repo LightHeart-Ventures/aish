@@ -8007,6 +8007,39 @@ fn sort_rows_tray_order(rows: &mut [(String, bool, String)]) {
     rows.sort_by_key(|(id, _, _)| order.iter().position(|o| o == id).unwrap_or(usize::MAX));
 }
 
+/// Which backfill a landed attach slot owes its pane.
+///
+/// Shift-Tab's rotation walks the whole forest — this session's in-memory
+/// coordinators AND the durable SUBWORKERS they spawned (TASK-315) — so the
+/// slot it lands on is not necessarily a worker this process owns. The three
+/// cases are exactly `attach_worker`'s: a finished run replays durably (review),
+/// a live in-session run replays its transcript ring and keeps streaming, and a
+/// live run owned by ANOTHER process has no ring at all and must be tailed from
+/// its durable activity log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachBackfill {
+    /// Terminal run: durable replay + final result.
+    Review,
+    /// Live worker in THIS session: transcript ring + live forwarder.
+    Live,
+    /// Live run owned by another process: replay + tail `~/.aish/activity`.
+    DurableTail,
+}
+
+/// Pick the backfill for an attach slot. Pure → unit-tested.
+///
+/// The bug this encodes against: Shift-Tab used to treat every non-terminal
+/// slot as [`AttachBackfill::Live`], so attaching to a live SUBWORKER rendered
+/// the durable header + task row and then nothing — no turns, forever, because
+/// no durable tail was ever armed.
+fn attach_backfill_mode(terminal: bool, in_session: bool) -> AttachBackfill {
+    match (terminal, in_session) {
+        (true, _) => AttachBackfill::Review,
+        (false, true) => AttachBackfill::Live,
+        (false, false) => AttachBackfill::DurableTail,
+    }
+}
+
 /// `Shift-Tab` — cycle the interactive session's attach cursor across the
 /// coordinators it launched, walking UP the escalation tray. The cycle is
 /// `interactive → bottom tray row → … → top tray row → interactive`: the first
@@ -8169,36 +8202,69 @@ fn cycle_worker(session: &mut Session) -> bool {
     }
     let short = crate::batch::short_id(&run_id);
     let task_suffix = attach_task_suffix(&task);
-    if terminal {
-        // Finished agent: review mode (mirrors `attach_worker`'s terminal
-        // branch). Pre-seed the review marker so `announce_attach_review`
-        // doesn't re-announce the finish, replay its work, then show its result.
-        // A typed line resumes it (see `send_to_attached` → `resume_coordinator`).
-        *session.attach_review_announced.lock().unwrap() = Some(run_id.clone());
-        let banner = format!(
-            "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
-            next_idx,
-            ids.len(),
-            task_suffix
-        );
-        backfill_attached(&run_id, session, &banner);
-        print_attached_result(&run_id, session);
-    } else {
-        // Live worker: clear any stale review marker so a later finish is
-        // announced exactly once (mirrors `attach_worker`'s live branch).
-        *session.attach_review_announced.lock().unwrap() = None;
-        let banner = format!(
-            "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop){}\x1b[0m",
-            next_idx,
-            ids.len(),
-            task_suffix
-        );
-        // Replay the input + activity captured so far, THEN the live stream
-        // continues — the same backfill `:attach` performs. The worker's
-        // forwarder now sees this session as attached and forwards every
-        // subsequent line, so the operator gets the full session transcript
-        // first and live output after, instead of only future output.
-        backfill_attached(&run_id, session, &banner);
+    // A rotation slot can be a durable SUBWORKER (TASK-315 folds them into the
+    // forest), which this process does NOT own: no `WorkerJob`, no transcript
+    // ring, no live forwarder. Its mode is decided exactly like `:attach` does.
+    let in_session = session
+        .worker_jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|w| w.id == run_id);
+    match attach_backfill_mode(terminal, in_session) {
+        AttachBackfill::Review => {
+            // Finished agent: review mode (mirrors `attach_worker`'s terminal
+            // branch). Pre-seed the review marker so `announce_attach_review`
+            // doesn't re-announce the finish, replay its work, then show its
+            // result. A typed line resumes it (`send_to_attached` →
+            // `resume_coordinator`).
+            *session.attach_review_announced.lock().unwrap() = Some(run_id.clone());
+            let banner = format!(
+                "\x1b[1;33m⇄ attached to {short} (finished)\x1b[0m \x1b[2m({}/{} · review mode: type a message to resume it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
+                next_idx,
+                ids.len(),
+                task_suffix
+            );
+            backfill_attached(&run_id, session, &banner);
+            print_attached_result(&run_id, session);
+        }
+        AttachBackfill::Live => {
+            // Live worker: clear any stale review marker so a later finish is
+            // announced exactly once (mirrors `attach_worker`'s live branch).
+            *session.attach_review_announced.lock().unwrap() = None;
+            let banner = format!(
+                "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · Shift-Tab to cycle, :detach to stop){}\x1b[0m",
+                next_idx,
+                ids.len(),
+                task_suffix
+            );
+            // Replay the input + activity captured so far, THEN the live stream
+            // continues — the same backfill `:attach` performs. The worker's
+            // forwarder now sees this session as attached and forwards every
+            // subsequent line, so the operator gets the full session transcript
+            // first and live output after, instead of only future output.
+            backfill_attached(&run_id, session, &banner);
+        }
+        AttachBackfill::DurableTail => {
+            // LIVE SUBWORKER (or another session's live run). Byte-for-byte the
+            // `:attach` durable branch: replay the recorded activity, then ARM
+            // `attached_durable` so `pump_durable_attach` tails the log from the
+            // cursor anchored here. Without the arming, this pane showed the
+            // header + task row and then nothing — the "Shift-Tab into a
+            // subworker shows no turns" bug.
+            *session.attach_review_announced.lock().unwrap() = None;
+            let banner = format!(
+                "\x1b[1;33m⇄ attached to {short}\x1b[0m \x1b[2m({}/{} · durable tail — owned by another process; type to steer it, Shift-Tab to cycle, :detach to stop){}\x1b[0m",
+                next_idx,
+                ids.len(),
+                task_suffix
+            );
+            let tail = backfill_attached_durable_tail(&run_id, session, &banner);
+            *session.attached_durable.lock().unwrap() = Some(crate::activity_log::DurableAttach {
+                run_id: run_id.clone(),
+                tail,
+            });
+        }
     }
     true
 }
@@ -15345,6 +15411,34 @@ mod tests {
         // `:close`d) is treated as interactive, so the next press lands on the
         // first worker rather than panicking or skipping.
         assert_eq!(next_attach_index(&running, Some("w_gone")), 1);
+    }
+
+    // ---- Shift-Tab backfill mode (attach_backfill_mode) -----------------
+
+    #[test]
+    fn attach_backfill_terminal_is_review_regardless_of_ownership() {
+        // A finished run replays durably + prints its result whether or not
+        // this process owns it.
+        assert_eq!(attach_backfill_mode(true, true), AttachBackfill::Review);
+        assert_eq!(attach_backfill_mode(true, false), AttachBackfill::Review);
+    }
+
+    #[test]
+    fn attach_backfill_live_in_session_streams_transcript_ring() {
+        assert_eq!(attach_backfill_mode(false, true), AttachBackfill::Live);
+    }
+
+    #[test]
+    fn attach_backfill_live_subworker_arms_durable_tail() {
+        // REGRESSION: Shift-Tab used to treat every non-terminal slot as
+        // `Live`, so landing on a live SUBWORKER (owned by another process, no
+        // transcript ring) rendered the header + task row and then nothing —
+        // "I attach to the worker and never see its turns". A slot that is not
+        // in THIS session's worker list MUST take the durable tail.
+        assert_eq!(
+            attach_backfill_mode(false, false),
+            AttachBackfill::DurableTail
+        );
     }
 
     // ---- Shift-Tab rotation order (tray_cycle_order) --------------------
