@@ -1058,8 +1058,19 @@ pub async fn run(
             }
         }
         if needs_gap {
-            println!();
-            println!();
+            // While `:attach`ed, the pane's colored left bar must stay
+            // CONTIGUOUS. These two separator rows are bare newlines — they
+            // carry no pane border — so emitting them mid-stream snaps the bar
+            // into disconnected segments (the "blank line after historical
+            // output" UX bug). The streamed pane rows already separate
+            // themselves, so drop the gap while a pane is on screen and keep it
+            // for the normal (unattached) prompt.
+            let live_attach = session.attached.lock().unwrap().is_some();
+            let durable_attach = session.attached_durable.lock().unwrap().is_some();
+            if !live_attach && !durable_attach {
+                println!();
+                println!();
+            }
             needs_gap = false;
         }
         // If the coordinator we're attached to has reached a terminal state,

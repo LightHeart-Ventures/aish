@@ -1589,8 +1589,11 @@ impl ThinkingSpinner {
                     // notice — the same 💭 glyph the forwarded per-round thinking
                     // rows use (`💭 thinking…`) — which reads as an intentional
                     // static line rather than a frozen braille frame `⠋` that
-                    // merely looks stuck. A trailing blank line sets it apart from
-                    // the next forwarded row / the redrawn prompt below it.
+                    // merely looks stuck. It is committed as ONE line with NO
+                    // trailing blank: while attached, a bare blank row carries no
+                    // pane border, so it snaps the colored left bar into
+                    // non-contiguous segments (the "blank line after thinking" UX
+                    // bug). The bar itself is the separator.
                     let body = format!("{NARRATION_ALIGN_PAD}💭 \x1b[2;36mthinking…\x1b[0m");
                     let row = if live {
                         pane_row_live(PANE_NO_LABEL, &body)
@@ -1598,11 +1601,11 @@ impl ThinkingSpinner {
                         pane_row(&label, &body)
                     };
                     // Un-hide the cursor `start` hid — there is no in-place
-                    // animation to conceal — then commit the row on its own line,
-                    // followed by a blank line (announce_raw appends one `\n`; the
-                    // extra `\n` here yields the separating blank row).
+                    // animation to conceal — then commit the row on its own line.
+                    // `announce_raw` already appends the single terminating `\n`;
+                    // do NOT add a second one or the pane gains a bar-less row.
                     eprint!("\x1b[?25h");
-                    crate::tools::announce_raw(&format!("{row}\n"));
+                    crate::tools::announce_raw(&row);
                     committed_static = true;
                     continue;
                 }
