@@ -88,6 +88,7 @@ mod spawn_broker;
 mod spawn_broker_host;
 mod spawn_broker_policy;
 mod spawn_broker_registry;
+mod spawn_ledger;
 
 mod schedule;
 mod stream_cancel;
