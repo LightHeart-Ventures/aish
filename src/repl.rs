@@ -3105,7 +3105,6 @@ pub(crate) struct AishHelper {
     /// repeated paint of the same buffer in O(1); any edit (a new line) or a `cd`
     /// (new cwd) misses and recomputes exactly once.
     route_cache: Mutex<Option<RouteMemo>>,
-    pastes: Mutex<Vec<(String, String)>>,
 }
 
 /// One memoized route-preview decision, keyed on the exact `(line, cwd)` it was
@@ -3134,7 +3133,6 @@ impl AishHelper {
             aliases,
             cmd_cache: Arc::new(Mutex::new(None)),
             route_cache: Mutex::new(None),
-            pastes: Mutex::new(Vec::new()),
         }
     }
 
@@ -3851,46 +3849,29 @@ impl Highlighter for AishHelper {
     }
 }
 impl Validator for AishHelper {
+    /// Collapse a multi-line bracketed paste into a one-line marker the instant
+    /// it lands, so a 400-line paste doesn't flood the composer.
+    ///
+    /// The marker↔payload mapping lives in [`crate::paste_registry`] rather than
+    /// in this helper: the Ctrl-E expansion handler is a rustyline
+    /// `ConditionalEventHandler`, which is handed an `EventContext` and never
+    /// the helper, so a helper-owned store would be unreachable from the one
+    /// place that makes the marker inspectable.
     fn transform_paste(&self, text: String) -> String {
-        if !text.contains('\n') {
-            return text;
-        }
-        let lines = text.lines().count().max(1);
-        let mut pastes = self.pastes.lock().unwrap();
-        let base = format!("[pasted {lines} lines from clipboard]");
-        let mut marker = base.clone();
-        let mut id = 2;
-        while pastes.iter().any(|(key, _)| key == &marker) {
-            marker = format!("[pasted {lines} lines from clipboard #{id}]");
-            id += 1;
-        }
-        pastes.push((marker.clone(), text));
-        marker
+        crate::paste_registry::stash(text)
     }
 }
 
 impl AishHelper {
+    /// Drop remembered pastes at the start of a fresh line, so a marker can
+    /// never resolve against a stale payload.
     pub(crate) fn clear_pastes(&self) {
-        self.pastes.lock().unwrap().clear();
+        crate::paste_registry::clear();
     }
 
+    /// Swap every live marker back for its clipboard text on submit.
     pub(crate) fn expand_pastes(&self, line: &str) -> String {
-        // Replace only tokens from this editing session, without recursively
-        // interpreting clipboard text as additional placeholders.
-        let pastes = self.pastes.lock().unwrap();
-        let mut result = String::new();
-        let mut rest = line;
-        while let Some((offset, marker, payload)) = pastes
-            .iter()
-            .filter_map(|(marker, payload)| rest.find(marker).map(|i| (i, marker, payload)))
-            .min_by_key(|(i, _, _)| *i)
-        {
-            result.push_str(&rest[..offset]);
-            result.push_str(payload);
-            rest = &rest[offset + marker.len()..];
-        }
-        result.push_str(rest);
-        result
+        crate::paste_registry::expand(line)
     }
 }
 impl Helper for AishHelper {}
@@ -13708,7 +13689,6 @@ mod tests {
             aliases: Arc::new(aliases),
             cmd_cache: Arc::new(Mutex::new(None)),
             route_cache: Mutex::new(None),
-            pastes: Mutex::new(Vec::new()),
         }
     }
 
@@ -16453,6 +16433,9 @@ mod clipboard_paste_tests {
             String::new(),
             Arc::new(HashMap::new()),
         );
+        // The registry is process-global (the Ctrl-E handler can't see the
+        // helper), so start from a known-empty store.
+        helper.clear_pastes();
         let first = "alpha\nbeta\n";
         let marker = helper.transform_paste(first.into());
         assert_eq!(marker, "[pasted 2 lines from clipboard]");
@@ -16465,8 +16448,13 @@ mod clipboard_paste_tests {
         );
         assert_eq!(helper.transform_paste("single line".into()), "single line");
         assert_eq!(helper.expand_pastes("deleted"), "deleted");
+        // What Ctrl-E keys off: a live marker is expandable, plain text isn't —
+        // that's what lets the chord keep its readline `EndOfLine` meaning.
+        assert!(crate::paste_registry::has_marker(&format!("x {marker}")));
+        assert!(!crate::paste_registry::has_marker("no paste here"));
         helper.clear_pastes();
         assert_eq!(helper.expand_pastes(&marker), marker);
+        assert!(!crate::paste_registry::has_marker(&marker));
     }
 }
 

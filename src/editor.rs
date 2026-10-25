@@ -242,6 +242,17 @@ impl RustylineEditor {
             EventHandler::Conditional(Box::new(AcceptHint)),
         );
 
+        // Ctrl-E makes the `[pasted N lines from clipboard]` marker
+        // INSPECTABLE: with a live marker in the buffer it swaps the stub for
+        // the clipboard text in place, so the operator can read (and edit) what
+        // they are about to send instead of trusting a stub. With no marker in
+        // the buffer it is a plain `EndOfLine`, so the chord keeps its readline
+        // meaning everywhere else.
+        rl.bind_sequence(
+            KeyEvent::ctrl('E'),
+            EventHandler::Conditional(Box::new(ExpandPaste)),
+        );
+
         // Ctrl-S voice dictation — bind the key and init the flag only when the
         // `voice` feature is compiled in; neither exists in default/CI builds.
         // NOTE: Ctrl-S is XOFF (flow control); ensure IXON is cleared in tty setup.
@@ -467,8 +478,13 @@ impl LineEditor for RustylineEditor {
         crate::terminal::park_input_row(prompt);
         let outcome = self.blocking_read(prompt);
         crate::terminal::set_reading_line(false);
+        // Expand paste markers BEFORE the echo so the committed transcript
+        // records what was actually sent. Echoing the raw stub left scrollback
+        // permanently missing the content (the registry is cleared on the next
+        // read, so there is no later chance to resolve it).
+        let outcome = self.expand_outcome(outcome);
         crate::terminal::unpark_input_row(echo_for(prompt, &outcome).as_deref());
-        self.expand_outcome(outcome)
+        outcome
     }
 
     fn read_line_with_initial(&mut self, prompt: &str, initial: &str) -> ReadOutcome {
@@ -488,9 +504,11 @@ impl LineEditor for RustylineEditor {
         crate::terminal::park_input_row(prompt);
         let res = self.rl.readline_with_initial(prompt, (initial, ""));
         crate::terminal::set_reading_line(false);
-        let outcome = self.outcome(res);
+        // Expand before echoing — same reason as `read_line`: the transcript has
+        // to be self-contained, and the marker registry does not outlive the read.
+        let outcome = self.expand_outcome(self.outcome(res));
         crate::terminal::unpark_input_row(echo_for(prompt, &outcome).as_deref());
-        self.expand_outcome(outcome)
+        outcome
     }
 
     fn add_history(&mut self, line: &str) {
@@ -623,6 +641,40 @@ impl ConditionalEventHandler for AcceptHint {
         } else {
             Some(Cmd::Move(Movement::ForwardChar(n)))
         }
+    }
+}
+
+/// Ctrl-E handler that expands a PENDING paste marker in place.
+///
+/// A multi-line bracketed paste is collapsed to a one-line
+/// `[pasted N lines from clipboard]` stub the instant it lands (see
+/// `crate::paste_registry`), and that stub used to be opaque until submit — the
+/// operator had no way to re-read what they had pasted. This turns the marker
+/// into something you can OPEN: one chord replaces every live marker in the
+/// buffer with its clipboard text, leaving an ordinary multi-line buffer that
+/// can be read, edited, or submitted as-is.
+///
+/// It only claims the chord when there is something to expand; otherwise it
+/// returns `Cmd::Move(Movement::EndOfLine)`, Ctrl-E's readline meaning. The
+/// registry is consulted through the process-global store because a
+/// `ConditionalEventHandler` is handed an `EventContext` and never the helper
+/// that owns the paste hook.
+struct ExpandPaste;
+
+impl ConditionalEventHandler for ExpandPaste {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
+        let line = ctx.line();
+        if !crate::paste_registry::has_marker(line) {
+            return Some(Cmd::Move(Movement::EndOfLine));
+        }
+        // Replace the WHOLE buffer rather than splicing: `Movement::WholeBuffer`
+        // leaves the cursor at the end of the inserted text, which is where the
+        // operator wants it after unfolding a paste, and keeps the expansion a
+        // single undoable edit.
+        Some(Cmd::Replace(
+            Movement::WholeBuffer,
+            Some(crate::paste_registry::expand(line)),
+        ))
     }
 }
 

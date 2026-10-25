@@ -744,22 +744,31 @@ pub fn band_half_row(glyph: char, cols: usize, bg: &str) -> String {
 /// highlight reads as one contiguous shape with a thin lip above and below
 /// rather than three full rows of grey.
 ///
-/// Row count stays 3 either way, so `terminal::unpark_input_row`'s `BODY_ROW`
-/// math is untouched.
+/// A MULTI-LINE `echo` (an Alt-Enter composition, or a submitted line whose
+/// paste marker was expanded back into its clipboard text) becomes one banded
+/// row PER line between the same two lips, so the highlight stays a single
+/// contiguous shape. `terminal::unpark_input_row` advances `BODY_ROW` by the
+/// returned row count, so a taller block needs no math there.
 ///
 /// Pure form: the caller decides color and shade, so the layout is
 /// unit-testable without a TTY. Embedded resets inside `echo` are re-armed with
 /// `bg` by [`band_row`]. With `color_on` false the band is dropped and the two
 /// padding lines come back empty — still blank, just unpainted.
 pub fn input_echo_block_with(echo: &str, cols: usize, color_on: bool, bg: &str) -> Vec<String> {
+    // Split on '\n' in BOTH arms: the caller emits one terminal write per
+    // element, so a newline left embedded in a row would stair-step the output
+    // (no carriage return) and, in the painted arm, end the band mid-line.
+    let rows = echo.split('\n').map(|row| row.trim_end_matches('\r'));
     if !color_on {
-        return vec![String::new(), echo.to_string(), String::new()];
+        let mut block = vec![String::new()];
+        block.extend(rows.map(str::to_string));
+        block.push(String::new());
+        return block;
     }
-    vec![
-        band_half_row(BAND_UPPER_HALF, cols, bg),
-        band_row(echo, cols, bg),
-        band_half_row(BAND_LOWER_HALF, cols, bg),
-    ]
+    let mut block = vec![band_half_row(BAND_UPPER_HALF, cols, bg)];
+    block.extend(rows.map(|row| band_row(row, cols, bg)));
+    block.push(band_half_row(BAND_LOWER_HALF, cols, bg));
+    block
 }
 
 /// Paint ONE already-styled row edge to edge in the band shade `bg`, padded out
