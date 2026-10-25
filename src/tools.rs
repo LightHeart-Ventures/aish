@@ -4143,22 +4143,38 @@ sentence that you're on it and the answer will appear when ready."
     };
     let id = crate::worker::spawn(&session.worker_jobs, task.to_string(), spec);
     let short = crate::batch::short_id(&id);
-    // Announce the fan-out, but ONLY when we are nested. A top-level call is the
-    // interactive shell starting a worker on the operator's own instruction, and
-    // it already prints its own launch notice (see `escalation.rs`) — a second
-    // line here would just duplicate it on screen.
     if session.nested {
+        // Nested: this is a coordinator fanning sub-work out, and its own stdout
+        // is captured — route the note through the console channel so it reaches
+        // the operator's interactive session instead of a log nobody reads.
         crate::worker::emit_console_note(&fan_out_note(
             &format!("spawned sub-worker {short}"),
             task,
         ));
+    } else {
+        // Top-level: the model just launched a worker on the operator's own
+        // instruction — and until now THIS path printed nothing. `:dispatch` and
+        // the work-signal auto-offload both print a 🚀 liftoff banner
+        // (`dispatch_background`), so the operator saw a notice for two of the
+        // three launch paths and bare model prose for the third. Print the same
+        // line, with the same verb, so one event has one rendering.
+        //
+        // The STATIC final frame, not the animation: we are mid-turn (the footer
+        // painter owns the cursor and the stream is live), exactly like the
+        // mid-turn `:dispatch` path, which settles for this line too.
+        println!(
+            "{}",
+            crate::repl::liftoff_banner_line(crate::repl::DISPATCH_VERB, short, task)
+        );
     }
     Ok(format!(
         "Queued a background coordinator (full toolset + MCP in this directory; it can fan parallel \
 sub-work out on its own). The result auto-delivers here when it's done — do NOT poll for it. If your \
 context is compacted before you consume the delivered result, retrieve it deterministically with \
-`job_output {{job: \"{short}\"}}` (or list ids with `background_status scope:\"session\"`). Now reply \
-to the user with one short, natural sentence that you're on it and the answer will appear when ready."
+`job_output {{job: \"{short}\"}}` (or list ids with `background_status scope:\"session\"`). aish has \
+ALREADY printed the launch notice on screen, so do not restate the task, the id, or why you offloaded \
+it — and nothing should have preceded this call. Now reply to the user with one short, natural \
+sentence that you're on it and the answer will appear when ready."
     ))
 }
 

@@ -1577,7 +1577,7 @@ pub async fn run(
                     // the most recent turns so deixis resolves. No-op when there's
                     // no prior context (the digest adds nothing on a cold prompt).
                     let task = enrich_task_with_context(&line, &session.history);
-                    dispatch_background(&task, &mut session, true);
+                    dispatch_background(&task, &mut session);
                     continue;
                 }
 
@@ -6041,7 +6041,7 @@ pub(crate) fn dispatch_coordinator_ctx(task: &str, ctx: &OpsCtx) -> Dispatched {
             // `dispatch_background` re-renders this with the liftoff animation on
             // a TTY; a mid-turn `:dispatch` (which can only return a string) uses
             // this static final-frame line as-is.
-            let message = liftoff_banner_line("dispatched to", crate::batch::short_id(&id), task);
+            let message = liftoff_banner_line(DISPATCH_VERB, crate::batch::short_id(&id), task);
             Dispatched {
                 id: Some(id),
                 message,
@@ -6128,6 +6128,16 @@ pub(crate) fn run_midturn_command(line: &str, ctx: &OpsCtx) -> Option<String> {
 /// mark. Aliased (not re-typed) so they cannot drift.
 const LIFTOFF_GLYPH: &str = crate::escalation::LIVE_GLYPH;
 
+/// The ONE verb every coordinator-launch notice uses, whatever launched it: an
+/// operator's `:dispatch`, the agent auto-offloading a work-signal line, or the
+/// model calling `run_in_background`. All three land in the same
+/// [`crate::worker::spawn`] and pin the same footer row, so wearing two
+/// vocabularies ("escalated to" vs "dispatched to") only taught the operator
+/// that they were different events — and "escalated" additionally implied a
+/// tier/competence judgement no caller actually makes. Centralised as a const so
+/// the call sites cannot drift apart again.
+pub(crate) const DISPATCH_VERB: &str = "dispatched to";
+
 /// Condense a task brief into the one-line summary the liftoff banner carries
 /// after the worker id. Whitespace is COLLAPSED first — a multi-line brief
 /// pasted into `:dispatch` must not break a single-line banner (or smear the
@@ -6139,11 +6149,12 @@ fn liftoff_summary(task: &str, budget: usize) -> String {
 }
 
 /// Body of a liftoff banner: everything after the animating glyph.
-/// `verb` is the offload phrasing — `"escalated to"` when the agent offloaded
-/// the work itself, `"dispatched to"` when the operator typed `:dispatch`. The
-/// rest is deliberately IDENTICAL for both: either way the work now lives on a
-/// background worker the operator can keep working alongside, so the two notices
-/// read as one visual family instead of two unrelated lines.
+/// `verb` is the offload phrasing, and in practice there is exactly one:
+/// [`DISPATCH_VERB`]. It stays a parameter only so the shape is unit-testable
+/// independently of the word — every launch path (`:dispatch`, the work-signal
+/// auto-offload, the model's own `run_in_background`) means the same thing to
+/// the operator (the work now lives on a background worker they can keep working
+/// alongside), so they all read as one line, not a family of near-synonyms.
 ///
 /// The tail is the WORK, not instructions: a static "keep working here;
 /// Shift-Tab to see work" reprinted on every launch is chrome the operator
@@ -6167,7 +6178,7 @@ fn liftoff_banner_body(verb: &str, short: &str, summary: &str) -> String {
 /// [`crate::escalation::set_task`], swapped in from the durable row by
 /// `refresh_escalation_status`); a banner that printed the raw brief instead left
 /// one worker wearing two names — and a brief that opens with pasted context
-/// reads as `escalated to background worker w_MvA9HUdU: === Recent conversation
+/// reads as `dispatched to background worker w_MvA9HUdU: === Recent conversation
 /// context …` directly above a tray row reading `w_MvA9HUdU · dai-TODO gap
 /// analysis & build plan`. The title is written by the coordinator SUBPROCESS a
 /// moment after it boots (credential + one lightweight model call), so the
@@ -6436,16 +6447,16 @@ fn print_liftoff_banner(
 /// or start streaming the worker's activity. Use `:attach <id>` afterwards to
 /// watch + steer it, or `:output on` to stream every coordinator's activity.
 ///
-/// `escalation` distinguishes the two ways we reach here, and now changes only
-/// the VERB in the banner. An explicit `:dispatch <task>` (`escalation == false`)
-/// is a deliberate launch ("dispatched to background worker …"); an ESCALATION
-/// (`escalation == true`) is the agent offloading heavy work on its own — either
-/// because it decided to, or because the typed line carried a work signal
-/// (outside `:dispatch`) — and reads "escalated to background worker …". Both
-/// print the same liftoff banner (🚀 + id + a clipped summary of the task that
-/// just left), leaving the operator free to keep working in the interactive
-/// session with the newly-spawned worker (a `w_########` id) one Shift-Tab away.
-fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
+/// EVERY way we reach here prints the SAME notice, with the same verb
+/// ([`DISPATCH_VERB`]): an explicit `:dispatch <task>`, and the agent
+/// auto-offloading a typed line that carried a work signal. The old split —
+/// "dispatched to" for the operator, "escalated to" for the agent — described a
+/// difference the operator cannot see and does not care about: both land in the
+/// same [`crate::worker::spawn`] and pin the same footer row. The banner is 🚀 +
+/// id + a clipped summary of the task that just left, leaving the operator free
+/// to keep working in the interactive session with the newly-spawned worker (a
+/// `w_########` id) one Shift-Tab away.
+fn dispatch_background(task: &str, session: &mut Session) {
     let Dispatched { id, message } = dispatch_coordinator(task, session);
     // A guard failure (empty/nested/no-credential/no-binary) carries no id —
     // print its explanation regardless of how we got here and bail.
@@ -6454,28 +6465,13 @@ fn dispatch_background(task: &str, session: &mut Session, escalation: bool) {
         return;
     };
     let short = crate::batch::short_id(&id);
-    if escalation {
-        // The agent escalated this on its own (or via a work-signal line). Run it
-        // as a background worker and name the work that left, so the operator can
-        // tell this launch apart from the others already in the tray. The leading
-        // 🚀 "lifts off" with a brief liftoff animation on a TTY.
-        print_liftoff_banner(
-            "escalated to",
-            short,
-            task,
-            session.coordinator_store.as_ref(),
-            &id,
-        );
-        return;
-    }
-    // Fire-and-forget: unlike the old behaviour we do NOT auto-attach or turn
-    // `:output` on. An operator-typed `:dispatch` gets the SAME banner as an
-    // escalation (only the verb differs) — same glyph, same liftoff animation,
-    // same task summary — because it means the same thing to the operator.
-    // `message` already holds this line's static form (so the mid-turn path
-    // matches); printing it through the banner adds the animation on a TTY.
+    // Fire-and-forget: we do NOT auto-attach or turn `:output` on. Name the work
+    // that left so the operator can tell this launch apart from the others
+    // already in the tray; the leading 🚀 "lifts off" with a brief animation on a
+    // TTY. `message` already holds this line's static form (so the mid-turn path
+    // matches); printing it through the banner adds the animation.
     print_liftoff_banner(
-        "dispatched to",
+        DISPATCH_VERB,
         short,
         task,
         session.coordinator_store.as_ref(),
@@ -9044,7 +9040,7 @@ enum TellTarget {
 const TELL_GLYPH: &str = "\u{1f4e3}";
 
 /// Build the `:tell` confirmation banner — the steering sibling of the
-/// escalation / `:dispatch` liftoff lines ("🚀  escalated to background worker
+/// dispatch liftoff lines ("🚀  dispatched to background worker
 /// w_abc1234: fix the flaky test"), so every operator-facing worker event
 /// reads as one visual family: glyph, two spaces, `<verb> background worker
 /// <short-id>`, then a dim `—` tail. `:tell` differs only in the glyph (📣, the
@@ -11702,8 +11698,8 @@ async fn handle_colon(
             // the deterministic equivalent of the model calling run_in_background.
             // Shares dispatch_coordinator with the "troubleshoot" auto-offload.
             let task = parts.collect::<Vec<_>>().join(" ");
-            // Explicit operator launch — not an agent escalation.
-            dispatch_background(&task, session, false);
+            // Explicit operator launch — same notice as every other launch path.
+            dispatch_background(&task, session);
         }
         Some("attach") => attach_worker(parts.next(), session),
         Some("detach") => detach_worker(session),
@@ -15925,7 +15921,7 @@ mod tests {
     #[test]
     fn tell_banner_matches_the_coordinator_banner_family() {
         let line = tell_banner("w_abc1234", 2);
-        // Megaphone marker — :tell's sibling of the dispatch / escalation lines.
+        // Megaphone marker — :tell's sibling of the dispatch liftoff line.
         assert!(line.contains("📣"), "missing megaphone: {line}");
         // Same "<glyph>  <verb> background worker <short-id>" shape the liftoff
         // banner uses, so the three worker events read as one family.
@@ -15934,8 +15930,8 @@ mod tests {
             "unexpected shape: {line}"
         );
         assert!(
-            liftoff_banner_body("escalated to", "w_abc1234", "fix the flaky test")
-                .contains("  escalated to background worker w_abc1234"),
+            liftoff_banner_body(DISPATCH_VERB, "w_abc1234", "fix the flaky test")
+                .contains("  dispatched to background worker w_abc1234"),
             "liftoff family shape drifted — keep tell_banner in step"
         );
         // The pending count stays visible so repeated :tells are legible.
@@ -16121,38 +16117,35 @@ mod tests {
     }
 
     #[test]
-    fn liftoff_banner_is_one_family_for_dispatch_and_escalation() {
-        // The whole point of the change: an operator-typed `:dispatch` and an
-        // agent-initiated escalation render the SAME banner — same leading
-        // glyph (the escalation tray's rocket), same task-summary tail, same
-        // worker id — differing only in the verb. If these ever drift apart the
-        // operator sees two unrelated notices again.
+    fn liftoff_banner_is_one_line_for_every_launch_path() {
+        // The whole point of the change: an operator-typed `:dispatch`, the
+        // work-signal auto-offload and the model's own `run_in_background` all
+        // render the SAME banner — same leading glyph (the escalation tray's
+        // rocket), same ONE verb, same worker id, same task-summary tail. No
+        // caller gets to pick a near-synonym: there is exactly one verb const.
         let task = "rename the dispatch glyph to the escalation rocket";
-        let esc = liftoff_banner_line("escalated to", "w_2WjMgbqm", task);
-        let dis = liftoff_banner_line("dispatched to", "w_2WjMgbqm", task);
-        for line in [&esc, &dis] {
-            assert!(
-                line.contains(LIFTOFF_GLYPH),
-                "missing liftoff glyph: {line}"
-            );
-            // Same rocket the escalation tray paints on a live worker.
-            assert!(line.contains("🚀"), "glyph is not the tray rocket: {line}");
-            assert!(line.contains("background worker w_2WjMgbqm:"), "{line}");
-            // The tail is the WORK, not instructions.
-            assert!(line.contains("rename the dispatch glyph"), "{line}");
-            // No leftovers from the old dispatch notice / old chrome tail.
-            assert!(!line.contains("Shift-Tab"), "{line}");
-            assert!(!line.contains("keep working here"), "{line}");
-            assert!(!line.contains("auto-delivers"), "{line}");
-            assert!(!line.contains(":workers"), "{line}");
-        }
-        assert!(esc.contains("escalated to background worker"), "{esc}");
-        assert!(dis.contains("dispatched to background worker"), "{dis}");
-        // Identical apart from the verb.
-        assert_eq!(
-            esc.replace("escalated to", "VERB"),
-            dis.replace("dispatched to", "VERB")
+        let line = liftoff_banner_line(DISPATCH_VERB, "w_2WjMgbqm", task);
+        assert!(
+            line.contains(LIFTOFF_GLYPH),
+            "missing liftoff glyph: {line}"
         );
+        // Same rocket the escalation tray paints on a live worker.
+        assert!(line.contains("🚀"), "glyph is not the tray rocket: {line}");
+        assert!(
+            line.contains("dispatched to background worker w_2WjMgbqm:"),
+            "{line}"
+        );
+        // The tail is the WORK, not instructions.
+        assert!(line.contains("rename the dispatch glyph"), "{line}");
+        // "escalated" implied a tier/competence judgement no caller makes — it
+        // must not come back, in either direction.
+        assert!(!line.contains("escalated"), "{line}");
+        assert!(!DISPATCH_VERB.contains("escalat"), "{DISPATCH_VERB}");
+        // No leftovers from the old dispatch notice / old chrome tail.
+        assert!(!line.contains("Shift-Tab"), "{line}");
+        assert!(!line.contains("keep working here"), "{line}");
+        assert!(!line.contains("auto-delivers"), "{line}");
+        assert!(!line.contains(":workers"), "{line}");
     }
 
     #[test]

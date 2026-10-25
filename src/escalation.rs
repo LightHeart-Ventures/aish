@@ -3,7 +3,7 @@
 //!
 //! THE PROBLEM. When the model escalates work to a background coordinator
 //! (`run_in_background`), the launch notice is printed ONCE into the scrolling
-//! body ("🚀 escalated to a background coordinator …") and then immediately
+//! body ("🚀 dispatched to background worker w_xxxxxxxx: …") and then immediately
 //! scrolls away under the next command's output. Thirty seconds later the
 //! operator has no on-screen evidence that anything is running — the only
 //! surviving signal is the `⟳N` prompt pulse, which says neither WHAT was

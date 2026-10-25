@@ -1634,10 +1634,12 @@ for. Read the request first: if it is a question, reach for background_status (o
 lookup) and reply; dispatching a fresh coordinator to answer whether a coordinator was already \
 dispatched is exactly the wrong move. To answer \"what's running?\" call \
 background_status (never invent your own tracking). Steer a coordinator that is ALREADY running without restarting it: call the `tell` tool with its run id (from background_status) and a message — a clarification, a course-correction, a narrower scope — and it is folded into that coordinator's next round; this is how you and your background coordinators message each other mid-flight. When you offload, call run_in_background with NO \
-preamble, then reply with ONE short, natural sentence — tailored to what they asked — saying you're \
-handling it in the background and the answer will appear here when it's ready (e.g. \"On it — I'll work \
-that out in the background and post the answer here.\"). Do NOT predict or mention the job id, restate \
-the task, or explain cost/timing; the result auto-delivers.\n\nROUTING DECISION TABLE — match the tool to the intent: a NEW logical task to DO → run_in_background · a follow-up or course-correction for an already-running job → tell · a check of progress, outcome, or history → background_status · a QUESTION of any kind (even asking whether a worker was already dispatched) → answer INLINE. Spawning a coordinator to answer a question about coordinators is the exact error class this table prevents.";
+preamble — nothing before the call: no plan, no scope summary, no justification of why the work is \
+too heavy to run inline, not even one sentence of setup. Then reply with ONE short, natural sentence \
+— tailored to what they asked — saying you're handling it in the background and the answer will \
+appear here when it's ready (e.g. \"On it — I'll work that out in the background and post the answer \
+here.\"). aish itself prints the launch notice (🚀 + the worker id + a summary of the work), so do NOT \
+predict or mention the job id, restate the task, or explain cost/timing; the result auto-delivers.\n\nROUTING DECISION TABLE — match the tool to the intent: a NEW logical task to DO → run_in_background · a follow-up or course-correction for an already-running job → tell · a check of progress, outcome, or history → background_status · a QUESTION of any kind (even asking whether a worker was already dispatched) → answer INLINE. Spawning a coordinator to answer a question about coordinators is the exact error class this table prevents.";
 
 /// Appended when the frontend is a smaller/faster model than the strongest one
 /// available (haiku/sonnet, or a local model with a Claude credential). It tells
