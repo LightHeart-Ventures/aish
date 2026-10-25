@@ -1621,6 +1621,18 @@ pub async fn run(
                         let cb_tail = std::sync::Arc::new(interactive_tail_rows(&session));
                         let on_shift_tab: crate::keywatch::ShiftTabFn =
                             std::sync::Arc::new(move || {
+                                // Hold a DEC 2026 synchronized-output frame across the
+                                // ENTIRE view switch. The cycle wipes the viewport,
+                                // repaints the footer, re-anchors the cursor and then
+                                // streams a header + a screenful of replayed rows —
+                                // dozens of writes. Un-synchronized the terminal
+                                // presents the blank intermediate state and the
+                                // operator sees a hard flash; wrapped, the wipe and
+                                // the repaint land as ONE frame. Guard drops (and the
+                                // frame presents) at the end of this closure, after
+                                // the replay has been written. No-op on terminals that
+                                // don't implement 2026.
+                                let _frame = crate::terminal::sync_update();
                                 cycle_worker_live(
                                     &cb_workers,
                                     &cb_attached,
@@ -1856,7 +1868,19 @@ pub async fn run(
                 // OR the hop that wraps back to the interactive prompt (it prints
                 // nothing and re-anchors the cursor itself). Either way, DON'T arm
                 // the gap in those cases.
-                if cycle_worker(&mut session) {
+                // Same flash fix as the mid-turn path: hold a DEC 2026
+                // synchronized-output frame across the whole switch so the wipe,
+                // the footer repaint, the attach header and the backfilled tail
+                // are presented as ONE atomic frame instead of letting the
+                // operator see the cleared screen first. The guard drops at the
+                // end of this block (before the prompt redraw, which is a single
+                // write and never flashed). No-op off a tty, on terminals without
+                // 2026, or when AISH_NO_SYNC_UPDATE is set.
+                let cycled = {
+                    let _frame = crate::terminal::sync_update();
+                    cycle_worker(&mut session)
+                };
+                if cycled {
                     needs_gap = true;
                 }
                 continue;
