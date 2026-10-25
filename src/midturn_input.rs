@@ -67,6 +67,12 @@ pub enum Key {
     CtrlA,
     /// Ctrl-E — move to end of line.
     CtrlE,
+    /// A whole **bracketed paste** (`ESC [200~` … `ESC [201~`), already
+    /// assembled and newline-normalised. Delivered as ONE key so a multi-line
+    /// paste lands as one edit at the cursor instead of N phantom Enters: the
+    /// operator still owns submission (`paste → Enter`, `input → paste → Enter`,
+    /// `paste → input → Enter`, … are all valid).
+    Paste(String),
 }
 
 /// Parser carry state so an escape sequence or UTF-8 character split across two
@@ -80,6 +86,39 @@ pub struct KeyParser {
     utf8: Vec<u8>,
     /// How many more continuation bytes the in-progress UTF-8 char still needs.
     utf8_need: usize,
+    /// Bracketed-paste accumulation: `None` = not pasting; `Some(buf)` = inside
+    /// `ESC [200~` … `ESC [201~`, `buf` holds the raw payload seen so far.
+    /// Everything (newlines included) is buffered verbatim until the end marker.
+    paste: Option<Vec<u8>>,
+}
+
+/// The bracketed-paste terminator emitted by the terminal after the payload.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Normalise a raw pasted payload into the text we insert into the line buffer:
+/// CRLF/CR → LF (so a Windows-clipboard paste doesn't carry stray `\r` into the
+/// command) and a trailing newline trimmed (copying a whole line almost always
+/// includes it, and it must NOT read as "submit"). Returns `None` when nothing
+/// printable survives.
+fn normalize_paste(raw: &str) -> Option<String> {
+    let text = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let text = text.trim_end_matches('\n').to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Heuristic fallback for terminals that do NOT speak bracketed paste: a single
+/// `read()` chunk carrying an **interior** newline cannot have been typed (a
+/// human's Enter ends the chunk), so treat the whole chunk as one paste.
+/// Conservative on purpose — chunks containing ESC are left to the key parser so
+/// no escape sequence is ever swallowed.
+fn looks_like_paste(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 || bytes.contains(&0x1b) {
+        return false;
+    }
+    // An interior newline = a newline with at least one byte after it.
+    bytes[..bytes.len() - 1]
+        .iter()
+        .any(|&b| b == b'\n' || b == b'\r')
 }
 
 impl KeyParser {
@@ -94,8 +133,42 @@ impl KeyParser {
     /// key (e.g. an unsupported CSI final) are silently dropped, matching the
     /// existing reader's "ignore what we don't handle" posture.
     pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Key>) {
+        // Terminals without bracketed paste give us no markers at all; a chunk
+        // with an interior newline is a paste by construction (see
+        // `looks_like_paste`). Only consider it from a clean ground state so we
+        // never cut a carried-over escape / UTF-8 / paste sequence in half.
+        if self.is_ground() && looks_like_paste(bytes) {
+            if let Some(text) = normalize_paste(&String::from_utf8_lossy(bytes)) {
+                out.push(Key::Paste(text));
+            }
+            return;
+        }
         for &b in bytes {
             self.feed_byte(b, out);
+        }
+    }
+
+    /// True when no escape / UTF-8 / paste sequence is mid-flight.
+    fn is_ground(&self) -> bool {
+        self.esc.is_none() && self.utf8_need == 0 && self.paste.is_none()
+    }
+
+    /// Accumulate one payload byte of an in-flight bracketed paste, emitting a
+    /// single [`Key::Paste`] once the `ESC [201~` terminator lands. The payload
+    /// is buffered verbatim — a newline inside a paste is text, never a submit.
+    fn feed_paste_byte(&mut self, b: u8, out: &mut Vec<Key>) {
+        let Some(buf) = self.paste.as_mut() else {
+            return;
+        };
+        buf.push(b);
+        if !buf.ends_with(PASTE_END) {
+            return;
+        }
+        let mut raw = std::mem::take(buf);
+        raw.truncate(raw.len() - PASTE_END.len());
+        self.paste = None;
+        if let Some(text) = normalize_paste(&String::from_utf8_lossy(&raw)) {
+            out.push(Key::Paste(text));
         }
     }
 
@@ -107,6 +180,14 @@ impl KeyParser {
     }
 
     fn feed_byte(&mut self, b: u8, out: &mut Vec<Key>) {
+        // Inside a bracketed paste every byte is payload — newlines, control
+        // chars, the lot — until the `ESC [201~` terminator. This is what keeps a
+        // 12-line paste from arriving as 12 submitted lines.
+        if self.paste.is_some() {
+            self.feed_paste_byte(b, out);
+            return;
+        }
+
         // In the middle of a CSI / ESC sequence?
         if let Some(buf) = self.esc.as_mut() {
             // A stray ESC re-arms the sequence (matches scan_csi_z semantics).
@@ -131,6 +212,15 @@ impl KeyParser {
                 // buf = [ '[' , params..., final ]
                 let seq = std::mem::take(buf);
                 self.esc = None;
+                // Paste brackets are modes, not keys: `[200~` opens the payload
+                // buffer, a stray `[201~` in ground state is noise.
+                if seq.as_slice() == b"[200~" {
+                    self.paste = Some(Vec::new());
+                    return;
+                }
+                if seq.as_slice() == b"[201~" {
+                    return;
+                }
                 if let Some(k) = decode_csi(&seq) {
                     out.push(k);
                 }
@@ -365,6 +455,17 @@ impl LineBuf {
         self.detach_from_history();
     }
 
+    /// Insert a whole string at the cursor as ONE edit — the paste path. Keeps
+    /// newlines as literal chars so the block stays a single pending line that
+    /// the operator submits (or edits further) with Enter.
+    fn insert_str(&mut self, s: &str) {
+        for c in s.chars() {
+            self.chars.insert(self.cursor, c);
+            self.cursor += 1;
+        }
+        self.detach_from_history();
+    }
+
     fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -408,6 +509,14 @@ impl LineBuf {
         match key {
             Key::Char(c) => {
                 self.insert(c);
+                Action::None
+            }
+            // A paste is ONE edit, never a sequence of submits: the whole
+            // payload (newlines included) lands in the buffer and waits for the
+            // operator's Enter. This is the GH bug — pasted lines were each
+            // queued as separate input.
+            Key::Paste(text) => {
+                self.insert_str(&text);
                 Action::None
             }
             Key::Backspace => {
@@ -871,6 +980,121 @@ mod tests {
         b.apply(Key::Delete); // empty guard
         assert!(b.is_empty());
         assert_eq!(b.cursor(), 0);
+    }
+
+    // ---- bracketed paste (GH: pasting while busy queued EACH line) ----
+
+    /// Drive a byte stream through one parser + one buffer, returning the
+    /// pending line and every action the keys produced — the exact pipeline the
+    /// mid-turn reader runs.
+    fn drive(chunks: &[&[u8]]) -> (String, Vec<Action>) {
+        let mut p = KeyParser::new();
+        let mut b = LineBuf::new();
+        let mut acts = Vec::new();
+        for chunk in chunks {
+            for k in p.decode(chunk) {
+                acts.push(b.apply(k));
+            }
+        }
+        (b.as_string(), acts)
+    }
+
+    #[test]
+    fn bracketed_paste_is_one_edit_not_one_submit_per_line() {
+        let (line, acts) = drive(&[b"\x1b[200~one\ntwo\nthree\x1b[201~".as_slice()]);
+        // THE bug: three pasted lines must not become three queued commands.
+        assert!(!acts.iter().any(|a| matches!(a, Action::Submit(_))));
+        assert_eq!(acts.len(), 1, "a paste is exactly one key");
+        assert_eq!(line, "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn paste_then_enter_submits_the_whole_block_once() {
+        let mut p = KeyParser::new();
+        let mut b = LineBuf::new();
+        for k in p.decode(b"\x1b[200~a\nb\x1b[201~") {
+            assert_eq!(b.apply(k), Action::None);
+        }
+        // The operator still owns submission: paste → Enter.
+        assert_eq!(b.apply(Key::Enter), Action::Submit("a\nb".to_string()));
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn typing_around_a_paste_lands_at_the_cursor() {
+        // input → paste → input → Enter is a valid operator sequence.
+        let (line, acts) = drive(&[
+            b"go ".as_slice(),
+            b"\x1b[200~x\ny\x1b[201~".as_slice(),
+            b"!".as_slice(),
+        ]);
+        assert!(!acts.iter().any(|a| matches!(a, Action::Submit(_))));
+        assert_eq!(line, "go x\ny!");
+    }
+
+    #[test]
+    fn paste_split_across_reads_still_lands_as_one_key() {
+        // Payload AND end marker can straddle `read()` chunks.
+        let (line, acts) = drive(&[
+            b"\x1b[20".as_slice(),
+            b"0~first\nsec".as_slice(),
+            b"ond\x1b[20".as_slice(),
+            b"1~".as_slice(),
+        ]);
+        assert_eq!(line, "first\nsecond");
+        assert_eq!(acts.len(), 1);
+    }
+
+    #[test]
+    fn paste_normalises_crlf_and_drops_the_trailing_newline() {
+        // Copying whole lines almost always grabs the final newline — it must
+        // read as end-of-text, never as "submit".
+        let (line, acts) = drive(&[b"\x1b[200~win\r\nlines\r\n\x1b[201~".as_slice()]);
+        assert_eq!(line, "win\nlines");
+        assert!(!acts.iter().any(|a| matches!(a, Action::Submit(_))));
+    }
+
+    #[test]
+    fn newline_only_paste_is_dropped() {
+        let (line, acts) = drive(&[b"\x1b[200~\n\n\x1b[201~".as_slice()]);
+        assert!(line.is_empty());
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn unbracketed_multiline_chunk_is_treated_as_a_paste() {
+        // Terminals that don't speak DECSET 2004 send no markers; an interior
+        // newline cannot have been typed, so it is still ONE edit.
+        let (line, acts) = drive(&[b"alpha\nbeta".as_slice()]);
+        assert_eq!(line, "alpha\nbeta");
+        assert!(!acts.iter().any(|a| matches!(a, Action::Submit(_))));
+    }
+
+    #[test]
+    fn typed_enter_still_submits_and_stray_end_marker_is_noise() {
+        // A chunk whose only newline is terminal is a human pressing Enter.
+        let mut p = KeyParser::new();
+        let mut b = LineBuf::new();
+        let mut acts = Vec::new();
+        for k in p.decode(b"ls -la\r") {
+            acts.push(b.apply(k));
+        }
+        assert_eq!(acts.last(), Some(&Action::Submit("ls -la".to_string())));
+        // An orphan `ESC [201~` in ground state decodes to nothing at all.
+        assert!(p.decode(b"\x1b[201~").is_empty());
+    }
+
+    #[test]
+    fn paste_display_keeps_the_block_on_one_row() {
+        let mut p = KeyParser::new();
+        let mut b = LineBuf::new();
+        for k in p.decode(b"\x1b[200~a\nb\x1b[201~") {
+            b.apply(k);
+        }
+        // Painted single-row — the painters flatten on the way out…
+        assert_eq!(crate::terminal::flatten_rows(&b.as_string(), true), "a⏎b");
+        // …but submitted with the real newlines intact.
+        assert_eq!(b.as_string(), "a\nb");
     }
 
     // ---- history recall (GH: Up was inert while aish was busy) ----

@@ -252,14 +252,33 @@ fn cbreak_from(cooked: &libc::termios) -> libc::termios {
     raw
 }
 
+/// Turn the terminal's bracketed-paste reporting on/off (DECSET/DECRST 2004).
+///
+/// With it ON the terminal wraps a paste in `ESC [200~` … `ESC [201~`, which is
+/// the ONLY way to tell a pasted newline (text) from a typed Enter (submit).
+/// The mid-turn reader needs that distinction: without it a multi-line paste
+/// arrives as N bare `\n`s and each line gets queued as its own command. We
+/// enable it alongside cbreak and drop it when handing cooked mode back (a
+/// TTY-hand-off child, or teardown) so no child inherits the marker stream.
+/// rustyline re-enables it for the at-the-prompt editor on its own.
+fn set_bracketed_paste(on: bool) {
+    use std::io::Write as _;
+    let seq: &[u8] = if on { b"\x1b[?2004h" } else { b"\x1b[?2004l" };
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq);
+    let _ = out.flush();
+}
+
 fn apply_cbreak() {
     if let Some(c) = *gate().cooked.lock().unwrap() {
         set_termios(&cbreak_from(&c));
+        set_bracketed_paste(true);
     }
 }
 
 fn apply_cooked() {
     if let Some(c) = *gate().cooked.lock().unwrap() {
+        set_bracketed_paste(false);
         set_termios(&c);
     }
 }
@@ -401,6 +420,9 @@ fn reader_loop(
                         // hand this text back to the next prompt instead of
                         // dropping it with the reader thread.
                         publish_partial(&cfg.partial, &text);
+                        // Paint the live text; the painters flatten any pasted
+                        // newlines to `⏎` so the whole block stays on the single
+                        // mid-turn row instead of scrolling the footer away.
                         paint_midturn(cfg, &text);
                     }
                     Action::Submit(line) => {

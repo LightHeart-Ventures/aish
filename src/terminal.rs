@@ -714,7 +714,15 @@ pub fn set_midturn_input(styled_prompt: &str, text: &str) {
         // Always surface at least the bare prompt affordance during a turn; append
         // the live line as the operator types. `clear_midturn_input` (turn
         // teardown) is what restores the cached status message.
-        *slot = Some(format!("{styled_prompt}{text}"));
+        //
+        // A multi-line paste lands here with real newlines in `text`; the footer
+        // slot is single-row by contract, so collapse them to visible `⏎`
+        // markers (see [`flatten_rows`]) instead of blowing up the row
+        // accounting.
+        *slot = Some(format!(
+            "{styled_prompt}{}",
+            flatten_rows(text, utf8_locale())
+        ));
     }
     paint_cached_footer(false);
 }
@@ -733,6 +741,34 @@ pub fn clear_midturn_input() {
     paint_cached_footer(false);
 }
 
+/// Collapse embedded newlines so a multi-line value can be painted on ONE row.
+///
+/// A bracketed paste can carry real `\n`s (and `\r`s) into the mid-turn input
+/// buffer. Every mid-turn painter is single-row by contract — the footer slot,
+/// the inline affordance, and the `⏳ queued →` receipt all assume exactly one
+/// line and clip to `cols` — so a raw newline would break the row accounting
+/// (and scroll the body an extra time per line). We render each break as a
+/// visible `⏎` (a space on a non-UTF-8 locale) and squash `\r\n` to a single
+/// marker. Pure function: unit-tested without a tty.
+pub fn flatten_rows(text: &str, utf8: bool) -> String {
+    let marker = if utf8 { "⏎" } else { " " };
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next(); // CRLF counts as ONE break
+                }
+                out.push_str(marker);
+            }
+            '\n' => out.push_str(marker),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Build the escape sequence that renders the mid-turn prompt affordance
 /// INLINE, for terminals with no pinned footer message row (height <
 /// [`MIN_FOOTER_ROWS`], or a non-footer tty). Returns
@@ -740,7 +776,12 @@ pub fn clear_midturn_input() {
 /// whole line, then paint the (already colour-styled) bare prompt sigil plus any
 /// typed text. Pure builder so it can be unit-tested without a real terminal.
 pub fn midturn_inline_seq(styled_prompt: &str, text: &str) -> String {
-    format!("\r\x1b[2K{styled_prompt}{text}")
+    // Single-row by contract: a pasted block's newlines become visible `⏎`
+    // markers so the affordance never scrolls the body (see [`flatten_rows`]).
+    format!(
+        "\r\x1b[2K{styled_prompt}{}",
+        flatten_rows(text, utf8_locale())
+    )
 }
 
 /// Paint the mid-turn prompt affordance INLINE on the current cursor row (for
@@ -792,6 +833,10 @@ pub fn midturn_queued_seq(
 ) -> String {
     let sigil = if utf8 { "⏳" } else { "[q]" };
     let arrow = if utf8 { "→" } else { "->" };
+    // A pasted block carries real newlines; they must NOT reach the row or the
+    // single-line receipt becomes N rows (and the trailing `\r\n` scrolls the
+    // body more than once). Show them as a visible pilcrow-ish marker instead.
+    let text = &flatten_rows(text, utf8);
     let pos = if position > 1 {
         format!(" #{position}")
     } else {
@@ -842,6 +887,7 @@ pub fn print_midturn_queued(text: &str, position: usize) {
 pub fn midturn_now_seq(text: &str, cols: u16, utf8: bool, color_on: bool) -> String {
     let sigil = if utf8 { "⚡" } else { "[!]" };
     let arrow = if utf8 { "→" } else { "->" };
+    let text = &flatten_rows(text, utf8);
     let body = if color_on {
         format!("\x1b[2m{sigil} ran {arrow}\x1b[0m {text}")
     } else {
@@ -4724,5 +4770,36 @@ mod tests {
         }
         // One past the plan must never be addressed.
         assert!(seq.contains(&format!("\x1b[{};1H\x1b[2K", top - 1)));
+    }
+
+    #[test]
+    fn flatten_rows_collapses_pasted_newlines_to_one_row() {
+        // A bracketed paste carries real newlines into the mid-turn buffer;
+        // every mid-turn painter is single-row by contract, so they must become
+        // a visible marker rather than extra rows.
+        assert_eq!(flatten_rows("a\nb", true), "a⏎b");
+        // CRLF is ONE break, not two.
+        assert_eq!(flatten_rows("a\r\nb", true), "a⏎b");
+        // Bare CR counts too (old-Mac clipboards, some editors).
+        assert_eq!(flatten_rows("a\rb", true), "a⏎b");
+        // Non-UTF-8 locales get a space instead of a multibyte glyph.
+        assert_eq!(flatten_rows("a\nb", false), "a b");
+        // Newline-free text is passed through untouched.
+        assert_eq!(flatten_rows("ls -la", true), "ls -la");
+    }
+
+    #[test]
+    fn midturn_receipts_never_emit_a_pasted_newline() {
+        // The `⏳ queued →` / `⚡ ran →` receipts print with a trailing CRLF; an
+        // embedded newline would scroll the body once per pasted line.
+        let q = midturn_queued_seq("one\ntwo", 1, 80, true, false);
+        assert!(
+            !q.trim_end().contains('\n'),
+            "queued receipt stayed one row"
+        );
+        assert!(q.contains("one⏎two"));
+        let n = midturn_now_seq("one\ntwo", 80, true, false);
+        assert!(!n.trim_end().contains('\n'), "ran receipt stayed one row");
+        assert!(n.contains("one⏎two"));
     }
 }
