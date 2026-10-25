@@ -2596,6 +2596,10 @@ fn refresh_escalation_status(session: &Session) {
     refresh_escalation_status_from(&session.worker_jobs, session.coordinator_store.as_ref());
 }
 
+/// One pinned worker's live reading, lifted out from under the `jobs` lock:
+/// `(visible_id, status, run_id, last_transcript_line, thread_run_ids)`.
+type WorkerSnapshot = (String, String, String, Option<String>, Vec<String>);
+
 /// The `Session`-free body of [`refresh_escalation_status`], taking only the two
 /// shared handles it actually needs.
 ///
@@ -2613,7 +2617,7 @@ fn refresh_escalation_status_from(
     if ids.is_empty() {
         return;
     }
-    let snapshot: Vec<(String, String, String, Option<String>)> = jobs
+    let snapshot: Vec<WorkerSnapshot> = jobs
         .lock()
         .unwrap()
         .iter()
@@ -2624,6 +2628,7 @@ fn refresh_escalation_status_from(
                 w.status(),
                 w.run_id(),
                 w.transcript_rows().last().map(|(_, text)| text.clone()),
+                w.thread_run_ids(),
             )
         })
         .collect();
@@ -2632,9 +2637,18 @@ fn refresh_escalation_status_from(
     // the wrong key.
     let threads: Vec<(String, String)> = snapshot
         .iter()
-        .map(|(id, _, run_id, _)| (id.clone(), run_id.clone()))
+        .map(|(id, _, run_id, _, _)| (id.clone(), run_id.clone()))
         .collect();
-    for (id, status, run_id, last) in snapshot {
+    // EVERY coordinator `run_id` each pinned worker has ever run under, keyed by
+    // its visible id. A child stamps the `parent_run_id` of the THREAD that
+    // dispatched it, which after an in-place resume is neither the visible id nor
+    // necessarily the newest thread — so the fan-out walk needs the full set as
+    // aliases. See [`refresh_escalation_subworkers`].
+    let aliases: Vec<(String, Vec<String>)> = snapshot
+        .iter()
+        .map(|(id, _, _, _, threads)| (id.clone(), threads.clone()))
+        .collect();
+    for (id, status, run_id, last, _) in snapshot {
         // Prefer the lightweight ACTIVITY SUMMARY (see `crate::activity_summary`):
         // one model-written status-line-sized sentence saying what the worker is
         // doing, budgeted to this terminal's width. The raw last transcript line
@@ -2669,7 +2683,7 @@ fn refresh_escalation_status_from(
     }
     // FAN-OUT: a pinned coordinator's own children run in their own processes,
     // so they are nowhere in `jobs` — they come from the durable table instead.
-    refresh_escalation_subworkers(store);
+    refresh_escalation_subworkers(store, &aliases);
     // Re-read the ids: the pass above may have pinned fresh sub-worker rows, and
     // each needs its heart fed in the SAME pass or it paints hollow ("no
     // liveness claim") until the next poll window opens.
@@ -2712,6 +2726,49 @@ fn beat_targets(pinned: &[String], threads: &[(String, String)]) -> Vec<(String,
         .collect()
 }
 
+/// Map every coordinator thread `run_id` back to the VISIBLE worker id it paints
+/// under: `thread_run_id -> visible_id`.
+///
+/// One visible worker can own several durable threads. An in-place resume
+/// ([`crate::worker::resume_in_place`]) mints a FRESH coordinator `run_id` for
+/// the new thread but deliberately re-pins under the same visible id, so a child
+/// dispatched after a resume stamps `parent_run_id` with a thread id that appears
+/// nowhere in the tray. This table is what lets the sub-worker walk recognise
+/// that parent anyway. Identity entries are dropped — an un-resumed worker's
+/// thread id already equals its visible id, so mapping it buys nothing.
+fn thread_aliases(aliases: &[(String, Vec<String>)]) -> std::collections::HashMap<&str, &str> {
+    aliases
+        .iter()
+        .flat_map(|(id, threads)| {
+            threads
+                .iter()
+                .map(move |t| (t.as_str(), id.as_str()))
+                .filter(|(t, id)| t != id)
+        })
+        .collect()
+}
+
+/// Seed the reachability walk with every id a pinned row answers to: the visible
+/// ids themselves PLUS each of their thread aliases.
+///
+/// The walk tests `shown.contains(parent_run_id)`, and a child dispatched by a
+/// resumed worker carries the thread id — not the visible one. Without the alias
+/// entries that child is unreachable and silently never pins, which is exactly
+/// the missing-sub-worker bug.
+fn reachable_seed<'a>(
+    pinned: &'a [String],
+    alias_to_visible: &std::collections::HashMap<&'a str, &'a str>,
+) -> std::collections::HashSet<&'a str> {
+    let mut shown: std::collections::HashSet<&str> = pinned.iter().map(String::as_str).collect();
+    shown.extend(
+        alias_to_visible
+            .iter()
+            .filter(|(_, visible)| pinned.iter().any(|p| p == *visible))
+            .map(|(thread, _)| *thread),
+    );
+    shown
+}
+
 /// Discover and refresh the tray's SUB-WORKER rows: coordinators spawned BY a
 /// pinned coordinator.
 ///
@@ -2735,7 +2792,10 @@ fn beat_targets(pinned: &[String], threads: &[(String, String)]) -> Vec<(String,
 /// the very next poll — an immortal row that outlives the work. A child ALREADY
 /// pinned keeps getting refreshed either way, so one that finishes while on
 /// screen still shows its verdict and then retires for good.
-fn refresh_escalation_subworkers(store: Option<&crate::db::CoordinatorStore>) {
+fn refresh_escalation_subworkers(
+    store: Option<&crate::db::CoordinatorStore>,
+    aliases: &[(String, Vec<String>)],
+) {
     const SUB_POLL: std::time::Duration = std::time::Duration::from_secs(2);
     /// How stale a non-terminal row may be and still count as live work. A
     /// coordinator killed mid-run leaves `phase = "running"` behind forever;
@@ -2769,7 +2829,16 @@ fn refresh_escalation_subworkers(store: Option<&crate::db::CoordinatorStore>) {
     // is skipped WITHOUT being marked shown, so its own children can't pin
     // either — a grandchild whose parent is absent from the tray would otherwise
     // render as a bogus root.
-    let mut shown: std::collections::HashSet<&str> = pinned.iter().map(String::as_str).collect();
+    // A child stamps `parent_run_id` with the coordinator `run_id` of the THREAD
+    // that dispatched it. For a worker that never resumed that equals its visible
+    // id, but an in-place resume ([`crate::worker::resume_in_place`]) mints a
+    // fresh `run_id` per thread while keeping ONE visible id — so a child
+    // dispatched after a resume carried a parent nothing in the tray matched, and
+    // silently never pinned (the reported bug: a dispatched sub-worker missing
+    // from the escalation tray). Map every thread `run_id` back to its visible id
+    // and treat them as aliases for both the reachability walk and the pin.
+    let alias_to_visible = thread_aliases(aliases);
+    let mut shown = reachable_seed(&pinned, &alias_to_visible);
     let mut subs: Vec<&crate::coordinator_store::CoordinatorRow> = Vec::new();
     for _ in 0..MAX_PASSES {
         let mut added = false;
@@ -2800,6 +2869,10 @@ fn refresh_escalation_subworkers(store: Option<&crate::db::CoordinatorStore>) {
         let Some(parent) = r.parent_run_id.as_deref() else {
             continue;
         };
+        // Resolve a thread `run_id` back to the parent's VISIBLE id — the key the
+        // tray files rows under. Unmapped parents (sub-workers, un-resumed
+        // workers) are already their own visible id and pass through unchanged.
+        let parent = alias_to_visible.get(parent).copied().unwrap_or(parent);
         let label = [r.title.as_deref(), r.activity_summary.as_deref()]
             .into_iter()
             .flatten()
@@ -13038,6 +13111,57 @@ mod tests {
         for (i, id) in pinned.iter().enumerate() {
             assert_eq!(&targets[i].0, id, "order and coverage must be preserved");
         }
+    }
+
+    // ---- tray sub-workers resolve a resumed parent's thread ids -----------
+
+    #[test]
+    fn thread_aliases_maps_resumed_threads_back_to_the_visible_id() {
+        // `w_477N4jf1` resumed twice, so its durable threads are the visible id
+        // plus two minted run_ids. A child stamps `parent_run_id` with whichever
+        // thread dispatched it, so every non-identity thread must resolve back.
+        let aliases = vec![(
+            s("w_477N4jf1"),
+            vec![s("w_477N4jf1"), s("w_thread2"), s("w_thread3")],
+        )];
+        let map = thread_aliases(&aliases);
+        assert_eq!(map.get("w_thread2"), Some(&"w_477N4jf1"));
+        assert_eq!(map.get("w_thread3"), Some(&"w_477N4jf1"));
+        assert_eq!(
+            map.get("w_477N4jf1"),
+            None,
+            "the identity entry is noise — the visible id already matches itself"
+        );
+    }
+
+    #[test]
+    fn reachable_seed_accepts_a_child_dispatched_by_a_resumed_thread() {
+        // The reported bug: w_jC1YnkYi was dispatched by w_477N4jf1's SECOND
+        // thread, so its parent_run_id matched nothing in the tray and the row
+        // silently never pinned. The seed must accept the thread id too.
+        let pinned = [s("w_477N4jf1")];
+        let aliases = vec![(s("w_477N4jf1"), vec![s("w_477N4jf1"), s("w_thread2")])];
+        let seed = reachable_seed(&pinned, &thread_aliases(&aliases));
+        assert!(seed.contains("w_477N4jf1"), "visible id stays reachable");
+        assert!(
+            seed.contains("w_thread2"),
+            "a child carrying the resumed thread's run_id must be reachable"
+        );
+    }
+
+    #[test]
+    fn reachable_seed_ignores_threads_of_unpinned_workers() {
+        // Aliases are collected for every live worker, pinned or not. Seeding an
+        // unpinned worker's threads would pin its children as bogus roots.
+        let pinned = [s("w_pinned")];
+        let aliases = vec![
+            (s("w_pinned"), vec![s("w_pinned"), s("w_pin_t2")]),
+            (s("w_other"), vec![s("w_other"), s("w_other_t2")]),
+        ];
+        let seed = reachable_seed(&pinned, &thread_aliases(&aliases));
+        assert!(seed.contains("w_pin_t2"));
+        assert!(!seed.contains("w_other_t2"));
+        assert!(!seed.contains("w_other"));
     }
 
     // ---- confirm prompt: only the advertised keys count --------------------
