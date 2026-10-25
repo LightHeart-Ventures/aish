@@ -2973,6 +2973,51 @@ fn refresh_escalation_subworkers(
             crate::escalation::note_terminal(&r.run_id, r.phase == "failed" || r.error.is_some());
         }
     }
+
+    // ── Second pass: SUB-WORK LEDGER rows.
+    //
+    // Distinct mechanism from the walk above, and the reason this function needs
+    // two passes at all: a sub-WORKER is another coordinator process with its own
+    // `coordinator_runs` row, while a sub-WORK item is work the SAME worker does
+    // itself (`crate::subwork`, whose decomposition prompt explicitly tells the
+    // worker NOT to dispatch children for items). So the parentage walk can never
+    // discover ledger work — there is no child row to find. Its only durable
+    // evidence is the `subwork` JSON column the coordinator stamps onto its OWN
+    // row, which we translate into tray rows here.
+    //
+    // Read by THREAD id, filed by VISIBLE id: an in-place resume mints a fresh
+    // `run_id`, so the newest thread holds the current ledger while the tray
+    // keys rows under the id the operator sees. Threads are oldest-first, so we
+    // scan in reverse and take the first that has a ledger at all.
+    //
+    // An empty/absent column parses to zero items, and `sync_subwork` with zero
+    // items unpins any stale `sw:` rows for that parent — so "no ledger" is
+    // self-healing and leaves the sub-worker rows above untouched.
+    for id in &pinned {
+        let mut threads: Vec<&str> = vec![id.as_str()];
+        if let Some((_, t)) = aliases.iter().find(|(visible, _)| visible == id) {
+            threads.extend(
+                t.iter()
+                    .map(String::as_str)
+                    .filter(|thread| *thread != id.as_str()),
+            );
+        }
+        let json = threads
+            .iter()
+            .rev()
+            .find_map(|thread| store.subwork(thread))
+            .unwrap_or_default();
+        let rows: Vec<crate::escalation::SubWorkRow> = crate::subwork::parse_json(&json)
+            .into_iter()
+            .map(|i| crate::escalation::SubWorkRow {
+                id: i.id,
+                label: i.intent,
+                status: i.status.as_str().to_string(),
+                note: i.note,
+            })
+            .collect();
+        crate::escalation::sync_subwork(id, &rows);
+    }
 }
 
 /// Is this durable row a sub-worker worth PINNING — i.e. work that is plausibly

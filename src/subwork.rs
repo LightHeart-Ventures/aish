@@ -549,6 +549,38 @@ mod tests {
         SubWorkLedger::new(PARENT)
     }
 
+    /// The durable column is the ONLY path the ledger takes out of the
+    /// coordinator subprocess, so the wire format has to survive a round trip
+    /// without losing a field: a reader that silently dropped one would paint
+    /// rows with an empty label or a lost status. Unparseable input must
+    /// collapse to "no ledger" rather than erroring — the column is NULL on
+    /// every run written by a build that predates it.
+    #[test]
+    fn ledger_json_round_trips_and_degrades_quietly() {
+        let mut l = ledger();
+        l.ingest("SUBWORK PLAN: parse-cap | enforce the 5-item cap");
+        l.ingest("SUBWORK PLAN: wire-tray | wire the tray rows");
+        l.ingest("- **SUBWORK DONE:** `parse-cap` — cap enforced");
+
+        let json = l.to_json();
+        let items = parse_json(&json);
+        assert_eq!(
+            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["parse-cap", "wire-tray"],
+            "plan order is preserved across the wire"
+        );
+        assert_eq!(
+            serde_json::to_string(&items).unwrap(),
+            json,
+            "parse → serialize is byte-stable, so no field is being dropped"
+        );
+
+        // NULL column, truncated write, or a payload from a future format.
+        assert!(parse_json("").is_empty());
+        assert!(parse_json("[{\"id\":").is_empty());
+        assert!(parse_json("null").is_empty());
+    }
+
     #[test]
     fn parses_plan_and_status_markers() {
         let d = parse_directive("SUBWORK PLAN: parse-cap | enforce the 5-item cap").unwrap();
