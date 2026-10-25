@@ -1493,7 +1493,9 @@ run_program chains. Filter/aggregate yourself.\n\
 - Interactive stuff (vim, top, ssh): ALWAYS use run_interactive for TTY handoff. run_program for \
 the output you need. Never run_interactive for watchers/monitors — it freezes the prompt.\n\
 - Background/long-running (watchers, tails, servers): run_program with background:true → job id; \
-output streams to the user and you read it later via job_output. User handles :jobs/:kill.\n\
+output streams to the user and you read it later via job_output. User handles :jobs/:kill. \
+`:jobs` lists ONLY these shell jobs — it is NOT the worker list, so never point the user at \
+`:jobs` for a background coordinator/worker: use background_status (or tell them `:workers`).\n\
 - Your turn ENDS when you reply — nothing of yours runs between turns except background jobs, and \
 you never receive pushed events; never claim to be 'listening' or 'waiting' after replying.\n\
 - Secrets: ONLY credential refs like ${{profile:KEY}} or ${{ENV}}. Never read_file creds.\n\
