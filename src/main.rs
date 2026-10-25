@@ -61,6 +61,7 @@ mod plugin_timers;
 mod plugins;
 mod present;
 mod pulse;
+mod question;
 mod rc;
 mod reasoning_telemetry;
 mod redact;
