@@ -952,7 +952,6 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "type",
     "md5sum",
     "sha256sum",
-    "diff",
 ];
 
 const GIT_READ_ONLY: &[&str] = &[
@@ -1065,6 +1064,14 @@ const ALWAYS_CONFIRM_PROGRAMS: &[&str] = &[
     "more",
     "most",
     "pg",
+    // `man` is a pager: it execs $PAGER (less by default), inheriting the
+    // `!cmd` escape, so it belongs in the pager class and not outside it.
+    "man",
+    // Recipe/script runners: `just` executes arbitrary recipes from a
+    // justfile and `cmake` executes arbitrary CMake script and build rules.
+    // Both are "run whatever this file says" drivers, same hazard as `make`.
+    "just",
+    "cmake",
     "vi",
     "vim",
     "nvim",
@@ -2160,6 +2167,59 @@ fn is_always_confirm(bin: &str, args: &[String]) -> bool {
     false
 }
 
+/// True when this `sed` invocation edits its operand files IN PLACE.
+///
+/// Plain `sed s/a/b/ f` is a read — it writes a transformed copy to stdout and
+/// leaves `f` alone. `sed -i` REWRITES the file, which is a destructive write
+/// wearing a read's name, so the two cannot share a classification. All three
+/// spellings count: GNU/BSD `-i`, `-i.bak` (suffix glued to the flag),
+/// `--in-place[=SUFFIX]`, and `i` bundled into a short cluster (`-ni`).
+///
+/// `-e`/`-f` take a VALUE, so scanning stops at them: `sed -e 's/i/x/' f`
+/// must not read the `i` inside the script as the in-place flag.
+fn sed_edits_in_place(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if tok == "--" {
+            break; // operands only from here on
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            if long == "in-place" || long.starts_with("in-place=") {
+                return true;
+            }
+            if long == "expression" || long == "file" {
+                i += 2; // consumes the next arg as its value
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(shorts) = tok.strip_prefix('-')
+            && !shorts.is_empty()
+        {
+            let mut consumes_next = false;
+            for (idx, c) in shorts.char_indices() {
+                match c {
+                    'i' => return true,
+                    // Value-taking flags swallow the rest of this token, or
+                    // the next arg when they end it. Either way the bytes
+                    // after them are a sed SCRIPT, not flag letters.
+                    'e' | 'f' => {
+                        consumes_next = idx + c.len_utf8() == shorts.len();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            i += if consumes_next { 2 } else { 1 };
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// True when a `find` argv carries a delete-or-exec action.
 fn find_has_mutating_action(args: &[String]) -> bool {
     args.iter()
@@ -2361,6 +2421,10 @@ fn is_destructive_at(program: &str, args: &[String], depth: usize) -> bool {
     }
     if bin == "find" {
         return find_has_mutating_action(args);
+    }
+    // `sed` splits on its argv: the stdout form is a read, `-i` is a write.
+    if bin == "sed" {
+        return sed_edits_in_place(args);
     }
     // A provably read-only binary suppresses the fuzzy verb scan so a
     // verb-shaped ARGUMENT (`grep delete .`) doesn't prompt.
@@ -8634,6 +8698,118 @@ them by review age\nthen file a report";
             args: &["-n", "10", "ls"],
             normal: false,
             careful: false,
+        },
+        // ── TASK-939 / SEC-1.2: the four list members the AC named but that
+        // never landed. Each of these ran UNPROMPTED in Normal (default) mode
+        // before this row existed, which is why they are permanent rows and
+        // not one-off asserts.
+        GateCase {
+            name: "sed -i rewrites the file in place",
+            program: "sed",
+            args: &["-i", "s/a/b/", "f"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "sed --in-place rewrites the file in place",
+            program: "sed",
+            args: &["--in-place", "s/a/b/", "f"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "sed -i.bak (suffix glued to the flag)",
+            program: "sed",
+            args: &["-i.bak", "s/a/b/", "f"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "sed -ni (i bundled in a short cluster)",
+            program: "sed",
+            args: &["-ni", "s/a/b/p", "f"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "man is a pager (execs $PAGER, inherits !cmd)",
+            program: "man",
+            args: &["ls"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "just runs an arbitrary recipe",
+            program: "just",
+            args: &["deploy"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "just is gated by CLASS, not by a destructive verb",
+            program: "just",
+            args: &["test"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "cmake --build runs arbitrary build rules",
+            program: "cmake",
+            args: &["--build", "."],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "cmake script mode runs arbitrary CMake",
+            program: "cmake",
+            args: &["-P", "script.cmake"],
+            normal: true,
+            careful: true,
+        },
+        // `diff` is no longer on the read-only allowlist (TASK-939 AC): it is
+        // not provably read-only in the sense the allowlist promises, so
+        // Careful mode must ask about it instead of auto-allowing it. Normal
+        // mode still stays quiet -- dropping the allowlist entry re-enables
+        // the fuzzy verb scan, it does not reclassify `diff` as destructive.
+        GateCase {
+            name: "diff is off the read-only allowlist (Careful asks)",
+            program: "diff",
+            args: &["a", "b"],
+            normal: false,
+            careful: true,
+        },
+        // Positive controls for the rows above: the stdout form of `sed` is a
+        // READ and must not be swept up by the in-place detection. These rows
+        // are the false-positive half of the same change — Normal mode stays
+        // quiet; Careful still asks, because `sed` is not on the read-only
+        // allowlist and Careful asks about everything it cannot prove.
+        GateCase {
+            name: "plain sed (no -i) stays quiet in Normal",
+            program: "sed",
+            args: &["s/a/b/", "f"],
+            normal: false,
+            careful: true,
+        },
+        GateCase {
+            name: "sed -e script containing an i is not an in-place flag",
+            program: "sed",
+            args: &["-e", "s/i/x/", "f"],
+            normal: false,
+            careful: true,
+        },
+        GateCase {
+            name: "sed -n p stays quiet in Normal",
+            program: "sed",
+            args: &["-n", "p", "f"],
+            normal: false,
+            careful: true,
+        },
+        GateCase {
+            name: "sed operands after -- are not scanned for flags",
+            program: "sed",
+            args: &["s/a/b/", "--", "-i"],
+            normal: false,
+            careful: true,
         },
         // ── reads must stay unprompted (no false-positive regression) ──
         GateCase {
