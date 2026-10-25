@@ -549,7 +549,8 @@ fn pad(s: &str, width: usize) -> String {
 
 /// Draw the modal as a bottom-anchored "tray". When a footer scroll region is
 /// live the tray's BOTTOM line is pinned to the last scrolling body row
-/// (`rows - FOOTER_ROWS`) — directly above the footer's horizontal rule — using
+/// (`rows - FOOTER_ROWS - GAP_ROWS`) — one blank breathing row above the
+/// footer's horizontal rule — using
 /// absolute cursor addressing wrapped in DECSC/DECRC so the operator's prompt
 /// cursor is left untouched. `prev_lines` is the row count painted by the
 /// previous call, used to erase stale rows when the tray shrinks. Without a
