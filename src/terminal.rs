@@ -2413,6 +2413,107 @@ fn anchor_bottom_after_wipe() {
     }
 }
 
+/// Begin a *synchronized output* frame — DEC private mode 2026 (`ESC[?2026h`),
+/// the de-facto "Begin Synchronized Update" (BSU) escape supported by iTerm2,
+/// WezTerm, Kitty, Alacritty, Ghostty, foot, Windows Terminal, and tmux ≥ 3.4.
+///
+/// Between BSU and [`END_SYNC_UPDATE`] the terminal buffers everything it
+/// receives and presents it as ONE atomic frame. That is what kills the
+/// Shift-Tab flash: a worker cycle wipes the screen (`ESC[2J`), repaints the
+/// footer, re-anchors the cursor, then streams a header + a whole backfilled
+/// tail — several dozen writes/flushes. Un-synchronized, the compositor samples
+/// the terminal mid-sequence and the operator SEES the blank screen before the
+/// repaint lands. Wrapped, the blank intermediate state is never presented.
+///
+/// Terminals that don't implement 2026 ignore the unknown private mode (xterm
+/// semantics), so the sequence is safe to emit unconditionally — no probing, no
+/// capability database, no behavioural difference beyond the flicker we're
+/// removing.
+pub const BEGIN_SYNC_UPDATE: &str = "\x1b[?2026h";
+
+/// End a synchronized output frame — DEC private mode 2026 reset (`ESC[?2026l`),
+/// "End Synchronized Update" (ESU). Presents everything buffered since
+/// [`BEGIN_SYNC_UPDATE`] as a single frame. Terminals also auto-release the hold
+/// on a timeout (~150 ms–1 s depending on implementation), so a crash between
+/// the two can never freeze a terminal permanently — but we still pair them with
+/// an RAII guard ([`sync_update`]) and the panic hook so the release is prompt.
+pub const END_SYNC_UPDATE: &str = "\x1b[?2026l";
+
+/// Nesting depth of active synchronized-output frames. Only the OUTERMOST
+/// begin/end pair reaches the terminal: nested frames (a worker-cycle repaint
+/// that itself calls a footer repaint that itself clears the screen) must not
+/// emit an inner `ESC[?2026l`, which would present the half-built frame and
+/// reintroduce exactly the flash we're suppressing.
+static SYNC_DEPTH: AtomicU16 = AtomicU16::new(0);
+
+/// RAII guard holding a synchronized-output frame open. Created by
+/// [`sync_update`]; the frame is presented when the guard drops — including on
+/// unwind, so a panic mid-repaint still releases the terminal.
+#[must_use = "the synchronized frame ends when the guard drops; bind it to a name"]
+pub struct SyncUpdate {
+    /// Whether THIS guard owns the outermost frame (and so must emit the ESU on
+    /// drop). `false` for nested guards and for non-tty / disabled cases.
+    outermost: bool,
+}
+
+impl Drop for SyncUpdate {
+    fn drop(&mut self) {
+        // Saturating, not `fetch_sub`: the panic hook force-releases the frame
+        // by zeroing the depth, and the guards then unwind through this Drop. A
+        // bare decrement would wrap u16 and leave `sync_update_active()` stuck
+        // true for the rest of the process.
+        let mut cur = SYNC_DEPTH.load(Ordering::SeqCst);
+        while cur > 0 {
+            match SYNC_DEPTH.compare_exchange_weak(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        if self.outermost {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "{END_SYNC_UPDATE}");
+            let _ = out.flush();
+        }
+    }
+}
+
+/// Open a synchronized-output frame for the duration of the returned guard, so
+/// every write until it drops is presented as ONE atomic terminal frame.
+///
+/// Use it to wrap any multi-write screen transition — the Shift-Tab worker
+/// cycle, `:attach` / detach, a resize repaint — where the intermediate states
+/// (cleared screen, footer-without-body, half-streamed backfill) are visual
+/// noise the operator should never see.
+///
+/// Re-entrant: nested calls increment a depth counter and only the outermost
+/// guard emits the begin/end pair. No-op off a tty (nothing to synchronize) and
+/// when `AISH_NO_SYNC_UPDATE` is set, which is the escape hatch for a terminal
+/// that mis-handles DEC 2026.
+pub fn sync_update() -> SyncUpdate {
+    // SAFETY: plain isatty query.
+    let tty = unsafe { libc::isatty(1) } == 1;
+    if !tty || std::env::var_os("AISH_NO_SYNC_UPDATE").is_some() {
+        // Still take a depth slot so Drop's bookkeeping stays balanced.
+        SYNC_DEPTH.fetch_add(1, Ordering::SeqCst);
+        return SyncUpdate { outermost: false };
+    }
+    let outermost = SYNC_DEPTH.fetch_add(1, Ordering::SeqCst) == 0;
+    if outermost {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "{BEGIN_SYNC_UPDATE}");
+        let _ = out.flush();
+    }
+    SyncUpdate { outermost }
+}
+
+/// Whether a synchronized-output frame is currently open. Lets a paint path
+/// skip an intermediate `flush()` it only performs to avoid visible tearing —
+/// inside a sync frame the terminal is holding presentation anyway.
+pub fn sync_update_active() -> bool {
+    SYNC_DEPTH.load(Ordering::Relaxed) > 0
+}
+
 /// Clear the visible screen and home the cursor (`ESC[2J ESC[H`), then flush.
 /// The viewport is wiped so the next attach/detach view redraws on a clean
 /// screen, while the terminal's native scrollback is preserved — that would
@@ -2426,7 +2527,15 @@ fn clear_screen_wipe() {
     }
     let mut out = std::io::stdout();
     let _ = write!(out, "\x1b[2J\x1b[H");
-    let _ = out.flush();
+    // The flush here exists only so the wipe isn't left sitting in our buffer
+    // while a caller does slow work before the repaint. Inside a synchronized
+    // frame the terminal is already withholding presentation and the guard
+    // flushes on drop, so skip it — flushing a bare `ESC[2J` mid-frame is the
+    // write that used to be sampled as a blank screen on terminals that ignore
+    // DEC 2026 nesting.
+    if !sync_update_active() {
+        let _ = out.flush();
+    }
 }
 
 /// Open a worker attach view on the PRIMARY screen buffer.
@@ -2669,6 +2778,14 @@ pub fn install_panic_hook() {
         // buffer to pop), so a crash mid-attach already lands on real
         // scrollback — just clear the flag.
         ATTACH_ACTIVE.store(false, Ordering::Relaxed);
+        // Release any held synchronized-output frame FIRST, so the panic
+        // message itself is presented instead of being swallowed by a terminal
+        // still buffering a frame it will only auto-release on timeout.
+        if SYNC_DEPTH.swap(0, Ordering::SeqCst) > 0 {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "{END_SYNC_UPDATE}");
+            let _ = out.flush();
+        }
         if ACTIVE.load(Ordering::Relaxed) {
             let mut out = std::io::stdout();
             let _ = write!(out, "{}{RESET_REGION}\r\n", restore_alt_scroll_seq());
@@ -2723,6 +2840,36 @@ mod tests {
     /// footer-global test locks this first. Poison-tolerant: a panic while held
     /// must not cascade-fail the siblings.
     static FOOTER_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The synchronized-output frame guard must be re-entrant and leak-free: a
+    /// nested frame keeps the hold open (so an inner repaint can't present a
+    /// half-built screen), and the depth returns to zero once every guard has
+    /// dropped. A stuck depth would make `sync_update_active()` permanently true
+    /// and suppress real flushes for the rest of the process.
+    #[test]
+    fn sync_update_frames_nest_and_fully_release() {
+        let _g = FOOTER_STATE_TEST_LOCK.lock();
+        assert!(
+            !sync_update_active(),
+            "a frame leaked from an earlier test: depth should start at 0"
+        );
+        {
+            let _outer = sync_update();
+            assert!(sync_update_active(), "outer guard must hold the frame open");
+            {
+                let _inner = sync_update();
+                assert!(sync_update_active(), "nested guard keeps the frame open");
+            }
+            assert!(
+                sync_update_active(),
+                "dropping the INNER guard must not present the frame"
+            );
+        }
+        assert!(
+            !sync_update_active(),
+            "dropping the outermost guard must release the frame"
+        );
+    }
 
     #[test]
     fn labeled_rule_welds_name_into_the_rule_near_the_right_edge() {
