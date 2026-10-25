@@ -333,6 +333,14 @@ enum Kind {
     /// rides the parent's durable `subwork` column — so the row is static, has
     /// no heartbeat, and is never a Shift-Tab target.
     SubWork,
+    /// An ARMED `:alert` monitor (`crate::alert`). Like the two above it there
+    /// is no process to attach to — the monitor is a predicate the session
+    /// re-checks — but unlike them it is a ROOT: an alarm is something the
+    /// operator is waiting on in its own right, not a slice of someone else's
+    /// work. The row exists to answer the three questions a rule badge could
+    /// not: WHAT is being watched (top line), HOW LONG it has been watching
+    /// (the runtime cell), and WHEN it last looked (the status cell).
+    Alert,
 }
 
 /// One pinned escalation. Many can be live at once — see the STACKING note in
@@ -677,6 +685,110 @@ pub fn sync_subwork(parent: &str, items: &[SubWorkRow]) {
             format!("{} · {}", item.status, item.note)
         };
         pin_subwork(parent, &item.id, &item.label, &status);
+    }
+}
+
+/// One armed `:alert` monitor, as the tray wants it.
+pub struct AlertRow {
+    /// The monitor's durable id (`alerts.id`), stringified — stable across
+    /// polls, which is what keeps a row's clock from restarting.
+    pub id: String,
+    /// What the monitor is watching, in the operator's own words.
+    pub summary: String,
+    /// `state · detail` for the status cell (see [`split_status`]).
+    pub status: String,
+}
+
+/// Row id for an armed alarm. Namespaced so an alert id can never collide with
+/// a coordinator run id (`w_…`), a queued line (`q#…`) or a ledger item (`sw:…`).
+fn alert_row_id(alert_id: &str) -> String {
+    format!("alert:{alert_id}")
+}
+
+/// Pin — or refresh in place — the tray row for one armed alarm.
+///
+/// Refresh keeps `pinned_at`, exactly like [`pin_subwork`], and here that is the
+/// whole point rather than a nicety: the runtime cell is the answer to "how long
+/// has this alarm been watching", so restarting the clock on every 2s poll would
+/// make the one number the row exists for permanently read `0s`.
+pub fn pin_alert(id: &str, summary: &str, status: &str) {
+    crate::terminal::repaint_escalation_around(|| {
+        let Ok(mut banners) = BANNERS.lock() else {
+            return;
+        };
+        let row = alert_row_id(id);
+        if let Some(slot) = banners
+            .iter_mut()
+            .find(|b| b.kind == Kind::Alert && b.id == row)
+        {
+            slot.task = summary.to_string();
+            slot.status = status.to_string();
+            return;
+        }
+        if banners.len() >= MAX_PINNED {
+            return;
+        }
+        banners.push(Banner {
+            kind: Kind::Alert,
+            id: row,
+            task: summary.to_string(),
+            // Roots, so no parent link — see the [`Kind::Alert`] note. This is
+            // also what makes [`ordered_rows`] emit the row at depth 0.
+            parent: None,
+            pinned_at: Instant::now(),
+            // Nothing executes, so there is no verdict to stamp and no heart to
+            // beat: the renderer draws the static [`IDLE_PREFIX`] instead, and
+            // a `terminal_at` of `None` keeps the row outside both halves of
+            // the dwell policy ([`sweep`], [`evict_for_tray_pressure`]) for as
+            // long as the monitor stays armed.
+            terminal_at: None,
+            failed: false,
+            status: status.to_string(),
+            beat: None,
+        });
+    });
+}
+
+/// Retire one alarm's row — the monitor fired, was cancelled, or expired.
+pub fn retire_alert(id: &str) {
+    let row = alert_row_id(id);
+    crate::terminal::repaint_escalation_around(|| {
+        if let Ok(mut banners) = BANNERS.lock() {
+            banners.retain(|b| !(b.kind == Kind::Alert && b.id == row));
+        }
+    });
+}
+
+/// Reconcile EVERY alarm row against the currently-armed set in one pass:
+/// pin/refresh what is armed, drop the rows whose monitor is gone.
+///
+/// The drop half is why this exists rather than a loop of [`pin_alert`]: an
+/// alarm leaves the armed set silently (it fired, or `:alert cancel`), and
+/// nothing else would ever remove its row — a tray that keeps claiming to watch
+/// something it no longer watches is worse than no row at all. An empty `items`
+/// is therefore a meaningful input, not a no-op: it clears the alarm rows and
+/// touches nothing else.
+pub fn sync_alerts(items: &[AlertRow]) {
+    let stale: Vec<String> = {
+        let Ok(banners) = BANNERS.lock() else {
+            return;
+        };
+        banners
+            .iter()
+            .filter(|b| b.kind == Kind::Alert)
+            .filter(|b| !items.iter().any(|it| b.id == alert_row_id(&it.id)))
+            .map(|b| b.id.clone())
+            .collect()
+    };
+    // Retirement goes through [`retire_alert`] rather than a local retain so
+    // there is exactly ONE place that knows how an alarm row leaves the tray.
+    for row in &stale {
+        // `stale` holds row ids; strip the namespace back off so the single
+        // retirement path keeps taking the caller-facing alert id.
+        retire_alert(row.strip_prefix("alert:").unwrap_or(row));
+    }
+    for item in items {
+        pin_alert(&item.id, &item.summary, &item.status);
     }
 }
 
@@ -1554,6 +1666,51 @@ pub fn render_subwork(
     (top, bottom)
 }
 
+/// Build ONE armed alarm's two rows. Pure, like [`render`], and STATIC like
+/// [`render_subwork`] — a monitor is a predicate the session re-evaluates, not a
+/// process, so a pulsing heart would claim an execution that isn't happening.
+///
+/// The alarm glyph leads the top row because it is the row's whole identity:
+/// this used to be a single ⏰ on the rule, and the trade the move makes is one
+/// badge's worth of width for the three facts a badge could never carry — the
+/// condition (`summary`, clipped to [`TASK_HINT_MAX`] like every other row's
+/// hint), the watch duration (`elapsed_ms`, which is why [`pin_alert`] never
+/// restarts the clock), and the last check (`status`).
+///
+/// Layout is [`render_subwork`]'s on purpose: the fixed [`BEAT_COL`] cell with
+/// the static [`IDLE_PREFIX`] where a live row draws its heart, so the runtime /
+/// state / message cells land in the same three columns as every other row in
+/// the block. Undimmed top row, though — an armed alarm is a root the operator
+/// is waiting on in its own right, not detail hanging off the row above.
+pub fn render_alert(
+    elapsed_ms: u64,
+    summary: &str,
+    status: &str,
+    color_on: bool,
+) -> (String, String) {
+    use crate::style::{Color, paint_with};
+    let (state, message) = split_status(status);
+    let hint = one_line(summary, TASK_HINT_MAX);
+    let glyph = crate::style::ALERT_GLYPH;
+    let top = if hint.is_empty() {
+        glyph.to_string()
+    } else {
+        format!("{glyph} {hint}")
+    };
+    let bottom = format!(
+        "{}{} {}",
+        paint_with("   ", Color::Dim, color_on),
+        pad_styled(&paint_with(IDLE_PREFIX, Color::Dim, color_on), BEAT_COL),
+        paint_with(
+            &status_cells(elapsed_ms, state, message),
+            Color::Dim,
+            color_on
+        )
+    );
+    (top, bottom)
+}
+
+
 /// The live banner rows, NEWEST FIRST — one `(escalation_row, status_row)` pair
 /// per painted escalation, empty when nothing is pinned. Reads the global stack
 /// and derives each animation frame from that banner's own clock, so any paint
@@ -1619,6 +1776,17 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
                     color_on,
                 );
             }
+            if b.kind == Kind::Alert {
+                // Roots, never indented: the alarm is its own concern, not a
+                // slice of the row above it (see [`Kind::Alert`]).
+                return render_alert(
+                    elapsed_ms,
+                    &b.task,
+                    &format!("{}{extra}", b.status),
+                    color_on,
+                );
+            }
+
             if b.kind == Kind::SubWork {
                 // Ledger rows are ALWAYS nested: the row describes a slice of
                 // the PARENT's work, so even an orphan (parent evicted, or

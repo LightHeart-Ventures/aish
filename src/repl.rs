@@ -2863,6 +2863,71 @@ fn reachable_seed<'a>(
 /// the very next poll — an immortal row that outlives the work. A child ALREADY
 /// pinned keeps getting refreshed either way, so one that finishes while on
 /// screen still shows its verdict and then retires for good.
+/// Reconcile the escalation tray's ALARM rows against the armed `:alert`
+/// monitors, on the footer paint path.
+///
+/// This is the replacement for the ⏰ badge the rule used to carry (see
+/// [`status_badges`]): a badge is a boolean, and the three things an operator
+/// actually wants from an armed alarm — what it watches, how long it has been
+/// watching, when it last looked — are not booleans. One row per armed monitor
+/// carries all three, with the row's own clock supplying the duration (which is
+/// why [`crate::escalation::pin_alert`] refreshes in place instead of
+/// re-pinning).
+///
+/// Throttled on the same 2s window, and for the same reason, as
+/// [`refresh_escalation_subworkers`]: the footer repaints far more often than an
+/// alarm's state can meaningfully change, and this runs on the paint path where
+/// a DB round-trip per frame would be felt. Between windows the rows keep their
+/// last values; only the runtime cell advances, which is correct — that cell is
+/// derived from the row's clock, not from the store.
+fn refresh_escalation_alerts(store: Option<&crate::db::AlertStore>) {
+    const ALERT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    let Some(store) = store else { return };
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|t| t.elapsed() < ALERT_POLL) {
+        return; // inside the throttle window — rows keep their last values
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+
+    let Ok(armed) = store.armed_alerts() else {
+        // A read failure is NOT evidence the alarms went away, so the rows are
+        // left exactly as they are rather than reconciled against an empty set.
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let rows: Vec<crate::escalation::AlertRow> = armed
+        .iter()
+        .map(|a| {
+            // `state · detail`, the shape [`crate::escalation::split_status`]
+            // peels back apart for the status row's two cells. Every armed
+            // monitor is in the same state, so the detail cell is where the row
+            // earns its keep: a native probe reports its last poll, a semantic
+            // one says so plainly (nothing polls it on a clock).
+            let detail = if !a.kind.is_native() {
+                "semantic monitor".to_string()
+            } else if a.last_checked <= 0 {
+                "awaiting first check".to_string()
+            } else {
+                let age = (now - a.last_checked).max(0);
+                format!("checked {} ago", crate::style::fmt_duration(age))
+            };
+            crate::escalation::AlertRow {
+                id: a.id.to_string(),
+                summary: a.condition.clone(),
+                status: format!("armed · {detail}"),
+            }
+        })
+        .collect();
+    crate::escalation::sync_alerts(&rows);
+}
+
+
 fn refresh_escalation_subworkers(
     store: Option<&crate::db::CoordinatorStore>,
     aliases: &[(String, Vec<String>)],
@@ -3170,12 +3235,16 @@ fn coordinator_status_message(session: &Session) -> String {
     left = recent_message_row(left, session.flash.lock().ok().and_then(|b| b.clone()));
     // Right-justify the session name (`:rename`) on this row, directly above the
     // clock on the statusline below — in bold magenta. Blank when unnamed.
-    // Append live status badges to the RIGHT of the name: ⏰ when an `:alert`
-    // monitor is armed, 🎯 when a goal is active. (No worker badge — the
-    // escalation tray above already makes live coordinators self-evident.)
-    // Badges render even when the session is UNNAMED — an armed
-    // alert (⏰) must always be visible in the statusline, not gated behind a
-    // `:rename`.
+    // Append live status badges to the RIGHT of the name: 🎯 when a goal is
+    // active. (No worker badge — the escalation tray above already makes live
+    // coordinators self-evident; no alarm badge either, see [`status_badges`].)
+    // Badges render even when the session is UNNAMED, so session state is never
+    // gated behind a `:rename`.
+    // Armed alarms now live in the tray, not on this rule — reconcile their
+    // rows here, the one paint path that holds the session (and therefore the
+    // alert store). Self-throttled, so calling it per frame is cheap.
+    refresh_escalation_alerts(session.alert_store.as_ref());
+
     let decorated = decorate_name(session.name.as_deref(), &status_badges(session));
     // The label does NOT ride this row: it is welded into the horizontal RULE
     // above it, ~2 columns from the right edge, with the rule continuing on both
@@ -3189,9 +3258,8 @@ fn coordinator_status_message(session: &Session) -> String {
 
 /// Combine the optional session name (`:rename`) with the live status-badge
 /// suffix into the right-justified SecondStatusLine label. Badges show even when
-/// the session is UNNAMED, so an armed `:alert` (⏰) or an active goal (🎯) is
-/// always visible in the statusline — not gated behind
-/// a name. Returns `None` only when there's neither a name nor any badge (so the
+/// the session is UNNAMED, so an active goal (🎯) is always visible in the
+/// statusline — not gated behind a name. Returns `None` only when there's neither a name nor any badge (so the
 /// row stays blank). Pure — unit-testable without a live `Session`.
 fn decorate_name(name: Option<&str>, badges: &str) -> Option<String> {
     let name = name.filter(|n| !n.is_empty());
@@ -3204,25 +3272,23 @@ fn decorate_name(name: Option<&str>, badges: &str) -> Option<String> {
 }
 
 /// Compose the live status-badge suffix appended to the right of the `:rename`
-/// label on the SecondStatusLine: ⏰ when at least one `:alert` monitor is armed,
-/// and 🎯 when a goal is active. Order is fixed (alert · goal); each badge is a
-/// single 2-col emoji joined by a space. Empty string when none apply.
+/// label on the SecondStatusLine: 🎯 when a goal is active. Empty string
+/// otherwise.
 ///
 /// There is deliberately NO worker (🤖) badge: live background coordinators are
 /// already self-evident from the escalation tray, which renders their rows
 /// directly above this rule. Duplicating that signal as an emoji on the rule
 /// label only added noise.
+///
+/// And no ALARM (⏰) badge either, for the same reason and then some: a badge
+/// could only say "something is armed", never WHICH monitor, how long it had
+/// been watching, or when it last checked. Armed alarms now get real tray rows
+/// ([`crate::escalation::render_alert`], fed by [`refresh_escalation_alerts`])
+/// that carry all three, so the rule keeps its one remaining badge for session
+/// state the tray has no row for. The fired-alert banner still wears
+/// [`crate::style::ALERT_GLYPH`] — that surface is unchanged.
 fn status_badges(session: &Session) -> String {
     let mut badges: Vec<&str> = Vec::new();
-    let alert_active = session
-        .alert_store
-        .as_ref()
-        .and_then(|s| s.armed_alerts().ok())
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-    if alert_active {
-        badges.push("⏰");
-    }
     if session.active_goal().is_some() {
         badges.push("🎯");
     }
