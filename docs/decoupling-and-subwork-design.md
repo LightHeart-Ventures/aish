@@ -146,6 +146,13 @@ when a sub-worker spawns (`create_project_task` has no match in `src/`); the
 `:workers` view links the two by *matching the key against the worker's task
 text*.
 
+**Visibility (landed in #1105).** Sub-work is no longer invisible. The ledger
+persists in a durable `coordinator_runs.subwork` JSON column, is surfaced on the
+escalation tray as `Kind::SubWork`, and uses `sw:{parent}:{item}` row ids that
+cannot collide with run ids. `sync_subwork` reaps retracted items and `sweep`
+reaps orphans. The tray row shows the item and its state without opening the
+worker.
+
 **The gap.** Two prompt constants state criteria, and they do not agree on the
 same axis:
 
@@ -186,7 +193,13 @@ Choose a **sub-worker** only when sub-work cannot express the piece.
 | Different repo or different cwd | ❌ | ✅ |
 | Deferrable — operator does not need it in this run | ❌ | ✅ |
 
-Tie-break: **if the pieces must land in one PR, they are sub-work.** That single
+Tie-break: **if the pieces must land in one PR, they are sub-work.**
+
+Rationale update: part of why workers reached for sub-workers was that sub-work
+was invisible to the operator. Since #1105 it appears on the escalation tray, so
+the reason to spawn a sub-worker just to get tracking is gone. The default
+should be sub-work, and the sub-worker lane should need one of the listed
+signals. That single
 sentence resolves most real cases, including the operator's 3-file example.
 
 ### 2.3 Design
@@ -220,7 +233,11 @@ wrap-up path checks `verify()` **before** the PR step. Not verified → skip
 `git status`. This is the same philosophy as `MAX_SUBWORK_ITEMS` being enforced
 in `ingest`: a rule the model can talk past is not a rule.
 
-**D6. Declare `files` on each sub-work item.** Extend the marker grammar to
+**D6. Declare `files` on each sub-work item.** Add an optional `files` field to
+`SubWorkItem` and to the `SubWorkRow` ledger view (#1105). Because the ledger is
+JSON in `coordinator_runs.subwork` and `SubWorkItem` already derives serde, the
+field is additive: existing rows deserialize with `files` empty, which means
+unknown, not disjoint. Extend the marker grammar to
 `SUBWORK PLAN: <id> | <intent> | files: a.rs, b.rs` (third field optional for
 back-compat). Two wins: it feeds the same disjointness test the sub-worker lane
 uses, so the lane choice is computed from one data shape; and it lets the ledger
