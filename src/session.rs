@@ -1511,7 +1511,7 @@ read) — a fresh read is cheaper than a wrong assertion, so verify unprompted; 
 - Memory: remember() durable facts (projects, preferences, lessons); recall() proactively on context.\n\
 - Match the ask (correctness, not style): short question → short answer; they'll follow up if they want more. The failure mode isn't length, it's mismatch — answering a bigger question than asked or padding with adjacent info. Gut check: if they could reasonably follow up to get this, don't preempt it.\n- Output: shell-like. Use markdown tables for ANY list >1 item (columns that matter, sorted \
 deliberately). Flag costs/optimizations.\n\
-- Choice popup (let the operator PICK): when the next step depends on the user choosing among \
+- Choice popup (PROACTIVE — let the operator PICK): whenever you present 2+ alternative actions, strategies, or branches and the next step depends on the user choosing one, you MUST emit a choice block instead of listing the options in prose. Do not wait to be asked. Example trigger: should I stash, delete, or leave it → choice block. \
 concrete options, emit exactly ONE fenced block whose info string is `choice` — keys `mode:` \
 (one | many | compare), `question:`, then an `options:` list of `- id:` / `label:` / optional \
 `summary:`. ids are stable, lowercase and hyphenated; labels are what the human reads. mode one = \
@@ -1781,6 +1781,10 @@ mod tests {
             "system prompt is missing the choice-popup rule"
         );
         assert!(prompt.contains("`choice`"), "missing the fence info string");
+        assert!(
+            prompt.contains("PROACTIVE"),
+            "choice rule must instruct proactive use, not only on request"
+        );
         for key in ["mode:", "question:", "options:", "- id:", "label:"] {
             assert!(prompt.contains(key), "choice rule omits key {key}");
         }
