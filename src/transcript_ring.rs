@@ -147,6 +147,22 @@ impl TranscriptRing {
         self.next_seq.saturating_sub(1)
     }
 
+    /// A live cursor seated at the CURRENT write pointer — it emits only entries
+    /// pushed from here on, never the retained history.
+    ///
+    /// This is what an in-place resume's fresh stderr stream starts from. The
+    /// ring now RETAINS the prior thread's rows (so `:attach` can still replay
+    /// a resumed worker's output-to-date — the reported bug), which means a
+    /// `LiveCursor::default()` would re-emit that whole history into the live
+    /// forward stream on the resumed thread's very first line. Seating the
+    /// cursor at the write pointer keeps the live stream strictly "new output
+    /// only" while the backfill cursor keeps the full tail.
+    pub fn live_cursor_now(&self) -> LiveCursor {
+        LiveCursor {
+            last_seq: self.write_pos(),
+        }
+    }
+
     /// Retained entry count (after eviction). Observability/test accessor.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
@@ -166,9 +182,15 @@ impl TranscriptRing {
         self.bytes
     }
 
-    /// Drop all retained entries (an in-place resume — a fresh "thread"). The
-    /// write pointer stays monotonic so seqs are never reused; a resumed run's
-    /// fresh [`LiveCursor`] (position 0) simply drains from the next push.
+    /// Drop all retained entries. The write pointer stays monotonic so seqs are
+    /// never reused.
+    ///
+    /// NOT used by an in-place resume any more: a resumed worker KEEPS its prior
+    /// thread's rows so `:attach` still replays the output-to-date instead of an
+    /// empty pane (the resumed-worker attach bug). Resume pushes a thread-boundary
+    /// marker and seats the new live stream at
+    /// [`live_cursor_now`](Self::live_cursor_now).
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
@@ -202,6 +224,33 @@ mod tests {
         let tail: Vec<String> = ring.backfill_tail().into_iter().map(|(_, t)| t).collect();
         assert_eq!(tail, vec!["yy", "zz"]);
         assert!(ring.bytes() <= 4);
+    }
+
+    #[test]
+    /// A resumed worker's stderr stream seats its cursor HERE rather than at
+    /// `LiveCursor::default()`: the ring retains the pre-resume rows so
+    /// `:attach` can replay them, and a default cursor would re-dump that whole
+    /// history into the live stream on the resumed thread's first line.
+    fn live_cursor_now_skips_retained_history() {
+        let mut ring = TranscriptRing::default();
+        ring.push("", "before one");
+        ring.push("", "before two");
+
+        let mut cur = ring.live_cursor_now();
+        assert!(
+            ring.read_live(&mut cur).is_empty(),
+            "seated cursor must skip everything already in the ring"
+        );
+        // …while the backfill replay still sees the retained history.
+        assert_eq!(ring.backfill_tail().len(), 2);
+
+        ring.push("", "after");
+        let fresh: Vec<String> = ring
+            .read_live(&mut cur)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(fresh, vec!["after"]);
     }
 
     #[test]
