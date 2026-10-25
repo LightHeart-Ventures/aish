@@ -2907,12 +2907,13 @@ fn coordinator_status_message(session: &Session) -> String {
     left = recent_message_row(left, session.flash.lock().ok().and_then(|b| b.clone()));
     // Right-justify the session name (`:rename`) on this row, directly above the
     // clock on the statusline below — in bold magenta. Blank when unnamed.
-    // Append live status badges to the RIGHT of the name: 🤖 when a background
-    // coordinator is still working, ⏰ when an `:alert` monitor is armed, 🎯 when
-    // a goal is active. Badges render even when the session is UNNAMED — an armed
+    // Append live status badges to the RIGHT of the name: ⏰ when an `:alert`
+    // monitor is armed, 🎯 when a goal is active. (No worker badge — the
+    // escalation tray above already makes live coordinators self-evident.)
+    // Badges render even when the session is UNNAMED — an armed
     // alert (⏰) must always be visible in the statusline, not gated behind a
     // `:rename`.
-    let decorated = decorate_name(session.name.as_deref(), &status_badges(session, &workers));
+    let decorated = decorate_name(session.name.as_deref(), &status_badges(session));
     // The label does NOT ride this row: it is welded into the horizontal RULE
     // above it, ~2 columns from the right edge, with the rule continuing on both
     // sides of the name. Hand it to the terminal layer, which frames it into the
@@ -2925,8 +2926,8 @@ fn coordinator_status_message(session: &Session) -> String {
 
 /// Combine the optional session name (`:rename`) with the live status-badge
 /// suffix into the right-justified SecondStatusLine label. Badges show even when
-/// the session is UNNAMED, so an armed `:alert` (⏰), a working coordinator (🤖),
-/// or an active goal (🎯) is always visible in the statusline — not gated behind
+/// the session is UNNAMED, so an armed `:alert` (⏰) or an active goal (🎯) is
+/// always visible in the statusline — not gated behind
 /// a name. Returns `None` only when there's neither a name nor any badge (so the
 /// row stays blank). Pure — unit-testable without a live `Session`.
 fn decorate_name(name: Option<&str>, badges: &str) -> Option<String> {
@@ -2940,15 +2941,16 @@ fn decorate_name(name: Option<&str>, badges: &str) -> Option<String> {
 }
 
 /// Compose the live status-badge suffix appended to the right of the `:rename`
-/// label on the SecondStatusLine: 🤖 when any background coordinator is still
-/// running (non-terminal), ⏰ when at least one `:alert` monitor is armed, and
-/// 🎯 when a goal is active. Order is fixed (workers · alert · goal); each badge
-/// is a single 2-col emoji joined by a space. Empty string when none apply.
-fn status_badges(session: &Session, workers: &[(String, bool, String)]) -> String {
+/// label on the SecondStatusLine: ⏰ when at least one `:alert` monitor is armed,
+/// and 🎯 when a goal is active. Order is fixed (alert · goal); each badge is a
+/// single 2-col emoji joined by a space. Empty string when none apply.
+///
+/// There is deliberately NO worker (🤖) badge: live background coordinators are
+/// already self-evident from the escalation tray, which renders their rows
+/// directly above this rule. Duplicating that signal as an emoji on the rule
+/// label only added noise.
+fn status_badges(session: &Session) -> String {
     let mut badges: Vec<&str> = Vec::new();
-    if workers.iter().any(|(_, terminal, _)| !terminal) {
-        badges.push("🤖");
-    }
     let alert_active = session
         .alert_store
         .as_ref()
@@ -14753,7 +14755,7 @@ mod tests {
         assert_eq!(decorate_name(Some("proj"), ""), Some("proj".to_string()));
         // UNNAMED but an alert is armed → the ⏰ badge still shows (the fix).
         assert_eq!(decorate_name(None, "⏰"), Some("⏰".to_string()));
-        assert_eq!(decorate_name(Some(""), "🤖 ⏰"), Some("🤖 ⏰".to_string()));
+        assert_eq!(decorate_name(Some(""), "⏰ 🎯"), Some("⏰ 🎯".to_string()));
         // Neither name nor badge → blank row.
         assert_eq!(decorate_name(None, ""), None);
         assert_eq!(decorate_name(Some(""), ""), None);
@@ -15396,16 +15398,15 @@ mod tests {
     }
 
     #[test]
-    fn status_badges_reflects_active_workers() {
+    fn status_badges_omits_worker_badge() {
         let session = Session::new().unwrap();
-        // No workers, no alert, no goal → no badges.
-        assert_eq!(status_badges(&session, &[]), "");
-        // A terminal (finished) worker contributes no robot badge.
-        let done = vec![("w1".to_string(), true, "task".to_string())];
-        assert_eq!(status_badges(&session, &done), "");
-        // A live (non-terminal) worker shows the robot badge.
-        let live = vec![("w2".to_string(), false, "task".to_string())];
-        assert_eq!(status_badges(&session, &live), "🤖");
+        // No alert, no goal → no badges.
+        assert_eq!(status_badges(&session), "");
+        // Live background coordinators are NOT badged on the rule label: the
+        // escalation tray directly above already surfaces them, so the 🤖
+        // emoji was pure duplication. Whatever the worker state, the badge
+        // string stays free of the robot glyph.
+        assert!(!status_badges(&session).contains('🤖'));
     }
 
     #[test]

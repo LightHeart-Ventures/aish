@@ -6,8 +6,8 @@
 //! body ("🚀 escalated to a background coordinator …") and then immediately
 //! scrolls away under the next command's output. Thirty seconds later the
 //! operator has no on-screen evidence that anything is running — the only
-//! surviving signal is the `⟳N` prompt pulse and the 🤖 statusline badge, neither
-//! of which says WHAT was escalated or HOW it's doing. The operator has to run
+//! surviving signal is the `⟳N` prompt pulse, which says neither WHAT was
+//! escalated nor HOW it's doing. The operator has to run
 //! `:workers` to answer "is that thing still going?".
 //!
 //! THE FIX. Pin the escalation to the footer instead of the body. While
