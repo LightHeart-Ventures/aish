@@ -2598,9 +2598,10 @@ pub fn unpark_input_row(echo: Option<&str>) {
     // Wipe the editor's leftovers so the resting-prompt repaint starts clean.
     let _ = write!(out, "\x1b[{input_row};1H\x1b[2K\x1b[{row};1H");
     if let Some(line) = echo {
-        // Paint the echo as one solid, full-width background band (a padding
-        // row above and below, all background fill — see
-        // `style::input_echo_block_with` for why it's not half-block glyphs),
+        // Paint the echo as one contiguous, full-width band: the echo row is a
+        // full-height background fill, framed by HALF-height lips above and
+        // below (reverse-video half blocks — see `style::band_half_row` for why
+        // the shade has to be the cell BACKGROUND and not a foreground paint),
         // so the operator can spot where their last input was at a glance.
         // At the last body row these `\r\n`s scroll the region (correct);
         // above it they just step down a row.
