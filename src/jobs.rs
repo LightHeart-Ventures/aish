@@ -8,6 +8,7 @@
 //! registry ([`Jobs`]), and one explicit `running` / `stopped` / `done`
 //! state machine ([`JobState`]).
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -153,9 +154,19 @@ impl Job {
 
     /// Append a line of streamed output, dropping the oldest bytes once the
     /// retained buffer exceeds [`JOB_BUFFER_CAP`].
-    pub fn push_line(&self, line: &str) {
+    ///
+    /// The line is passed through the central redaction filter
+    /// ([`crate::redact::scrub`]) at CAPTURE time (SEC-3.2 / TASK-947): the
+    /// background-job path is the one place where process output reaches the
+    /// operator's console *and* the persisted session without first going
+    /// through a scrubbed tool result, so filtering only on read would still
+    /// leave plaintext secrets in the retained buffer and the DB. Returns the
+    /// scrubbed line so callers echo exactly what was retained — borrowed when
+    /// the line was already clean, owned only when something was replaced.
+    pub fn push_line<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        let scrubbed = crate::redact::scrub(line);
         let mut buf = self.buffer.lock().unwrap();
-        buf.push_str(line);
+        buf.push_str(&scrubbed);
         buf.push('\n');
         if buf.len() > JOB_BUFFER_CAP {
             let mut cut = buf.len() - JOB_BUFFER_CAP;
@@ -164,6 +175,7 @@ impl Job {
             }
             buf.drain(..cut);
         }
+        scrubbed
     }
 
     /// A snapshot of the retained output.
@@ -408,5 +420,36 @@ mod tests {
         assert_eq!(lines[0], "[1] running — tail -f log");
         assert_eq!(lines[1], "[2] stopped — sleep 100");
         assert!(format_listing(&[]).is_empty());
+    }
+
+    // SEC-3.2 / TASK-947 — a secret printed by a BACKGROUND JOB must not reach
+    // the retained buffer (what `job_output` hands the model and what the
+    // session persists) nor the echoed console line. Capture-time scrubbing is
+    // what makes read-time scrubbing non-load-bearing for the DB.
+    #[test]
+    fn scrub_job_output() {
+        let _g = crate::redact::test_registry_lock();
+        let secret = "ghp_jobEchoedSecret0123456789";
+        assert!(crate::redact::register_secret(secret, "profile:JOBS_TEST"));
+
+        let job = Job::background(1, format!("echo {secret}")).0;
+        // What the child printed, exactly as the stream pump feeds it in.
+        let raw = format!("token={secret} trailing");
+        let echoed = job.push_line(&raw);
+        job.push_line("second line, nothing secret");
+
+        // 1. the line handed back for the console stream
+        assert!(!echoed.contains(secret), "LEAK on console echo: {echoed:?}");
+        assert!(
+            echoed.contains("[redacted:profile:JOBS_TEST]"),
+            "{echoed:?}"
+        );
+
+        // 2. the retained buffer — the source for both job_output (model
+        //    context) and the persisted job row.
+        let buf = job.output();
+        assert!(!buf.contains(secret), "LEAK in job buffer: {buf:?}");
+        assert!(buf.contains("[redacted:profile:JOBS_TEST]"), "{buf:?}");
+        assert!(buf.contains("second line, nothing secret"), "{buf:?}");
     }
 }
