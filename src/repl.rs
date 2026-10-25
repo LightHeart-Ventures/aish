@@ -8051,14 +8051,47 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     } else {
         ":workers and the Shift-Tab rotation"
     };
-    if matches!(status.as_str(), "done" | "failed") {
-        println!("\x1b[2m⇄ closed {short} — removed from {surfaces}.\x1b[0m");
+    // Confirmation lands on the SecondStatusLine's recent-message slot — the
+    // same flash the `mcp: ready` notice and `:new`'s "history cleared" use —
+    // instead of a jargon line above the prompt. Operators read "✓ Closed
+    // w_abc1234"; the mechanics (which surfaces it left, whether the worker
+    // keeps running) stay recoverable in the `:activity` tray detail.
+    let banner = close_banner(short);
+    let detail = if matches!(status.as_str(), "done" | "failed") {
+        format!("closed {short} — removed from {surfaces}.")
     } else {
-        println!(
-            "\x1b[2m⇄ closed {short} — removed from {surfaces}; it keeps running in the background.\x1b[0m"
+        format!("closed {short} — removed from {surfaces}; it keeps running in the background.")
+    };
+    if let Some(act) = &session.activity_store {
+        let _ = act.record(
+            crate::style::Severity::Info.as_str(),
+            &banner,
+            &detail,
+            "worker",
         );
     }
+    if let Ok(mut f) = session.flash.lock() {
+        *f = Some(crate::style::notice_flash(
+            &banner,
+            crate::style::colors_enabled(),
+        ));
+    }
 }
+
+/// Human-readable `:workers close` / `:close` confirmation for the
+/// SecondStatusLine flash slot: `✓ Closed w_abc1234`. Deliberately plain — the
+/// operator asked for "<emoji> Closed <workerid>", not the old machine-ish
+/// "⇄ closed w_abc1234 — removed from :workers and the Shift-Tab rotation."
+/// (that mechanical detail moved to the recoverable `:activity` entry). Pure →
+/// unit-tested.
+fn close_banner(short: &str) -> String {
+    format!("{CLOSE_GLYPH} Closed {short}")
+}
+
+/// Leading glyph of the close confirmation — a check mark, the one glyph every
+/// operator reads as "done, it's gone" without a legend. Sibling of
+/// [`LIFTOFF_GLYPH`] (🚀, work leaving) and [`TELL_GLYPH`] (📣, steering).
+const CLOSE_GLYPH: &str = "\u{2713}";
 /// AC7 (TASK-201 / S9.2) ownership decision for steering a coordinator that may
 /// belong to ANOTHER session. A coordinator is "owned" by the session that
 /// launched it — its durable `coordinator_runs.session_id`, or, for an in-memory
@@ -15132,6 +15165,21 @@ mod tests {
         assert!(line.contains("(2 pending)"), "missing pending: {line}");
         // Reset the SGR state so the prompt isn't left colored.
         assert!(line.ends_with("\x1b[0m"), "unterminated SGR: {line}");
+    }
+
+    #[test]
+    fn close_banner_reads_as_plain_english_for_humans() {
+        let line = close_banner("w_abc1234");
+        // Exactly the operator-requested shape: "<emoji> Closed <workerid>".
+        assert_eq!(line, "✓ Closed w_abc1234");
+        // The old machine-ish wording moved to the :activity detail column —
+        // keep it OUT of the flash banner.
+        assert!(!line.contains("⇄"), "old glyph resurfaced: {line}");
+        assert!(!line.contains("Shift-Tab"), "mechanics leaked: {line}");
+        assert!(!line.contains("removed from"), "mechanics leaked: {line}");
+        // No SGR in the banner itself — notice_flash() owns the dim wrapping,
+        // and the :activity row stores plain text.
+        assert!(!line.contains('\x1b'), "pre-colored banner: {line}");
     }
 
     #[test]
