@@ -210,6 +210,46 @@ triage collapses the remaining work to one root cause, the ready set collapses
 to one node and the coordinator runs solo **by construction** — the outcome the
 anti-decompose directive was trying to achieve by instruction.
 
+### Enforcement at dispatch
+
+The two invariants above are only real if something *refuses* a dispatch that
+violates them. `PlanGraph::fan_out_candidates` on its own is a predicate the
+prompt is asked to respect; the gate is what makes it authoritative.
+
+`PlanGraph::authorize_dispatch(done, node_id, concurrent)` (`src/plan.rs`) is
+that decision, and it is pure:
+
+| Condition | Denial |
+|---|---|
+| `node_id` is not in the graph | `UnknownNode` |
+| node is already in `done` | `AlreadyDone` |
+| some `depends_on` is not in `done` | `NotReady { blocked_by }` |
+| other plan nodes are in flight and `fan_out_candidates` declines | `FanOutNotIndependent { peers }` |
+
+A solo dispatch of a ready node is authorized — there is nothing to be
+independent *of*. A `concurrent` list containing only the node itself (a renew
+or re-dispatch) is treated as solo, not as a fan-out against itself.
+
+`tools::plan_dispatch_gate` wires that into the **spawn path** of
+`run_in_background`, before a credential is spent or a host process is forked:
+
+1. resolve the scope from `AISH_PLAN_SCOPE` (session env first, then process
+   env) — stamped by `goal::run_goal_loop` so it survives the per-turn re-exec;
+2. `load_plan_graph(scope)`; **no store, no scope, or no stored graph → the gate
+   is a no-op** and unplanned work behaves exactly as before;
+3. resolve the target node from the new `plan_node` tool argument, falling back
+   to the same whole-token brief match the lease ledger uses
+   (`goal::run_to_plan_node`);
+4. read the nodes already in flight from the durable work-package lease ledger
+   (`live_work_package_leases(scope)`) and map them back onto plan nodes;
+5. `authorize_dispatch` — a denial aborts the offload with an error naming the
+   denial *and* the currently ready node ids.
+
+The authorized node id is then stamped on the child as `AISH_PLAN_NODE`, so a
+spawned coordinator knows which node it is executing instead of re-inferring it
+from its brief.
+
+
 ### Lease keying
 
 The work-package lease key becomes the plan **`NodeId`** instead of the current
@@ -243,6 +283,7 @@ Two consequences:
 | **TASK-808** | Key the work-package lease on plan node id |
 | **TASK-809** | Tests: ready-set / topo-sort / cycle detection, plus prompt-constant assertions |
 | **TASK-810** | Document the loop in `docs/reference/coordinator/patterns.md` |
+| **TASK-811** | Enforce the plan at dispatch — `PlanGraph::authorize_dispatch` + the `run_in_background` gate (`plan_node` arg, `AISH_PLAN_SCOPE` / `AISH_PLAN_NODE`) |
 
 Two pairs must stay in lockstep:
 

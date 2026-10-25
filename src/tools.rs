@@ -609,6 +609,7 @@ a backend or worry about batches — just describe the task and offload it."
                 "type": "object",
                 "properties": {
                     "task": {"type": "string", "description": "The self-contained task to run in the background. It has no access to THIS conversation — include everything it needs. It CAN read the project files and use tools/MCP in the current directory."},
+                    "plan_node": {"type": "string", "description": "Plan node id this dispatch executes (e.g. \"wire-gate\"). REQUIRED when a plan graph is in force for this scope: the dispatch is checked against the plan's ready set and fan-out independence before anything is spawned, and a dispatch that isn't ready-set-derived is refused. Omit when there is no plan — then it is ignored. If omitted while a plan IS in force, the node is inferred from the task brief when the brief names it; otherwise the dispatch fails and names the ready nodes."},
                     "isolate": {"type": "boolean", "description": "Set TRUE for any task that WRITES or EDITS files or runs builds/tests — it then runs in its own dedicated git worktree (a fresh branch) so it can't clobber the working tree of other parallel background jobs or your live session. Set FALSE for read-only / analysis tasks (search, summarize, inspect) that change nothing. Defaults to TRUE (isolation is free when no changes are made — the worktree is auto-removed). When an isolated job makes changes, its branch is left intact and reported back for you to review/merge; nothing is auto-merged."},
                     "base": {"type": "string", "enum": ["main", "head"], "description": "Which baseline an ISOLATED job branches from (ignored when isolate is false). \"main\" (default) = a CLEAN trunk baseline (latest origin/main when there's a remote, else local main) — use it for independent/new work so the job doesn't inherit unrelated in-progress changes. \"head\" = branch from the CURRENT checkout (including all uncommitted and committed changes on your current branch) — pass this when you're working interactively and want a worker to CONTINUE your work from where you are, building on your existing changes. The worker gets its own isolated worktree so it won't interfere with your interactive session, and if it makes changes they'll land on a separate branch you can review and merge."},
                     "tier": {"type": "string", "enum": ["auto", "interactive", "batch"], "description": "Execution latency tier for a fan-out from INSIDE a coordinator (ignored at the top level, which always uses an interactive worker). \"auto\" (default) and \"interactive\" spawn a full-tool interactive sub-coordinator — use for urgent/time-sensitive sub-work. \"batch\" uses the cheaper Anthropic Batches API (~minutes latency) — reserve for large, non-urgent, parallel-independent sets. Urgent work is NEVER auto-routed to batch. Overridable via the AISH_FANOUT_TIER env var."}
@@ -3769,6 +3770,102 @@ fn forced_child_tier(cap: &crate::batch::BatchCapability) -> &'static str {
     }
 }
 
+/// Env var carrying the plan SCOPE KEY across the process boundary, so a
+/// spawned coordinator's dispatch gate resolves the SAME plan graph the goal
+/// loop is driving. Stamped by `goal::run_goal_loop` and re-stamped onto every
+/// child this process spawns.
+pub(crate) const PLAN_SCOPE_ENV: &str = "AISH_PLAN_SCOPE";
+/// Env var carrying the plan NODE this process was dispatched to execute.
+pub(crate) const PLAN_NODE_ENV: &str = "AISH_PLAN_NODE";
+
+/// The plan scope this process belongs to, if any: session env first (what a
+/// spawned coordinator was handed), then the ambient process env.
+fn plan_scope(session: &Session) -> Option<String> {
+    session
+        .env
+        .iter()
+        .find(|(k, _)| k == PLAN_SCOPE_ENV)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(PLAN_SCOPE_ENV).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// ENFORCE THE PLAN AT DISPATCH. Called on the spawn path of
+/// `run_in_background`, BEFORE a credential is spent or a host process forked.
+///
+/// When a plan graph is stored for this process's scope, a fan-out must be
+/// ready-set-derived: the target node is taken from the `plan_node` argument
+/// (or inferred from the brief via the same whole-token match the lease ledger
+/// uses) and then run through `PlanGraph::authorize_dispatch`, which defers to
+/// `ready_set` / `fan_out_candidates`. A dispatch the plan declines fails
+/// LOUDLY, naming the ready nodes, instead of silently racing in-flight work.
+///
+/// No store, no scope, or no stored graph → `Ok(None)`: unplanned work is
+/// unaffected (every pre-plan caller keeps working exactly as before).
+fn plan_dispatch_gate(session: &Session, call: &ToolCall, task: &str) -> Result<Option<String>> {
+    let Some(store) = &session.coordinator_store else {
+        return Ok(None);
+    };
+    let Some(scope) = plan_scope(session) else {
+        return Ok(None);
+    };
+    let Some(graph) = store.load_plan_graph(&scope).ok().flatten() else {
+        return Ok(None);
+    };
+    if graph.nodes.is_empty() {
+        return Ok(None);
+    }
+    let done = store.plan_nodes_done(&scope).unwrap_or_default();
+    let ready = graph.ready_ids(&done);
+    let ready_list = if ready.is_empty() {
+        "<none — every node is done or blocked>".to_string()
+    } else {
+        ready.join(", ")
+    };
+
+    // Which node is this dispatch FOR? Explicit argument wins; otherwise infer
+    // from the brief with the same whole-token match the work-package ledger
+    // uses, so a brief that names its node identifies itself.
+    let explicit = call.args["plan_node"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let node_id = match explicit {
+        Some(n) => n.to_string(),
+        None => match crate::goal::run_to_plan_node(&graph, "", task) {
+            Some(n) => n.id.clone(),
+            None => anyhow::bail!(
+                "not offloading — a plan is in force for scope `{scope}`, so a fan-out must be \
+ready-set-derived. Pass `plan_node` naming the node this work executes (ready now: {ready_list}), \
+or name the node id in the task brief."
+            ),
+        },
+    };
+
+    // Plan nodes ALREADY in flight, read from the durable work-package lease
+    // ledger (cross-process) and mapped back onto plan nodes.
+    let concurrent: Vec<String> = store
+        .live_work_package_leases(Some(&scope))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|l| {
+            crate::goal::run_to_plan_node(&graph, &l.owner_run, &l.task).map(|n| n.id.clone())
+        })
+        .filter(|id| *id != node_id)
+        .collect();
+
+    graph
+        .authorize_dispatch(&done, &node_id, &concurrent)
+        .map_err(|d| {
+            anyhow::anyhow!(
+                "not offloading — the plan for scope `{scope}` refuses this dispatch: {d}. \
+Ready nodes: {ready_list}. Dispatch one of those (pass `plan_node`), or re-plan."
+            )
+        })?;
+    Ok(Some(node_id))
+}
+
 fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
     let task = call.args["task"].as_str().map(str::trim).unwrap_or("");
     if task.is_empty() {
@@ -3791,6 +3888,12 @@ fn run_in_background(call: &ToolCall, session: &Session) -> Result<String> {
 steer, or pass `force: true` (or set AISH_BG_ALLOW_DUP=1) to spawn a duplicate anyway."
         );
     }
+
+    // ── Plan gate (enforce at dispatch) ──────────────────────────────────────
+    // When a plan graph exists for this process's scope, the plan — not the
+    // model's judgement — decides what may be dispatched. Refusal is loud and
+    // happens BEFORE any credential/fork spend. `None` means "no plan in force".
+    let plan_node = plan_dispatch_gate(session, call, task)?;
 
     // A background coordinator (a re-exec'd headless aish) runs on the SAME
     // backend as this session (full parity), so it needs a credential for THAT
@@ -4014,6 +4117,16 @@ sentence that you're on it and the answer will appear when ready."
         crate::worker::WORKER_OUTPUT_ENV.to_string(),
         session.worker_output_mode().as_env_value().to_string(),
     ));
+    // ── Plan node identity across the process boundary ───────────────────────
+    // The gate above resolved WHICH plan node this fan-out executes. Stamp it on
+    // the child so its own dispatch gate (and any ledger/telemetry read) knows
+    // the node it is working, instead of re-inferring it from the brief. The
+    // scope key rides along for free — it already lives in `session.env`
+    // (stamped by `goal::run_goal_loop`) and `child_env` is a clone of it.
+    child_env.retain(|(k, _)| k != PLAN_NODE_ENV);
+    if let Some(node) = &plan_node {
+        child_env.push((PLAN_NODE_ENV.to_string(), node.clone()));
+    }
     let spec = crate::worker::WorkerSpec {
         exe,
         cwd: session.cwd.clone(),
