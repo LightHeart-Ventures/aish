@@ -1358,7 +1358,7 @@ pub fn separator_line(cols: u16, utf8: bool, color_on: bool) -> String {
 }
 
 /// The session label welded into the footer's main horizontal rule — the
-/// `:rename` name plus its live status badges (🤖 / ⏰ / 🎯), already composed by
+/// `:rename` name plus its live status badges (⏰ / 🎯), already composed by
 /// the statusline builder.
 ///
 /// It lives in process state rather than as a [`footer_seq_with`] argument
