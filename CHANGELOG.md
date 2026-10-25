@@ -4,6 +4,12 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.71.2] - 2026-10-25
+
+### Fixed
+- **Finished escalation banners stay on the tray longer and yield under pressure.** The fixed 45s dwell is replaced by a 60s floor and a 15m ceiling. A quiet tray keeps a verdict until 15m or `:close`; a full tray reclaims the stalest verdict past its floor for a new row; live banners are never evicted (#1075).
+- **The input band's pads are half-height lips again.** The head and tail highlight rows regressed to full height in #1069; they are restored to the intended half-height framing (#1076).
+
 ## [0.71.1] - 2026-10-25
 
 ### Fixed
