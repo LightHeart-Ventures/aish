@@ -1621,6 +1621,18 @@ pub async fn run(
                         let cb_tail = std::sync::Arc::new(interactive_tail_rows(&session));
                         let on_shift_tab: crate::keywatch::ShiftTabFn =
                             std::sync::Arc::new(move || {
+                                // Hold a DEC 2026 synchronized-output frame across the
+                                // ENTIRE view switch. The cycle wipes the viewport,
+                                // repaints the footer, re-anchors the cursor and then
+                                // streams a header + a screenful of replayed rows —
+                                // dozens of writes. Un-synchronized the terminal
+                                // presents the blank intermediate state and the
+                                // operator sees a hard flash; wrapped, the wipe and
+                                // the repaint land as ONE frame. Guard drops (and the
+                                // frame presents) at the end of this closure, after
+                                // the replay has been written. No-op on terminals that
+                                // don't implement 2026.
+                                let _frame = crate::terminal::sync_update();
                                 cycle_worker_live(
                                     &cb_workers,
                                     &cb_attached,
@@ -1856,7 +1868,19 @@ pub async fn run(
                 // OR the hop that wraps back to the interactive prompt (it prints
                 // nothing and re-anchors the cursor itself). Either way, DON'T arm
                 // the gap in those cases.
-                if cycle_worker(&mut session) {
+                // Same flash fix as the mid-turn path: hold a DEC 2026
+                // synchronized-output frame across the whole switch so the wipe,
+                // the footer repaint, the attach header and the backfilled tail
+                // are presented as ONE atomic frame instead of letting the
+                // operator see the cleared screen first. The guard drops at the
+                // end of this block (before the prompt redraw, which is a single
+                // write and never flashed). No-op off a tty, on terminals without
+                // 2026, or when AISH_NO_SYNC_UPDATE is set.
+                let cycled = {
+                    let _frame = crate::terminal::sync_update();
+                    cycle_worker(&mut session)
+                };
+                if cycled {
                     needs_gap = true;
                 }
                 continue;
@@ -6029,6 +6053,87 @@ pub(crate) fn liftoff_banner_line(verb: &str, short: &str, task: &str) -> String
     )
 }
 
+/// Derive "quiet" terminal attrs from cooked ones: `ICANON` + `ECHO` off so the
+/// tty neither buffers nor PAINTS what the operator types, while `ISIG` is left
+/// untouched so Ctrl-C still raises SIGINT. `VMIN=1`/`VTIME=0` keeps a later
+/// `read` prompt. Split out from [`EchoSuspend::install`] so the load-bearing
+/// bit-twiddling is unit-testable without a controlling terminal.
+fn liftoff_quiet_attrs(cooked: &libc::termios) -> libc::termios {
+    let mut quiet = *cooked;
+    quiet.c_lflag &= !(libc::ICANON | libc::ECHO);
+    quiet.c_cc[libc::VMIN] = 1;
+    quiet.c_cc[libc::VTIME] = 0;
+    quiet
+}
+
+/// Should the liftoff animation take over the terminal discipline? ONLY when
+/// echo is currently ON. Echo already off means another owner holds stdin
+/// (`keywatch`'s mid-turn cbreak, a `workers_modal` raw guard), and a nested
+/// save/restore around their window could hand them back the wrong attrs — so
+/// we leave it alone and let them keep the keystrokes silent on our behalf.
+fn liftoff_should_suspend_echo(lflag: libc::tcflag_t) -> bool {
+    lflag & libc::ECHO != 0
+}
+
+/// RAII guard that silences terminal echo for the duration of a blocking
+/// animation WITHOUT discarding what the operator types into it.
+///
+/// [`print_liftoff_banner`] holds the main thread for up to
+/// the title grace ([`liftoff_title_wait`]) waiting out the worker's title,
+/// repainting ONE line in
+/// place with `\r\x1b[2K`. At a prompt boundary stdin is still COOKED — the
+/// editor isn't reading yet, so nothing has put it in cbreak — which means the
+/// tty itself echoes every keystroke typed during that window onto the banner's
+/// row. The banner already runs near the terminal width, so that echo wraps the
+/// cursor to a fresh row and the NEXT frame's `\r\x1b[2K` clears and repaints
+/// *that* row instead of the banner's. Each keystroke therefore strands another
+/// copy on screen —
+/// `🚀 dispatched to background worker w_…: build and open pr…^R` — and the
+/// typed text, spent as echo on a line nobody reads, never reaches the input.
+///
+/// Clearing `ECHO`/`ICANON` fixes both halves at once: nothing is painted over
+/// the banner, and the bytes stay QUEUED on fd 0 — we switch with `TCSANOW`,
+/// never `TCSAFLUSH` — so the editor picks them up the instant it takes the
+/// prompt back. Typing through a liftoff now lands in the input buffer like
+/// typing through any other pause.
+struct EchoSuspend {
+    cooked: libc::termios,
+}
+
+impl EchoSuspend {
+    /// Install the guard, or `None` when there's no tty / no echo to suspend.
+    fn install() -> Option<EchoSuspend> {
+        // SAFETY: plain isatty + tcgetattr into a zeroed termios, both checked
+        // before use; tcsetattr is handed a valid termios derived from them.
+        let cooked = unsafe {
+            if libc::isatty(0) != 1 {
+                return None;
+            }
+            let mut cooked: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut cooked) != 0 {
+                return None;
+            }
+            if !liftoff_should_suspend_echo(cooked.c_lflag) {
+                return None;
+            }
+            let quiet = liftoff_quiet_attrs(&cooked);
+            libc::tcsetattr(0, libc::TCSANOW, &quiet);
+            cooked
+        };
+        Some(EchoSuspend { cooked })
+    }
+}
+
+impl Drop for EchoSuspend {
+    fn drop(&mut self) {
+        // SAFETY: restore the saved cooked termios on fd 0. `TCSANOW` again, so
+        // whatever was typed during the banner is STILL queued for the editor.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.cooked);
+        }
+    }
+}
+
 /// Print the liftoff banner, animating the leading arrow so it "lifts off"
 /// the way the work does — a right→up-right→up glyph sweep that settles on the
 /// 🚀 the escalation tray then shows against that same worker, followed by the
@@ -6060,6 +6165,12 @@ fn print_liftoff_banner(
         );
         return;
     }
+    // We're about to BLOCK the main thread for up to the title grace with
+    // the editor not yet reading. Suspend terminal echo first so keystrokes
+    // typed through the launch neither smear duplicate banners across the
+    // scrollback nor get spent as echo — they stay queued for the prompt. Held
+    // through the settling frame below; restored on drop. See `EchoSuspend`.
+    let _echo = EchoSuspend::install();
     // Animate against the clipped brief so the launch appears INSTANTLY, then
     // let its name sharpen into the title in the settling frame below.
     let budget = crate::activity_summary::current_title_budget();
@@ -10677,6 +10788,7 @@ async fn handle_colon(
                                                      distribution + missed-inline heuristic (alias :dstats)\n\
                  :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  :startup-digest [on|off]            show/suppress the boot-time coordinator digest (completed-result walls + salvage/reattach lines); off (default). env: AISH_STARTUP_DIGEST\n\
+                 :verbose [on|off]                   per-round engine diagnostics (prompt-cache hit lines, serial-chain + call-budget advisories); off (default). env: AISH_VERBOSE\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (runs quietly; :attach <id> to watch/steer)\n\
@@ -11711,6 +11823,7 @@ async fn handle_colon(
         Some("secrets") => handle_secrets(parts.collect(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
         Some("startup-digest") => handle_startup_digest(parts.next(), session),
+        Some("verbose") => handle_verbose(parts.next(), session),
         Some("update") => {
             // handle_update returns true when the user opted to auto-restart onto
             // the freshly-installed binary — propagate it as the REPL break signal.
@@ -12469,6 +12582,70 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
             println!(
                 "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]"
             )
+        }
+    }
+}
+
+/// `:verbose [on|off|status]` arms the per-round engine diagnostics — prompt-cache
+/// hit lines, serial-chain-guard and call-budget-guard advisories. OFF by default:
+/// the activity stream is for what the shell DID, and every suppressed event keeps
+/// a user-visible consequence (guard yields still print their turn-stop banner, a
+/// soft budget warning is still folded into the next round's prompt, cumulative
+/// cache hit rate still shows on the statusline). Unlike `:startup-digest`, this
+/// takes effect IMMEDIATELY — the flag is a process-wide atomic in `engine` — and
+/// is also persisted for the next run. `AISH_VERBOSE` overrides the stored value
+/// for a single run.
+fn handle_verbose(sub: Option<&str>, session: &mut Session) {
+    let persisted = session
+        .db
+        .as_ref()
+        .and_then(|db| db.get_setting("verbose").ok().flatten())
+        .and_then(|v| crate::coordinator::parse_flag(&v));
+    let env_override = std::env::var("AISH_VERBOSE")
+        .ok()
+        .and_then(|v| crate::coordinator::parse_flag(&v));
+    match sub {
+        Some("on") | Some("off") => {
+            let on = sub == Some("on");
+            crate::engine::set_verbose(on);
+            let saved = match session.db.as_ref() {
+                Some(db) => db
+                    .set_setting("verbose", if on { "on" } else { "off" })
+                    .is_ok(),
+                None => false,
+            };
+            println!(
+                "verbose diagnostics {}{}",
+                if on { "on" } else { "off" },
+                if saved {
+                    ""
+                } else {
+                    " (this session only — no persistent store)"
+                }
+            );
+        }
+        None | Some("status") => {
+            println!(
+                "verbose diagnostics: {} (default off; cache + guard telemetry per round)",
+                if crate::engine::verbose() {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            if env_override.is_some() {
+                println!(
+                    "  source: AISH_VERBOSE env override{}",
+                    persisted
+                        .map(|p| format!(" (persisted setting: {})", if p { "on" } else { "off" }))
+                        .unwrap_or_default()
+                );
+            } else if persisted.is_some() {
+                println!("  source: persisted :verbose setting");
+            }
+        }
+        Some(other) => {
+            println!("unknown :verbose subcommand '{other}' — usage: :verbose [on|off|status]")
         }
     }
 }
@@ -16296,7 +16473,7 @@ mod clipboard_paste_tests {
 /// task brief the operator typed.
 #[cfg(test)]
 mod liftoff_label_tests {
-    use super::{LIFTOFF_FRAME, liftoff_label};
+    use super::{LIFTOFF_FRAME, liftoff_label, liftoff_quiet_attrs, liftoff_should_suspend_echo};
     use std::time::{Duration, Instant};
 
     fn store(tag: &str) -> crate::db::CoordinatorStore {
@@ -16451,5 +16628,59 @@ mod liftoff_label_tests {
         assert_eq!(parse(Some("banana")), default, "garbage ⇒ default");
         assert_eq!(parse(Some("")), default, "empty ⇒ default");
         assert_eq!(parse(Some("-1")), default, "negative ⇒ default");
+    }
+
+    fn cooked(lflag: libc::tcflag_t) -> libc::termios {
+        // SAFETY: termios is a plain POD struct; zeroed is a valid value and we
+        // only ever read back the fields we set.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        t.c_lflag = lflag;
+        t
+    }
+
+    // The bug: keystrokes typed during the banner's blocking title wait were
+    // echoed by the tty onto the banner row, wrapping the cursor so each
+    // following frame's `\r\x1b[2K` cleared the WRONG row — stranding a fresh
+    // `🚀 dispatched to background worker …^R` per keypress — and were consumed
+    // as echo instead of reaching the input. Both halves die with ECHO.
+    #[test]
+    fn quiet_attrs_silence_echo_and_canonical_buffering() {
+        let quiet = liftoff_quiet_attrs(&cooked(libc::ECHO | libc::ICANON | libc::ISIG));
+        assert_eq!(
+            quiet.c_lflag & libc::ECHO,
+            0,
+            "tty must not paint keystrokes"
+        );
+        assert_eq!(quiet.c_lflag & libc::ICANON, 0, "no line buffering");
+        assert_eq!(quiet.c_cc[libc::VMIN], 1);
+        assert_eq!(quiet.c_cc[libc::VTIME], 0);
+    }
+
+    // Suspending echo must never cost the operator their escape hatch: a
+    // liftoff can block for the title grace, and Ctrl-C has to keep working
+    // the whole time.
+    #[test]
+    fn quiet_attrs_keep_signals_live_so_ctrl_c_still_fires() {
+        let quiet = liftoff_quiet_attrs(&cooked(libc::ECHO | libc::ICANON | libc::ISIG));
+        assert_ne!(
+            quiet.c_lflag & libc::ISIG,
+            0,
+            "Ctrl-C must still raise SIGINT"
+        );
+    }
+
+    // Only ONE owner of the terminal discipline at a time. Mid-turn escalations
+    // land while `keywatch` already holds cbreak; nesting a save/restore there
+    // risks handing that session back attrs it never set.
+    #[test]
+    fn echo_is_suspended_only_when_someone_else_isnt_already_holding_it() {
+        assert!(
+            liftoff_should_suspend_echo(libc::ECHO | libc::ICANON),
+            "cooked prompt boundary: ours to quiet"
+        );
+        assert!(
+            !liftoff_should_suspend_echo(libc::ICANON),
+            "echo already off: another owner holds stdin, don't nest"
+        );
     }
 }

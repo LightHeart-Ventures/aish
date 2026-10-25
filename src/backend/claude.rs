@@ -1178,7 +1178,10 @@ same oversized call.]",
         let total_input = uncached + cache_read + cache_creation;
         // Suppressed on a quiet-summary turn (auto-resume): that turn renders as
         // a single animated line, and this dim telemetry would scroll over it.
-        if total_input > 0 && !crate::engine::quiet_summary() {
+        // Also verbose-only: this is per-round engine diagnostics, not a record
+        // of what the shell DID, so it stays behind `:verbose` while the
+        // cumulative hit rate remains on the statusline and in `:context`.
+        if total_input > 0 && !crate::engine::quiet_summary() && crate::engine::verbose() {
             let hit_pct = (cache_read as f64 / total_input as f64) * 100.0;
             crate::status_eprintln!(
                 "\x1b[2m  cache: {cache_read} read + {cache_creation} write + {uncached} uncached \

@@ -7,6 +7,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 ### Fixed
 - **Dispatching a background worker no longer stalls the prompt waiting for a name that cannot exist yet.** #1071 taught the liftoff banner to name the worker the way the tray names it by polling the durable coordinator row for the model-written title, with a bounded 5s grace. The grace was unwinnable in the common case: the title is written by the coordinator **subprocess** only after it re-execs aish, opens the store, takes its own `git worktree` (serialized behind the repo's `index.lock`), resolves a credential and finishes a model call — seconds, and in a fan-out every launch is additionally spaced by the spawn stagger. So the poll almost never resolved; it just blocked the REPL thread for the full budget and then printed the clipped brief anyway, once per dispatch and N times across a wave — the "significant delay right after the `🚀 dispatched to background worker w_…:` line". The grace is now a **glance, not a stall**: 600ms by default, long enough to pick up a title that is *already* stamped (a re-dispatch, a resumed run, a child that booted during the arrow sweep), never long enough to hold the prompt. `liftoff_label` also resolves **before** sleeping, so an already-settleable label (`--no-db`, a stamped title, an exhausted grace) costs zero wall-clock instead of one mandatory frame. Nothing is lost when a title lands late — the tray row and `:workers` swap it in the moment it appears (`refresh_escalation_status`); only the static scrollback line keeps the brief. Tunable via `AISH_LIFTOFF_TITLE_WAIT_MS` (`5000` restores the old wait-for-the-name behaviour, `0` skips the poll entirely); an unparseable value degrades to the default, so a typo can neither disable nor unbound the wait. The arrow sweep is unchanged — a zero grace still plays the animation in full.
 
+## [0.71.3] - 2026-10-25
+
+### Fixed
+- **Re-release of 0.71.2 with build artifacts.** `v0.71.2` was published before its production build ran and shipped with no assets, so `:update` could not install it. No code changes in this release.
+
 ## [0.71.2] - 2026-10-25
 
 ### Fixed
