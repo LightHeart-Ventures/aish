@@ -817,6 +817,26 @@ pub fn prompt_choice(spec: ChoiceSpec, want_banner_rows: u16) -> Option<String> 
     if unsafe { libc::isatty(0) } != 1 {
         return None;
     }
+    // Park the mid-turn keywatch reader for the popup's whole lifetime.
+    //
+    // This popup is opened from INSIDE a live turn (repl.rs, the `'resume`
+    // loop), and during a turn the keywatch reader thread is also sitting on
+    // fd 0 in cbreak mode driving type-ahead + Shift-Tab. Two readers on one
+    // tty — each mutating termios — is what left a backgrounded session fubar
+    // on return: `read_choice_key` restores COOKED mode after every single
+    // byte, clobbering keywatch's cbreak/no-echo so the operator's keys began
+    // echoing raw into the body, while the keystrokes themselves were split at
+    // random between the popup and the type-ahead buffer (and an arrow key
+    // whose CSI tail was stolen decodes as a bare Esc, i.e. the menu
+    // cancelling itself). `confirm_tty` already pauses for its `y/N` read;
+    // FR-431 landed this popup without the same guard.
+    //
+    // RAII: the guard restores cbreak and un-parks the reader on every return
+    // path below, Esc and Ctrl-C included. It is an inert no-op when no
+    // watcher is installed (a popup opened between turns). The operator's
+    // half-typed type-ahead is deliberately left alone — keywatch still owns
+    // it and `carry_over_partial` rescues it at the turn boundary.
+    let _keys = crate::keywatch::pause_for_prompt();
     let (rows, cols) = term_size()?;
     let mut state = ChoiceState::new(spec);
 
