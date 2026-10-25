@@ -530,16 +530,158 @@ fn status_line() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in registration of pre-existing environment secrets (SEC-3.2 / AC9)
+// ---------------------------------------------------------------------------
+
+/// Env var that OPTS IN to startup registration of credential-looking
+/// environment variables. **Default OFF** — scanning the ambient environment
+/// changes what gets rewritten in captured output, so it is never on unless the
+/// operator asks for it.
+pub const ENV_SCAN_FLAG: &str = "AISH_REDACT_ENV";
+
+/// Lowercased name fragments that mark an environment variable as
+/// credential-bearing. Deliberately conservative: a name hint alone is not
+/// enough — the value must also look like a secret
+/// ([`env_value_registerable`]).
+const ENV_SECRET_NAME_HINTS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "api_key",
+    "access_key",
+    "private_key",
+    "credential",
+    "_pat",
+    "pat_",
+];
+
+/// Names that match a hint but are known NOT to carry a usable credential —
+/// registering these would rewrite harmless output (paths, layouts, flags).
+const ENV_SECRET_NAME_DENY: &[&str] = &[
+    "keyboard",
+    "keymap",
+    "_key_file",
+    "_key_path",
+    "_token_file",
+    "_token_path",
+    "password_file",
+    "credential_file",
+    "credentials_file",
+    "secret_file",
+];
+
+/// Whether the opt-in env scan is enabled. OFF for `None` and for anything that
+/// isn't an explicit truthy value — deliberately the inverse of a default-on
+/// toggle (see [`ENV_SCAN_FLAG`]).
+pub fn env_scan_enabled_from(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// True when an env var NAME looks credential-bearing.
+pub fn env_name_is_secretish(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if ENV_SECRET_NAME_DENY.iter().any(|d| lower.contains(d)) {
+        return false;
+    }
+    if ENV_SECRET_NAME_HINTS.iter().any(|h| lower.contains(h)) {
+        return true;
+    }
+    // Bare `KEY` suffix/prefix (`AWS_SECRET_KEY`, `KEY`) — narrower than a
+    // substring match so `KEYBOARD` / `MONKEY_NAME` don't qualify.
+    lower == "key" || lower.ends_with("_key") || lower.starts_with("key_")
+}
+
+/// True when an env var VALUE is worth registering: long and opaque enough to
+/// be a credential, and not obviously a path, URL, or sentence. Keeps the
+/// registry from rewriting innocuous substrings of ordinary output.
+pub fn env_value_registerable(value: &str) -> bool {
+    let v = value.trim();
+    v.len() >= MIN_SECRET_LEN
+        && !v.contains(char::is_whitespace)
+        && !v.starts_with('/')
+        && !v.starts_with('~')
+        && !v.starts_with('.')
+        && !v.contains("://")
+}
+
+/// Pure core of the env scan: the `(name, value)` pairs that WOULD be
+/// registered. Split out from [`register_env_secrets`] so the policy is
+/// testable without mutating the process environment.
+pub fn env_secret_candidates<I, K, V>(vars: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    vars.into_iter()
+        .filter(|(k, v)| env_name_is_secretish(k.as_ref()) && env_value_registerable(v.as_ref()))
+        .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+        .collect()
+}
+
+/// Register credential-looking environment variables with the redactor so their
+/// values are scrubbed if they ever surface in captured output (a background
+/// job that echoes `$GITHUB_TOKEN`, a program that dumps its environment).
+///
+/// No-op — and no environment read beyond the flag itself — unless
+/// [`ENV_SCAN_FLAG`] is explicitly truthy. Returns how many values were
+/// registered.
+pub fn register_env_secrets() -> usize {
+    let enabled = env_scan_enabled_from(std::env::var(ENV_SCAN_FLAG).ok().as_deref());
+    if !enabled {
+        return 0;
+    }
+    register_env_secrets_from(enabled, std::env::vars())
+}
+
+/// Gate + registration without reading the process environment, so the
+/// default-OFF behaviour and the registration itself are testable.
+pub fn register_env_secrets_from<I, K, V>(enabled: bool, vars: I) -> usize
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    if !enabled {
+        return 0;
+    }
+    let mut n = 0;
+    for (name, value) in env_secret_candidates(vars) {
+        if register_secret(&value, &format!("env:{name}")) {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        tracing::info!("redact: registered {n} environment secret(s) ({ENV_SCAN_FLAG} is on)");
+    }
+    n
+}
+
+/// Serializes tests across the whole crate that mutate the PROCESS-WIDE
+/// secret registry (`src/jobs.rs` has one too — the registry is global, so the
+/// lock has to be as well, otherwise a `reset_global()` in one test can wipe
+/// the registration another test is mid-assertion on).
+#[cfg(test)]
+pub(crate) fn test_registry_lock() -> MutexGuard<'static, ()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Serializes the few tests that touch the PROCESS-WIDE registry.
     fn global_lock() -> MutexGuard<'static, ()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        test_registry_lock()
     }
 
     fn reset_global() {
@@ -935,6 +1077,125 @@ mod tests {
         assert!(is_unattended(Mode::Normal, true)); // background coordinator
         assert!(!is_unattended(Mode::Normal, false));
         assert!(!is_unattended(Mode::Paranoid, false));
+    }
+
+    // -- AC9: opt-in env-secret registration -------------------------------
+
+    #[test]
+    fn env_scan_defaults_off() {
+        // Absent / empty / anything non-truthy must leave the scan OFF so the
+        // default behaviour of the shell is unchanged.
+        assert!(!env_scan_enabled_from(None));
+        for raw in ["", " ", "0", "off", "false", "no", "maybe", "2"] {
+            assert!(!env_scan_enabled_from(Some(raw)), "{raw:?} must be off");
+        }
+        for raw in ["1", "on", "true", "yes", " ON ", "True"] {
+            assert!(env_scan_enabled_from(Some(raw)), "{raw:?} must be on");
+        }
+    }
+
+    #[test]
+    fn env_name_hints_and_denies() {
+        for name in [
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "ANTHROPIC_API_KEY",
+            "key",
+            "SIGNING_KEY",
+        ] {
+            assert!(env_name_is_secretish(name), "{name} should qualify");
+        }
+        for name in [
+            "KEYBOARD_LAYOUT",
+            "XKB_DEFAULT_KEYMAP",
+            "SSH_KEY_FILE",
+            "GH_TOKEN_PATH",
+            "MONKEY_NAME",
+            "PATH",
+            "HOME",
+        ] {
+            assert!(!env_name_is_secretish(name), "{name} must NOT qualify");
+        }
+    }
+
+    #[test]
+    fn env_values_must_look_like_credentials() {
+        assert!(env_value_registerable("ghp_aAbBcCdDeEfF0123456789"));
+        // Too short, pathy, URL-ish, or prose — registering these would rewrite
+        // ordinary output.
+        for v in [
+            "short",
+            "",
+            "/home/me/.ssh/id_rsa",
+            "~/.aws/credentials",
+            "./local.env",
+            "https://example.test/callback",
+            "a sentence with spaces",
+        ] {
+            assert!(!env_value_registerable(v), "{v:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn env_candidates_filter_pairs() {
+        let got = env_secret_candidates([
+            ("GITHUB_TOKEN", "ghp_aAbBcCdDeEfF0123456789"),
+            ("KEYBOARD_LAYOUT", "us-intl-extended-long"),
+            ("DB_PASSWORD", "short"),
+            ("PATH", "/usr/bin:/bin"),
+            ("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI0K7MDENGbPxRfiCY"),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "GITHUB_TOKEN".to_string(),
+                    "ghp_aAbBcCdDeEfF0123456789".to_string()
+                ),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "wJalrXUtnFEMI0K7MDENGbPxRfiCY".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_registration_is_off_by_default() {
+        let _g = global_lock();
+        reset_global();
+        // Deliberately NOT a value any built-in pattern matches, so the
+        // assertion isolates env registration from pattern scrubbing.
+        let pairs = [("API_SECRET", "Qv9TmKr4LwNb8Hs2Jd6FaPe0")];
+        assert_eq!(register_env_secrets_from(false, pairs), 0);
+        // Nothing registered => the value flows through untouched.
+        assert_eq!(
+            scrub("tok Qv9TmKr4LwNb8Hs2Jd6FaPe0"),
+            "tok Qv9TmKr4LwNb8Hs2Jd6FaPe0"
+        );
+        reset_global();
+    }
+
+    #[test]
+    fn env_registration_scrubs_when_enabled() {
+        let _g = global_lock();
+        reset_global();
+        let n = register_env_secrets_from(
+            true,
+            [
+                ("GITHUB_TOKEN", "ghp_onlyWhenEnabled0123456789"),
+                ("KEYBOARD_LAYOUT", "us-intl-extended-long"),
+            ],
+        );
+        assert_eq!(n, 1, "only the credential-shaped pair registers");
+        let out = scrub("leak ghp_onlyWhenEnabled0123456789 here");
+        assert!(
+            !out.contains("ghp_onlyWhenEnabled0123456789"),
+            "LEAK: {out:?}"
+        );
+        assert!(out.contains("[redacted:env:GITHUB_TOKEN]"), "{out:?}");
+        reset_global();
     }
 
     #[test]
