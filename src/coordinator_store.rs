@@ -147,7 +147,6 @@ pub struct RunResult {
 impl RunResult {
     /// Render the run's own result for display — the done answer, a failure
     /// note, or a still-running status. Mirrors `worker::WorkerJob::fetch`.
-    #[allow(dead_code)] // Public accessor kept for API parity; no call site today.
     pub fn rendered(&self) -> String {
         match self.phase.as_str() {
             "done" => self

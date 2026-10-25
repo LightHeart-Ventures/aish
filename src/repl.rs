@@ -7802,17 +7802,35 @@ fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
     // message, so a typed line RESUMES it instead (relaunch seeded with the
     // prior context + this message; see `resume_coordinator`). A live one is
     // steered via the `:tell` mailbox.
-    let terminal = session
+    let local_terminal = session
         .worker_jobs
         .lock()
         .unwrap()
         .iter()
         .find(|w| w.id == *run_id)
-        .map(|w| matches!(w.status().as_str(), "done" | "failed"))
-        .unwrap_or(false);
-    if terminal {
-        resume_coordinator(run_id, message, session);
-    } else {
+        .map(|w| matches!(w.status().as_str(), "done" | "failed"));
+    match local_terminal {
+        // Tracked in THIS session and finished: relaunch in place.
+        Some(true) => {
+            resume_coordinator(run_id, message, session);
+            return;
+        }
+        // Tracked and live: steer via the mailbox below.
+        Some(false) => {}
+        // NOT tracked here at all — a durable-tail attach to a run owned by
+        // another process (a sub-worker spawned by a coordinator, or a run
+        // from a restarted shell). Its liveness lives in the SHARED STORE,
+        // not `worker_jobs`, so consult the store: a terminal row gets the
+        // same resume treatment a local worker gets (sub-worker parity),
+        // while a live row falls through to the cross-session mailbox.
+        None => {
+            if durable_run_is_terminal(run_id, session) {
+                resume_durable_coordinator(run_id, message, session);
+                return;
+            }
+        }
+    }
+    {
         // A DURABLE-TAIL attach steers across the session boundary: explicitly
         // `:attach`ing a run owned by another process IS the opt-in that
         // `:tell --any` asks for, so pass `any` through rather than letting the
@@ -7826,6 +7844,121 @@ fn send_to_attached(run_id: &str, message: &str, session: &mut Session) {
             .unwrap_or(false);
         tell_coordinator(Some(run_id), message, any, session);
     }
+}
+
+/// Whether a run this session does NOT track locally is TERMINAL
+/// (`done`/`failed`) according to the shared coordinator store. Returns `false`
+/// when there is no store, no matching row, or the row is still live — the
+/// caller then falls through to the cross-session `:tell` mailbox.
+fn durable_run_is_terminal(run_id: &str, session: &Session) -> bool {
+    let Some(store) = session.coordinator_store.clone() else {
+        return false;
+    };
+    let Ok(rows) = store.load_all() else {
+        return false;
+    };
+    rows.iter()
+        .find(|r| r.run_id == run_id)
+        .map(|r| matches!(r.phase.as_str(), "done" | "failed"))
+        .unwrap_or(false)
+}
+
+/// Whether the ACTIVE backend has no usable credential. A resume spawns a real
+/// coordinator process, so both resume paths gate on this first rather than
+/// launching a child that dies on its first turn.
+fn backend_credential_missing(session: &Session) -> bool {
+    match session.backend_kind.as_str() {
+        "grok" => !crate::backend::grok::credential_available(&session.env),
+        "openai" | "openrouter" => {
+            !crate::backend::openai::provider_for_kind(&session.backend_kind)
+                .map(|p| crate::backend::openai::credential_available(p, &session.env))
+                .unwrap_or(false)
+        }
+        _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
+    }
+}
+
+/// The shared "no credential, cannot resume" notice for both resume paths.
+const NO_CREDENTIAL_RESUME: &str = "no credential for the active backend — can't resume (Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY · OpenAI: OPENAI_API_KEY · OpenRouter: OPENROUTER_API_KEY)";
+
+
+/// Resume a TERMINAL coordinator this session does NOT own — the sub-worker
+/// case. `resume_coordinator` can relaunch only a run tracked in
+/// `session.worker_jobs`; a sub-worker (spawned by another coordinator via
+/// `run_in_background`) lives solely in the shared store, so a typed line used
+/// to dead-end. Here we rebuild the SAME resume brief from the durable row
+/// (original task + rendered result + the operator's nudge) and launch it as a
+/// local coordinator, then move the attachment onto the new live run so the
+/// pane keeps following the work.
+fn resume_durable_coordinator(run_id: &str, message: &str, session: &mut Session) {
+    if session.nested {
+        println!("can't resume a coordinator from inside a coordinator");
+        return;
+    }
+    let Some(store) = session.coordinator_store.clone() else {
+        println!("no coordinator store — cannot resume {run_id}");
+        return;
+    };
+    let row = store
+        .load_all()
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|r| r.run_id == run_id));
+    let Some(row) = row else {
+        println!("no durable record for '{run_id}' — nothing to resume (see :workers)");
+        return;
+    };
+    // Nesting-depth / spawn budget guard (TASK-287): a resume is a new
+    // coordinator, so it answers to the same ceiling as any other spawn.
+    if let Err(why) = crate::worker::spawn_budget_gate() {
+        println!("{why}");
+        return;
+    }
+    if backend_credential_missing(session) {
+        println!("{NO_CREDENTIAL_RESUME}");
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        println!("cannot locate the aish binary — resume aborted");
+        return;
+    };
+    // Render the prior answer through the SAME renderer the local path uses
+    // (`RunResult::rendered` mirrors `WorkerJob::fetch`), so a resumed
+    // sub-worker gets a brief byte-identical in shape to a resumed local one.
+    let prior = crate::coordinator_store::RunResult {
+        run_id: run_id.to_string(),
+        phase: row.phase.clone(),
+        result: row.result.clone(),
+        error: row.error.clone(),
+    }
+    .rendered();
+    let prev_short = crate::batch::short_id(run_id);
+    let task = build_resume_task(prev_short, &row.task, &prior, message);
+    let spec = crate::worker::WorkerSpec {
+        exe,
+        cwd: session.cwd.clone(),
+        backend: session.backend_kind.clone(),
+        model: crate::worker::coordinator_model(&session.backend_kind, &session.batch_model),
+        env: session.env.clone(),
+        isolate: false,
+        base: "main".to_string(),
+        launch_session_id: session.session_id.clone(),
+        launch_session_name: session.name.clone(),
+        show_output: session.show_worker_output.clone(),
+        attached: session.attached.clone(),
+        coordinator_store: session.coordinator_store.clone(),
+    };
+    let new_id = crate::worker::spawn(&session.worker_jobs, task, spec);
+    // Follow the resumed work: the old run_id is terminal for good, so bind the
+    // pane to the live local run that continues it.
+    if let Ok(mut g) = session.attached.lock() {
+        *g = Some(new_id.clone());
+    }
+    if let Ok(mut g) = session.attach_review_announced.lock() {
+        *g = None;
+    }
+    println!(
+        "\x1b[1;32m↻ resumed\x1b[0m \x1b[2m{run_id} (terminal) → \x1b[0m\x1b[1m{new_id}\x1b[0m \x1b[2m· attached to the new run\x1b[0m"
+    );
 }
 
 /// When the attached coordinator reaches a terminal state, announce it ONCE and
@@ -7903,19 +8036,8 @@ fn resume_coordinator(prev_run_id: &str, message: &str, session: &mut Session) {
         );
         return;
     };
-    let no_credential = match session.backend_kind.as_str() {
-        "grok" => !crate::backend::grok::credential_available(&session.env),
-        "openai" | "openrouter" => {
-            !crate::backend::openai::provider_for_kind(&session.backend_kind)
-                .map(|p| crate::backend::openai::credential_available(p, &session.env))
-                .unwrap_or(false)
-        }
-        _ => crate::backend::claude::Credential::resolve(&session.env).is_err(),
-    };
-    if no_credential {
-        println!(
-            "no credential for the active backend — can't resume (Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY · OpenAI: OPENAI_API_KEY · OpenRouter: OPENROUTER_API_KEY)"
-        );
+    if backend_credential_missing(session) {
+        println!("{NO_CREDENTIAL_RESUME}");
         return;
     }
     let exe = match std::env::current_exe() {
@@ -8547,7 +8669,17 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
         .collect();
     let (run_id, status) = match matches.as_slice() {
         [] => {
-            println!("no coordinator in this session matching '{target}' (see :workers)");
+            // SUB-WORKER / cross-session fallback — the same resolution
+            // `:attach` already does. A sub-worker spawned by one of our
+            // coordinators has no `WorkerJob` in THIS session (its parent owns
+            // it), so the in-memory lookup alone made `:close w_hf77Xwxq`
+            // unreachable: the operator could see the row in the tray, attach
+            // to it, but never dismiss it. Resolve it from the shared store and
+            // close the SURFACE (tray row + attachment) instead of a record we
+            // never held.
+            if !close_durable_worker(&target, attached.as_deref(), session) {
+                println!("no coordinator in this session matching '{target}' (see :workers)");
+            }
             return;
         }
         [(rid, st)] => (rid.clone(), st.clone()),
@@ -8592,7 +8724,12 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
     // a terminal state and outlived its dwell, which a still-RUNNING closed
     // worker never does from this session's view, so the rows would have
     // outlived the worker indefinitely. No-op when the worker never escalated.
-    let was_pinned = crate::escalation::unpin(&run_id);
+    // `dismiss` (not plain `unpin`) because the tray is REPOPULATED from the
+    // live worker/sub-worker poll every tick: unpinning alone drops the rows
+    // for a frame and the very next sweep pins them straight back, so a closed
+    // worker's banner visibly resurrected. `dismiss` records the id as
+    // operator-dismissed so re-pin is suppressed for good.
+    let was_pinned = crate::escalation::dismiss(&run_id);
 
     // Detach if we just closed the worker we were attached to — and RESTORE the
     // interactive screen exactly the way `:detach` does. Clearing
@@ -8654,6 +8791,102 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
             crate::style::colors_enabled(),
         ));
     }
+}
+
+/// `:close <id>` for a coordinator THIS session does not hold a `WorkerJob`
+/// for — a SUB-WORKER spawned by one of our coordinators (its parent owns the
+/// record), or a run from another session. The operator can SEE those rows in
+/// the tray and can `:attach` to them, so `:close` has to dismiss them too;
+/// before this, the in-memory lookup alone made `:close w_hf77Xwxq` dead-end
+/// with "no coordinator in this session matching …" and left the row pinned
+/// forever (the reported bug).
+///
+/// What we close is the SURFACE, not a record we never held: the tray rows and
+/// the attachment. The sub-worker keeps running under its parent — aish only
+/// stops showing it here. Terminal (`done` / `failed`) sub-workers are closable
+/// for the same reason: the row is the thing the operator wants gone.
+///
+/// Returns `false` when `target` matches nothing we can close, so the caller
+/// can print its "no coordinator …" message unchanged.
+fn close_durable_worker(target: &str, attached: Option<&str>, session: &mut Session) -> bool {
+    // Resolve by exact id or unique prefix — the same affordance `:attach` and
+    // the in-session path give — against the tray, which is where a visible
+    // sub-worker row actually lives.
+    let hit = |id: &String| id == target || id.starts_with(target);
+    let matches: Vec<String> = crate::escalation::tray_order_ids()
+        .into_iter()
+        .filter(hit)
+        .collect();
+    let run_id = match matches.as_slice() {
+        [one] => one.clone(),
+        [] => {
+            // Nothing in the tray. Still honour the close when it's the id we
+            // are ATTACHED to (a durable attach can outlive its tray row), so
+            // the operator is never stranded inside a pane they can't dismiss.
+            match attached.filter(|a| *a == target || a.starts_with(target)) {
+                Some(a) => a.to_string(),
+                None => return false,
+            }
+        }
+        many => {
+            println!(
+                "'{target}' matches {} coordinators — be more specific:",
+                many.len()
+            );
+            for id in many {
+                println!("  {id}");
+            }
+            return true;
+        }
+    };
+
+    // Same teardown as the in-session path, minus the `worker_jobs` record we
+    // never had: suppress the tray rows, disarm auto-resume (so closing can't
+    // drag the operator into an unsolicited "reading finished workers" turn for
+    // a worker they just dismissed), and drop the cached activity summary.
+    let was_pinned = crate::escalation::dismiss(&run_id);
+    if let Ok(mut r) = session.resume.lock() {
+        r.forget(&run_id);
+    }
+    crate::activity_summary::forget_cached(&run_id);
+
+    // Detach with the FULL return-to-interactive sequence (spinner quiesce,
+    // durable tail stop, view teardown, conversation replay) — `:close` is a
+    // strict superset of `:detach`, so clearing the slot alone would leave the
+    // closed worker's pane on screen.
+    if attached == Some(run_id.as_str()) {
+        crate::worker::quiesce_thinking_spinners();
+        *session.attached_durable.lock().unwrap() = None;
+        set_attach_slot(&session.attached, None);
+        *session.attach_review_announced.lock().unwrap() = None;
+        crate::terminal::close_attach_view();
+        backfill_interactive(session);
+    }
+
+    let short = crate::batch::short_id(&run_id);
+    let banner = close_banner(short);
+    let surfaces = if was_pinned {
+        "the worker tray and the Shift-Tab rotation"
+    } else {
+        "the Shift-Tab rotation"
+    };
+    let detail =
+        format!("closed {short} — removed from {surfaces}; it keeps running under its parent.");
+    if let Some(act) = &session.activity_store {
+        let _ = act.record(
+            crate::style::Severity::Info.as_str(),
+            &banner,
+            &detail,
+            "worker",
+        );
+    }
+    if let Ok(mut f) = session.flash.lock() {
+        *f = Some(crate::style::notice_flash(
+            &banner,
+            crate::style::colors_enabled(),
+        ));
+    }
+    true
 }
 
 /// Human-readable `:workers close` / `:close` confirmation for the
