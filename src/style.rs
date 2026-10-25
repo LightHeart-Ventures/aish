@@ -397,6 +397,18 @@ pub fn time_cells(started: Option<i64>, finished: Option<i64>, now: i64) -> (Str
 /// dependency; a coordinator-side test asserts the two stay equal.
 pub const HEARTBEAT_STALE_AFTER_SECS: i64 = 15 * 60;
 
+/// Whether a `coordinator_runs` phase leaves NO live writer behind, so its
+/// heartbeat is frozen BY DESIGN and must render as a quiet `·` age rather than
+/// a `⚠` stale warning. `done`/`failed` are finished; `checkpoint` is parked at
+/// a round cap; `waiting` finished its own turns and exited on purpose while the
+/// sub-workers it spawned keep running. All four have an exited process, so a
+/// stale-beat alarm on them would be a false positive — the row is not hung, it
+/// is simply not beating. Pure, so every surface (`:workers`,
+/// `background_status`, the tray) classifies phases identically.
+pub fn phase_beat_is_frozen(phase: &str) -> bool {
+    matches!(phase, "done" | "failed" | "checkpoint" | "waiting")
+}
+
 /// Freshness cell for a coordinator's last heartbeat — the at-a-glance
 /// "alive-and-quiet vs actually-hung" signal for `background_status` /
 /// `:workers`. `heartbeat_at` is the SQLite UTC string; `terminal` is true for
@@ -1053,6 +1065,24 @@ mod tests {
         assert_eq!(fmt_heartbeat_age(None, false, base), "—");
         assert_eq!(fmt_heartbeat_age(Some("not-a-date"), false, base), "—");
         assert_eq!(fmt_heartbeat_age(Some(beat), false, base - 100), "♥ 0s");
+    }
+
+    #[test]
+    fn frozen_beat_phases_cover_every_exited_writer() {
+        // Finished verdicts.
+        assert!(phase_beat_is_frozen("done"));
+        assert!(phase_beat_is_frozen("failed"));
+        // Parked at a round cap — resumable, but nothing is beating.
+        assert!(phase_beat_is_frozen("checkpoint"));
+        // Exited on purpose with live sub-workers: a `⚠` here would be a false
+        // hang alarm on a row that is behaving exactly as designed.
+        assert!(phase_beat_is_frozen("waiting"));
+        // Anything with a live writer must still be held to the stale threshold.
+        assert!(!phase_beat_is_frozen("running"));
+        assert!(!phase_beat_is_frozen("coordinating"));
+        assert!(!phase_beat_is_frozen("awaiting_batch"));
+        assert!(!phase_beat_is_frozen("orphaned"));
+        assert!(!phase_beat_is_frozen(""));
     }
 
     #[test]

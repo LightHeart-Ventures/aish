@@ -1284,12 +1284,16 @@ fn pad_styled(styled: &str, width: usize) -> String {
 /// state column.
 pub(crate) fn split_status(status: &str) -> (&str, &str) {
     /// The lifecycle words the worker list and the tray itself emit.
-    const STATES: [&str; 8] = [
+    const STATES: [&str; 9] = [
         "queued",
         "pending",
         "running",
         "coordinating",
         "awaiting_batch",
+        // Own turns finished, spawned sub-workers still live (ISS-W1). A real
+        // lifecycle word, so it must peel into the state column like the rest —
+        // otherwise the tray promotes the whole string into the message cell.
+        "waiting",
         "done",
         "failed",
         "stopped",

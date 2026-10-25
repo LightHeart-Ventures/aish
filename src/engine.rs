@@ -1472,7 +1472,11 @@ pub async fn run_coordinator(
     crate::worker::await_launch_handoff(&session.worker_jobs).await;
 
     match outcome.phase {
-        crate::coordinator::Phase::Done => {
+        // `Waiting` prints and exits 0 exactly like `Done`: this coordinator DID
+        // produce its answer — it is only parked because the sub-workers it
+        // spawned are still running (ISS-W1). Treating it as a failure would
+        // make every fan-out parent exit non-zero.
+        crate::coordinator::Phase::Done | crate::coordinator::Phase::Waiting => {
             if let Some(result) = &outcome.result {
                 if session.output_json {
                     println!("{}", crate::json_ok(result));

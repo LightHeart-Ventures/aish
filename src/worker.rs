@@ -3448,7 +3448,13 @@ fn phase_needs_reconcile(phase: &str) -> bool {
     // — a parked, resumable run — so the parent must NOT flip it to `done` when
     // the (successfully-exiting) child process is reaped. Treat it as terminal
     // alongside `done`/`failed`.
-    !matches!(phase, "done" | "failed" | "checkpoint")
+    // `waiting` (ISS-W1) is likewise the child's own authoritative verdict: it
+    // finished its turns but the sub-workers IT spawned are still live, so the
+    // child process exits on purpose with a non-terminal row. Reconciling it
+    // would flip the parent-visible state straight back to a premature `done`
+    // (or `failed`), which is exactly the bug `waiting` exists to fix. The row
+    // is settled by whichever child finishes LAST, not by this parent.
+    !matches!(phase, "done" | "failed" | "checkpoint" | "waiting")
 }
 
 impl WorkerJob {
@@ -5454,6 +5460,9 @@ for operator after 4 auto-recovery attempt(s)";
         // Child's own authoritative verdict — parent must NOT overwrite.
         assert!(!phase_needs_reconcile("done"));
         assert!(!phase_needs_reconcile("failed"));
+        // ISS-W1: parked on live sub-workers — the child exited on purpose with
+        // a non-terminal row, and the LAST child settles it, not the parent.
+        assert!(!phase_needs_reconcile("waiting"));
         // Orphaned mid-flight phases the dead child never finalized — the stale
         // "coordinating" row the operator saw for w_zrdvGyJC. Parent reconciles.
         assert!(phase_needs_reconcile("coordinating"));

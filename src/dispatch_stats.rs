@@ -172,6 +172,17 @@ pub fn summarize(rows: &[&CoordinatorRow]) -> DispatchStats {
                 st.awaiting_batch += 1;
                 false
             }
+            // `waiting` (ISS-W1) is in-flight, not finished: the parent's own
+            // turns are over but the sub-workers it spawned are still burning
+            // tokens, so the dispatch is still outstanding. Counting it as
+            // `done` would be the very lie the phase exists to prevent, and
+            // its latency isn't knowable until the subtree settles — so no
+            // terminal timing sample either. Explicit arm rather than falling
+            // into `_` so the intent is on the record.
+            "waiting" => {
+                st.running += 1;
+                false
+            }
             _ => {
                 // "coordinating" and any unknown phase count as in-flight.
                 st.running += 1;

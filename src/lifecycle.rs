@@ -69,6 +69,11 @@ pub enum LifecycleState {
     /// maps to `Phase::Checkpoint`). Resumable, unlike a soft-fail which is a
     /// stumble rather than a planned stop.
     Checkpoint,
+    /// Non-terminal: this coordinator finished its own turns but the sub-workers
+    /// it spawned are still running (maps to `Phase::Waiting`). The delegated
+    /// work isn't done, so the run is NOT `Done` — the last child to settle
+    /// moves it on.
+    Waiting,
     /// Terminal: the task completed and a final answer was produced.
     Done,
     /// Terminal: the run failed — auto-recovery was exhausted and the operator
@@ -79,12 +84,13 @@ pub enum LifecycleState {
 impl LifecycleState {
     /// Every state, in canonical (roughly lifecycle) order. Used to build and
     /// validate the table and to render the diagram.
-    pub const ALL: [LifecycleState; 7] = [
+    pub const ALL: [LifecycleState; 8] = [
         LifecycleState::Spawned,
         LifecycleState::Running,
         LifecycleState::AwaitingBatch,
         LifecycleState::SoftFailed,
         LifecycleState::Checkpoint,
+        LifecycleState::Waiting,
         LifecycleState::Done,
         LifecycleState::Failed,
     ];
@@ -97,6 +103,7 @@ impl LifecycleState {
             LifecycleState::AwaitingBatch => "awaiting_batch",
             LifecycleState::SoftFailed => "soft_failed",
             LifecycleState::Checkpoint => "checkpoint",
+            LifecycleState::Waiting => "waiting",
             LifecycleState::Done => "done",
             LifecycleState::Failed => "failed",
         }
@@ -121,6 +128,7 @@ impl LifecycleState {
             Phase::Coordinating => LifecycleState::Running,
             Phase::AwaitingBatch => LifecycleState::AwaitingBatch,
             Phase::Checkpoint => LifecycleState::Checkpoint,
+            Phase::Waiting => LifecycleState::Waiting,
             Phase::Done => LifecycleState::Done,
             Phase::Failed => LifecycleState::Failed,
         }
@@ -132,6 +140,7 @@ impl LifecycleState {
     pub fn from_worker_status(status: &str) -> Option<LifecycleState> {
         match status {
             "running" => Some(LifecycleState::Running),
+            "waiting" => Some(LifecycleState::Waiting),
             "done" => Some(LifecycleState::Done),
             "failed" => Some(LifecycleState::Failed),
             _ => None,
@@ -170,6 +179,11 @@ pub enum LifecycleEvent {
     Pause,
     /// Resume from a checkpoint (`Checkpoint → Running`).
     Resume,
+    /// The coordinator finished its own turns while sub-workers it spawned are
+    /// still running (`Running → Waiting`).
+    AwaitChildren,
+    /// The last awaited sub-worker settled (`Waiting → Done`).
+    ChildrenSettled,
     /// Normal completion (`Running → Done`).
     Complete,
     /// Unrecoverable failure straight from work / batch-wait (`* → Failed`).
@@ -178,7 +192,7 @@ pub enum LifecycleEvent {
 
 impl LifecycleEvent {
     /// Every event, for table validation and the diagram legend.
-    pub const ALL: [LifecycleEvent; 10] = [
+    pub const ALL: [LifecycleEvent; 12] = [
         LifecycleEvent::Start,
         LifecycleEvent::BatchSpawned,
         LifecycleEvent::BatchSettled,
@@ -187,6 +201,8 @@ impl LifecycleEvent {
         LifecycleEvent::Flag,
         LifecycleEvent::Pause,
         LifecycleEvent::Resume,
+        LifecycleEvent::AwaitChildren,
+        LifecycleEvent::ChildrenSettled,
         LifecycleEvent::Complete,
         LifecycleEvent::Fail,
     ];
@@ -202,6 +218,8 @@ impl LifecycleEvent {
             LifecycleEvent::Flag => "flag",
             LifecycleEvent::Pause => "pause",
             LifecycleEvent::Resume => "resume",
+            LifecycleEvent::AwaitChildren => "await_children",
+            LifecycleEvent::ChildrenSettled => "children_settled",
             LifecycleEvent::Complete => "complete",
             LifecycleEvent::Fail => "fail",
         }
@@ -364,10 +382,15 @@ impl TransitionTable {
             // deliberate resumable pause
             t(S::Running, E::Pause, S::Checkpoint),
             t(S::Checkpoint, E::Resume, S::Running),
+            // sub-worker fan-out: own turns finished, children still running
+            t(S::Running, E::AwaitChildren, S::Waiting),
+            t(S::Waiting, E::ChildrenSettled, S::Done),
+            t(S::Waiting, E::Resume, S::Running),
             // terminal exits
             t(S::Running, E::Complete, S::Done),
             t(S::Running, E::Fail, S::Failed),
             t(S::AwaitingBatch, E::Fail, S::Failed),
+            t(S::Waiting, E::Fail, S::Failed),
         ];
         TransitionTable::build(
             LifecycleState::ALL.to_vec(),
@@ -470,9 +493,9 @@ mod tests {
     fn canonical_table_is_valid() {
         // The shipped machine passes every validity check.
         let table = TransitionTable::canonical();
-        assert_eq!(table.states().len(), 7);
-        assert_eq!(table.events().len(), 10);
-        assert_eq!(table.transitions().len(), 11);
+        assert_eq!(table.states().len(), 8);
+        assert_eq!(table.events().len(), 12);
+        assert_eq!(table.transitions().len(), 15);
     }
 
     #[test]
