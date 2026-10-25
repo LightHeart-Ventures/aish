@@ -689,18 +689,63 @@ pub fn input_highlight_bg() -> String {
         .unwrap_or_else(|| INPUT_HIGHLIGHT_BG.to_string())
 }
 
-/// The three transcript lines that record one submitted input: a padding row
-/// above, the `prompt + line` echo, and a padding row below — ALL THREE painted
-/// edge to edge with the band BACKGROUND, so the highlight is one solid,
-/// contiguous rectangle.
+/// Reverse video — swaps the cell's foreground and background at render time.
+/// The band's half-height pads lean on it: see [`band_half_row`].
+pub const REVERSE: &str = "\x1b[7m";
+/// Default background — `ESC[49m`. Paired with [`REVERSE`] it is how you name
+/// "whatever colour this terminal's background actually is" as a FOREGROUND.
+pub const DEFAULT_BG: &str = "\x1b[49m";
+
+/// Upper half block — covers the TOP half of a cell. Knocked out on the pad row
+/// ABOVE the echo, so the half that remains band-coloured is the BOTTOM one,
+/// hugging the echo.
+pub const BAND_UPPER_HALF: char = '\u{2580}'; // ▀
+/// Lower half block — covers the BOTTOM half of a cell. Knocked out on the pad
+/// row BELOW the echo, leaving the TOP half band-coloured and hugging the echo.
+pub const BAND_LOWER_HALF: char = '\u{2584}'; // ▄
+
+/// Re-aim an xterm-256 BACKGROUND SGR (`ESC[48;5;N m`) at the FOREGROUND
+/// (`ESC[38;5;N m`). Under [`REVERSE`] that foreground becomes the cell's
+/// effective BACKGROUND, which is the whole point. Anything that isn't a
+/// 256-color bg is handed back unchanged (degrade, never mangle).
+pub fn band_fg_from_bg(bg: &str) -> String {
+    if bg.contains("48;5;") {
+        bg.replacen("48;5;", "38;5;", 1)
+    } else {
+        bg.to_string()
+    }
+}
+
+/// One HALF-HEIGHT band row: `cols` of `glyph` where the band shade is the
+/// cell's effective BACKGROUND and the half-block is drawn in the TERMINAL's
+/// own background colour — a knockout, not a paint.
 ///
-/// The padding rows used to be `▄` / `▀` half-block GLYPHS drawn in the band
-/// shade as a foreground color, to get a thinner "lip". That can't be made
-/// contiguous: a glyph only covers what the font draws, and with any terminal
-/// line spacing above 1.0 (or a font whose block elements don't fill the full
-/// cell height) a dark seam opens between the echo row's background and the
-/// glyph — the band read as "highlighted line, gap, thin strip". Cell
-/// backgrounds always tile flush, so every row here is a background fill.
+/// This inversion is the whole trick. The obvious way round (half-block as a
+/// FOREGROUND in the band shade, cell background left default — what #1052
+/// shipped) cannot be made contiguous: a glyph only covers what the font
+/// draws, so with terminal line spacing above 1.0 a dark seam opens between
+/// the echo row's background and the glyph. Here the band half is a cell
+/// BACKGROUND, and backgrounds always tile flush into the line-spacing gap, so
+/// the pad fuses with the echo row. A font whose half-block misses the exact
+/// midpoint now only makes the lip a pixel taller or shorter — it can no
+/// longer open a gap.
+pub fn band_half_row(glyph: char, cols: usize, bg: &str) -> String {
+    let fg = band_fg_from_bg(bg);
+    format!(
+        "{fg}{DEFAULT_BG}{REVERSE}{}{RESET}",
+        glyph.to_string().repeat(cols)
+    )
+}
+
+/// The three transcript lines that record one submitted input: a HALF-height
+/// pad above, the `prompt + line` echo painted edge to edge, and a HALF-height
+/// pad below. The pads are reverse-video half blocks ([`band_half_row`]), so
+/// only the half of each cell that TOUCHES the echo carries the band — the
+/// highlight reads as one contiguous shape with a thin lip above and below
+/// rather than three full rows of grey.
+///
+/// Row count stays 3 either way, so `terminal::unpark_input_row`'s `BODY_ROW`
+/// math is untouched.
 ///
 /// Pure form: the caller decides color and shade, so the layout is
 /// unit-testable without a TTY. Embedded resets inside `echo` are re-armed with
@@ -711,9 +756,9 @@ pub fn input_echo_block_with(echo: &str, cols: usize, color_on: bool, bg: &str) 
         return vec![String::new(), echo.to_string(), String::new()];
     }
     vec![
-        band_row("", cols, bg),
+        band_half_row(BAND_UPPER_HALF, cols, bg),
         band_row(echo, cols, bg),
-        band_row("", cols, bg),
+        band_half_row(BAND_LOWER_HALF, cols, bg),
     ]
 }
 
@@ -1478,25 +1523,53 @@ Watch for this condition and call the `set_alert` tool with alert_id=7 …";
     }
 
     #[test]
-    fn input_echo_block_is_one_contiguous_background_band() {
+    fn input_echo_block_pads_are_half_height_and_hug_the_echo() {
         let block = input_echo_block_with("❯ :jobs", 20, true, "\x1b[48;5;237m");
         assert_eq!(block.len(), 3, "pad + echo + pad");
-        // Every row is a BACKGROUND fill spanning the full width — no glyph
-        // tricks — so the band tiles flush with no seam between rows.
+        // Every row still spans the full width and closes its own SGR.
         for row in &block {
-            assert!(row.starts_with("\x1b[48;5;237m"), "bg armed: {row:?}");
             assert!(row.ends_with(RESET), "row reset: {row:?}");
             assert_eq!(visible_cols(row), 20, "row spans cols: {row:?}");
-            assert!(
-                !row.contains('▄') && !row.contains('▀'),
-                "no half blocks: {row:?}"
-            );
-            assert!(!row.contains("38;5;"), "no fg-drawn band: {row:?}");
         }
+        // The echo itself is a full-height background fill.
+        assert!(
+            block[1].starts_with("\x1b[48;5;237m"),
+            "echo bg: {:?}",
+            block[1]
+        );
         assert!(block[1].contains("❯ :jobs"));
+        // The pads are HALF height, and the half that carries the band is the
+        // one facing the echo: upper block knocked out above, lower below.
+        assert_eq!(block[0].matches('▀').count(), 20, "top pad: {:?}", block[0]);
+        assert_eq!(
+            block[2].matches('▄').count(),
+            20,
+            "bottom pad: {:?}",
+            block[2]
+        );
+        assert!(!block[0].contains('▄'), "top pad knocks out the UPPER half");
+        assert!(
+            !block[2].contains('▀'),
+            "bottom pad knocks out the LOWER half"
+        );
+        // Contiguity: the band half is a cell BACKGROUND (reverse video turns
+        // the shade into the bg and the glyph into the terminal's own bg), NOT
+        // a foreground paint — that is what tiles flush into the line-spacing
+        // gap instead of leaving the #1052 seam.
         for row in [&block[0], &block[2]] {
+            assert!(row.contains(REVERSE), "reverse-video knockout: {row:?}");
+            assert!(row.contains("\x1b[38;5;237m"), "shade aimed at fg: {row:?}");
+            assert!(row.contains(DEFAULT_BG), "glyph in terminal bg: {row:?}");
             assert!(!row.contains(':'), "padding is textless: {row:?}");
         }
+    }
+
+    #[test]
+    fn band_fg_from_bg_reaims_256_colour_and_passes_others_through() {
+        assert_eq!(band_fg_from_bg("\x1b[48;5;237m"), "\x1b[38;5;237m");
+        assert_eq!(band_fg_from_bg("\x1b[48;5;250m"), "\x1b[38;5;250m");
+        // Not a 256-colour bg: handed back untouched rather than corrupted.
+        assert_eq!(band_fg_from_bg("\x1b[44m"), "\x1b[44m");
     }
 
     #[test]
