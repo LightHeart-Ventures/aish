@@ -2627,6 +2627,13 @@ fn refresh_escalation_status_from(
             )
         })
         .collect();
+    // Which durable row each tray row's HEART should read, captured before the
+    // snapshot is consumed below. See [`beat_targets`] for why the visible id is
+    // the wrong key.
+    let threads: Vec<(String, String)> = snapshot
+        .iter()
+        .map(|(id, _, run_id, _)| (id.clone(), run_id.clone()))
+        .collect();
     for (id, status, run_id, last) in snapshot {
         // Prefer the lightweight ACTIVITY SUMMARY (see `crate::activity_summary`):
         // one model-written status-line-sized sentence saying what the worker is
@@ -2666,7 +2673,43 @@ fn refresh_escalation_status_from(
     // Re-read the ids: the pass above may have pinned fresh sub-worker rows, and
     // each needs its heart fed in the SAME pass or it paints hollow ("no
     // liveness claim") until the next poll window opens.
-    refresh_escalation_beats(store, &crate::escalation::pinned_ids());
+    refresh_escalation_beats(
+        store,
+        &beat_targets(&crate::escalation::pinned_ids(), &threads),
+    );
+}
+
+/// Pair every pinned tray id with the durable `coordinator_runs` row whose
+/// heartbeat its heart should read: `(pinned_id, beat_run_id)`.
+///
+/// A tray row is keyed on the worker's VISIBLE id, which is stable for the life
+/// of the worker — but the durable heartbeat is keyed per THREAD. An in-place
+/// resume ([`crate::worker::resume_in_place`]) mints a fresh coordinator
+/// `run_id` for the new thread while deliberately re-pinning under the same
+/// visible id, so the visible id's row is the FIRST thread's — terminal, and
+/// never beating again. Feeding the heart from it painted a live-looking heart
+/// (the re-pin clears the terminal verdict and restarts the clock) that aged to
+/// red minutes after a perfectly healthy resume: the reported bug.
+///
+/// So root rows resolve through `WorkerJob::run_id()` — the thread running RIGHT
+/// NOW. Every other pinned id falls back to ITSELF, which is correct for the two
+/// other row kinds: a sub-worker row is pinned under its own durable `run_id`
+/// (it has no `WorkerJob`), and an un-resumed worker's `run_id` equals its
+/// visible id anyway. A just-resumed thread whose child has not yet inserted its
+/// row reads back `None` → hollow `♡` ("no liveness claim") for a beat or two,
+/// which is the honest answer rather than the previous thread's fossil.
+fn beat_targets(pinned: &[String], threads: &[(String, String)]) -> Vec<(String, String)> {
+    pinned
+        .iter()
+        .map(|id| {
+            let run_id = threads
+                .iter()
+                .find(|(worker_id, _)| worker_id == id)
+                .map(|(_, run_id)| run_id.as_str())
+                .unwrap_or(id.as_str());
+            (id.clone(), run_id.to_string())
+        })
+        .collect()
 }
 
 /// Discover and refresh the tray's SUB-WORKER rows: coordinators spawned BY a
@@ -2829,7 +2872,14 @@ fn subworker_is_live(
 /// Failure-tolerant by construction: no store (ephemeral session) or no row for
 /// an id leaves that banner's beat `None`, which renders the hollow `♡` — "no
 /// liveness claim" — instead of a green heart we have no evidence for.
-fn refresh_escalation_beats(store: Option<&crate::db::CoordinatorStore>, ids: &[String]) {
+///
+/// `targets` are `(pinned_id, beat_run_id)` pairs from [`beat_targets`]: the row
+/// is UPDATED by its pinned id but READ by its current thread's `run_id`, which
+/// differ for a resumed worker.
+fn refresh_escalation_beats(
+    store: Option<&crate::db::CoordinatorStore>,
+    targets: &[(String, String)],
+) {
     const BEAT_POLL: std::time::Duration = std::time::Duration::from_secs(3);
     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
@@ -2840,8 +2890,8 @@ fn refresh_escalation_beats(store: Option<&crate::db::CoordinatorStore>, ids: &[
     *last = Some(std::time::Instant::now());
     drop(last);
 
-    for id in ids {
-        let beat = store.and_then(|s| s.heartbeat_unix(id));
+    for (id, run_id) in targets {
+        let beat = store.and_then(|s| s.heartbeat_unix(run_id));
         crate::escalation::set_beat(id, beat);
     }
 }
@@ -12959,6 +13009,55 @@ mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
     use std::collections::HashMap;
+
+    // ---- tray hearts read the CURRENT thread's durable row ----------------
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn resumed_worker_heart_reads_its_current_thread_not_the_visible_id() {
+        // `w_5RN6BgsW` was resumed twice; the live thread is `w_3ylrNA05`. The
+        // visible id's own row is thread 1's — terminal since 16:24 and never
+        // beating again — so keying the heart on it ages a healthy worker to red.
+        let targets = beat_targets(&[s("w_5RN6BgsW")], &[(s("w_5RN6BgsW"), s("w_3ylrNA05"))]);
+        assert_eq!(
+            targets,
+            vec![(s("w_5RN6BgsW"), s("w_3ylrNA05"))],
+            "the row paints under its visible id but must READ the live thread"
+        );
+    }
+
+    #[test]
+    fn unresumed_and_subworker_rows_keep_reading_their_own_row() {
+        // An un-resumed worker's run_id IS its visible id, and a sub-worker row
+        // has no `WorkerJob` at all (it's pinned straight from the durable
+        // table) — both must fall back to themselves, not drop out.
+        let targets = beat_targets(
+            &[s("w_live"), s("w_subchild")],
+            &[(s("w_live"), s("w_live"))],
+        );
+        assert_eq!(
+            targets,
+            vec![
+                (s("w_live"), s("w_live")),
+                (s("w_subchild"), s("w_subchild")),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_pinned_row_gets_exactly_one_beat_target() {
+        // No pinned id may be silently dropped: a missing target means a banner
+        // whose heart never updates, which is the bug class this guards.
+        let pinned = [s("a"), s("b"), s("c")];
+        let targets = beat_targets(&pinned, &[(s("b"), s("b_thread2"))]);
+        assert_eq!(targets.len(), pinned.len());
+        for (i, id) in pinned.iter().enumerate() {
+            assert_eq!(&targets[i].0, id, "order and coverage must be preserved");
+        }
+    }
 
     // ---- confirm prompt: only the advertised keys count --------------------
 
