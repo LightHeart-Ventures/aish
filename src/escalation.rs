@@ -677,6 +677,32 @@ pub fn pinned_ids() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every pinned coordinator's run id in the tray's own PAINT order — the TOP
+/// painted row first, walking DOWN to the row nearest the prompt. Identical
+/// ordering to [`rows`] (phase-grouped, newest-first, each parent immediately
+/// followed by its sub-workers), minus the visible-rows truncation: hidden
+/// overflow rows stay in the list so a caller mapping ids to tray position never
+/// loses one.
+///
+/// Shift-Tab's rotation is built off this (reversed) so the cycle walks UP the
+/// tray from the bottom row instead of guessing at spawn order — the tray is
+/// what the operator is actually looking at.
+///
+/// Queued rows are omitted — there is no worker behind them to attach to.
+pub fn tray_order_ids() -> Vec<String> {
+    BANNERS
+        .lock()
+        .map(|banners| {
+            ordered_rows(&banners)
+                .into_iter()
+                .map(|(idx, _)| &banners[idx])
+                .filter(|b| b.kind == Kind::Escalation)
+                .map(|b| b.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Which LIFECYCLE PHASE a tray row sorts into.
 ///
 /// The tray groups before it sorts, because arrival order alone buries the row
