@@ -68,6 +68,17 @@ pub enum AlertKind {
         /// Optional stdout substring that must be present for a fire.
         expect: Option<String>,
     },
+    /// Fire when a background coordinator/worker run reaches a terminal phase
+    /// (done / failed / orphaned). Probed token-free against the coordinator
+    /// store on the presenter tick, so "let me know when w_xxxx is done" never
+    /// degrades to a semantic monitor that only resolves while a turn is active.
+    WorkerDone {
+        run_id: String,
+        /// Optional human label for the banner (falls back to `run_id`).
+        #[serde(default)]
+        label: String,
+    },
+
     /// A free-text condition no local probe can decide. Delegated to a
     /// background coordinator that resolves it and fires via `set_alert`.
     Semantic { description: String },
@@ -94,10 +105,81 @@ impl AlertKind {
         match self {
             AlertKind::FileChange { .. } => "file",
             AlertKind::Command { .. } => "command",
+            AlertKind::WorkerDone { .. } => "worker",
             AlertKind::Semantic { .. } => "semantic",
         }
     }
 }
+
+/// Pull a background worker/coordinator run id (`w_<alnum>`) out of a free-text
+/// condition. This is what makes "watch it, let me know when it's done" armable
+/// as a NATIVE monitor: the agent includes the run id it is watching.
+pub fn worker_run_id(condition: &str) -> Option<String> {
+    condition
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .find(|t| t.len() > 3 && t.starts_with("w_") && t[2..].chars().all(char::is_alphanumeric))
+        .map(str::to_string)
+}
+
+/// A terminal-state probe for background coordinators/workers. Lets an alert
+/// watch a worker token-free instead of falling back to a semantic monitor that
+/// only resolves while a turn is active. Implemented by `CoordinatorStore`
+/// (kept here so the trait and its only impl stay adjacent).
+pub trait WorkerProbe {
+    /// `Some((phase, summary))` once `run_id` is terminal (done/failed/
+    /// orphaned); `None` while it still runs or is unknown.
+    fn finished(&self, run_id: &str) -> Option<(String, String)>;
+}
+
+impl WorkerProbe for crate::coordinator_store::CoordinatorStore {
+    fn finished(&self, run_id: &str) -> Option<(String, String)> {
+        let r = self.result_for_run(run_id).ok().flatten()?;
+        if !matches!(r.phase.as_str(), "done" | "failed" | "orphaned") {
+            return None;
+        }
+        let summary = match (&r.error, &r.result) {
+            (Some(e), _) if !e.trim().is_empty() => e.clone(),
+            (_, Some(res)) => res.clone(),
+            _ => String::new(),
+        };
+        Some((r.phase.clone(), summary))
+    }
+}
+
+/// Evaluate a [`AlertKind::WorkerDone`] monitor: one keyed row read per tick,
+/// zero tokens. Returns `None` while the worker is still running.
+pub fn poll_worker(alert: &Alert, probe: &dyn WorkerProbe) -> Option<Fired> {
+    let AlertKind::WorkerDone { run_id, label } = &alert.kind else {
+        return None;
+    };
+    let (phase, summary) = probe.finished(run_id)?;
+    let who = if label.trim().is_empty() {
+        run_id.as_str()
+    } else {
+        label.as_str()
+    };
+    let verb = match phase.as_str() {
+        "done" => "finished",
+        "failed" => "FAILED",
+        _ => "was orphaned",
+    };
+    let first = summary
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(160)
+        .collect::<String>();
+    let short = format!("worker {who} {verb}");
+    let detail = if first.is_empty() {
+        format!("⏰ alert #{}: worker {who} {verb}.", alert.id)
+    } else {
+        format!("⏰ alert #{}: worker {who} {verb} — {first}", alert.id)
+    };
+    Some(Fired { detail, short })
+}
+
 
 /// An armed alert. `condition` is the operator's raw request, preserved verbatim
 /// for display and for a delegated coordinator's task.
@@ -365,6 +447,15 @@ fn dirs_home() -> Option<PathBuf> {
 /// question `gh` or `stat` can answer, so the probes are deliberately broad on
 /// phrasing and strict on what counts as a PR number or a path.
 pub fn parse_condition(condition: &str) -> AlertKind {
+    // A worker/coordinator run id in the text is probeable locally — prefer it
+    // over every other strategy so watching a worker is native, not semantic.
+    if let Some(run_id) = worker_run_id(condition) {
+        return AlertKind::WorkerDone {
+            run_id,
+            label: String::new(),
+        };
+    }
+
     let lower = condition.to_lowercase();
 
     // 1) PR state probe. Merge cues accept a bare "#412"; close cues demand the
@@ -424,6 +515,8 @@ pub fn parse_condition(condition: &str) -> AlertKind {
 /// `last_checked` afterwards.
 pub fn poll(alert: &Alert) -> Option<Fired> {
     match &alert.kind {
+        // Needs the coordinator store — evaluated by `poll_worker` instead.
+        AlertKind::WorkerDone { .. } => None,
         AlertKind::FileChange {
             path,
             baseline_mtime,
