@@ -8392,6 +8392,15 @@ them by review age\nthen file a report";
         },
         // ── reads must stay unprompted (no false-positive regression) ──
         GateCase {
+            // Baseline control: a plainly read-only program must never prompt
+            // in ANY mode. If this row ever flips, the harness is over-gating.
+            name: "cat baseline read",
+            program: "cat",
+            args: &["/etc/hostname"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
             name: "ls read",
             program: "ls",
             args: &["-la"],
