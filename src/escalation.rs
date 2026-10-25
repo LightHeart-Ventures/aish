@@ -457,6 +457,11 @@ pub fn take_dirty() -> bool {
 /// including while the operator edits the separate input row. Lock order is
 /// `FOOTER_PAINT` → `BANNERS`, so this wrapper runs outside the banner lock.
 pub fn pin(id: &str, task: &str) {
+    // An explicit pin is an operator-driven action (escalate / attach / retry),
+    // so it CLEARS any earlier `:close` for this id — otherwise a dismissal
+    // would blacklist the worker for the life of the process and a resumed run
+    // could never show up again.
+    undismiss(id);
     crate::terminal::repaint_escalation_around(|| push_banner(id, task));
 }
 
@@ -488,6 +493,12 @@ fn push_banner(id: &str, task: &str) {
 }
 
 fn push_banner_inner(id: &str, task: &str, parent: Option<&str>, age_ms: u64) {
+    // A `:close`d row stays closed. The poll that discovers sub-workers calls
+    // [`pin_sub`] on every tick, so without this gate the row the operator just
+    // dismissed would be re-inserted on the next pass.
+    if is_dismissed(id, parent) {
+        return;
+    }
     let Ok(mut banners) = BANNERS.lock() else {
         return;
     };
@@ -645,6 +656,11 @@ pub fn pin_subwork(parent: &str, key: &str, label: &str, status: &str) {
 /// all): it clears this parent's ledger rows and touches nothing else, so the
 /// sub-WORKER rows fed by [`pin_sub`] are undisturbed.
 pub fn sync_subwork(parent: &str, items: &[SubWorkRow]) {
+    // Ledger rows belong to the parent's banner; if the operator closed that
+    // worker, its sub-work must not keep repopulating the tray.
+    if is_dismissed(parent, None) {
+        return;
+    }
     let prefix = format!("sw:{parent}:");
     let stale: Vec<String> = {
         let Ok(banners) = BANNERS.lock() else {
@@ -796,9 +812,76 @@ pub fn unpin(id: &str) -> bool {
             return false;
         };
         let before = banners.len();
-        banners.retain(|b| !(b.kind == Kind::Escalation && b.id == id));
+        // Remove the WHOLE subtree, not just the head row: a closed coordinator's
+        // `↳` sub-worker rows (`parent == id`) and its sub-WORK ledger rows
+        // (`sw:{id}:…`) are rendered as that worker's own work, so leaving them
+        // animating under a worker the operator just dismissed is the same bug
+        // one level down.
+        let sw_prefix = format!("sw:{id}:");
+        banners.retain(|b| {
+            !(b.id == id
+                || b.parent.as_deref() == Some(id)
+                || (b.kind == Kind::SubWork && b.id.starts_with(&sw_prefix)))
+        });
         banners.len() != before
     })
+}
+
+/// Ids the operator explicitly `:close`d — dismissal has to STICK.
+///
+/// [`unpin`] alone can't hold a sub-worker closed: sub-worker rows are
+/// discovered by POLLING the durable `coordinator_runs` table, so the very next
+/// REPL poll calls [`pin_sub`] for the same child and the row the operator just
+/// closed reappears a beat later (the reported "can't `:close` a sub-worker"
+/// bug). Recording the dismissal here and gating every pin on it makes `:close`
+/// terminal for sub-workers and ledger rows exactly as it already is for a
+/// top-level escalation, whose record `:close` also drops from `session`.
+///
+/// `BTreeSet` rather than `HashSet` so the store can be a plain `static`
+/// (`HashSet::new` isn't const). Grows only with operator `:close`s, so it needs
+/// no eviction.
+static DISMISSED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Has `id` — or the parent it hangs under — been dismissed?
+///
+/// Parent-scoped on purpose: closing a coordinator closes the sub-worker and
+/// sub-work rows it owns, so a poll that re-discovers the children of a closed
+/// parent can't re-pin them under a head row that is gone.
+fn is_dismissed(id: &str, parent: Option<&str>) -> bool {
+    let Ok(dismissed) = DISMISSED.lock() else {
+        return false;
+    };
+    if dismissed.contains(id) {
+        return true;
+    }
+    if parent.is_some_and(|p| dismissed.contains(p)) {
+        return true;
+    }
+    // Ledger rows are keyed `sw:{parent}:{item}` and carry no `parent` field.
+    id.strip_prefix("sw:")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(parent, _)| dismissed.contains(parent))
+}
+
+/// `:close` a tray row for good: record the dismissal, then drop the row and
+/// everything rendered beneath it. Returns whether a banner was actually there,
+/// so the caller can avoid claiming it touched a tray that was empty for this
+/// worker.
+pub fn dismiss(id: &str) -> bool {
+    if let Ok(mut dismissed) = DISMISSED.lock() {
+        dismissed.insert(id.to_string());
+    }
+    unpin(id)
+}
+
+/// Undo a dismissal — the operator re-attached to (or re-dispatched) this id and
+/// wants to see it again. Without this, `:close` would permanently blacklist an
+/// id for the life of the process, so a resumed worker could never re-pin.
+pub fn undismiss(id: &str) {
+    if let Ok(mut dismissed) = DISMISSED.lock() {
+        dismissed.remove(id);
+    }
 }
 
 /// Retire EVERY banner (the footer shrinks back on the next paint).
