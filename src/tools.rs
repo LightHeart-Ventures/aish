@@ -1834,12 +1834,32 @@ enum Wrapped {
     Opaque,
 }
 
-/// Per-wrapper argv shape: flags that consume a separate value token, and how
-/// many positional tokens precede the wrapped command (`timeout`'s DURATION,
-/// `ssh`'s `[user@]host`).
-fn wrapper_flag_shape(bin: &str) -> (&'static [&'static str], usize) {
+/// Per-wrapper argv shape: flags that consume a SEPARATE value token, flags
+/// that are self-contained (booleans), and how many positional tokens precede
+/// the wrapped command (`timeout`'s DURATION, `ssh`'s `[user@]host`).
+///
+/// The boolean set is load-bearing for the fail-closed rule: a dash-prefixed
+/// token in NEITHER set means the argv is one we do not understand, so
+/// `resolve_wrapper` refuses to guess where the wrapped command begins.
+type WrapperShape = (&'static [&'static str], &'static [&'static str], usize);
+
+fn wrapper_flag_shape(bin: &str) -> WrapperShape {
     match bin {
-        "env" => (&["-u", "--unset", "-C", "--chdir"], 0),
+        "env" => (
+            &["-u", "--unset", "-C", "--chdir"],
+            &[
+                "-",
+                "-i",
+                "--ignore-environment",
+                "-0",
+                "--null",
+                "-v",
+                "--debug",
+                "--help",
+                "--version",
+            ],
+            0,
+        ),
         "xargs" => (
             &[
                 "-n",
@@ -1860,15 +1880,131 @@ fn wrapper_flag_shape(bin: &str) -> (&'static [&'static str], usize) {
                 "--max-chars",
                 "-L",
                 "-l",
+                "-J",
+                "-R",
+            ],
+            &[
+                "-0",
+                "--null",
+                "-t",
+                "--verbose",
+                "-p",
+                "--interactive",
+                "-r",
+                "--no-run-if-empty",
+                "-x",
+                "--exit",
+                "-o",
+                "--open-tty",
+                "--help",
+                "--version",
             ],
             0,
         ),
-        "timeout" => (&["-s", "--signal", "-k", "--kill-after"], 1),
-        "nice" | "ionice" => (&["-n", "--adjustment", "-c", "-p"], 0),
-        "stdbuf" => (&["-i", "--input", "-o", "--output", "-e", "--error"], 0),
-        "watch" => (&["-n", "--interval"], 0),
+        "timeout" => (
+            &["-s", "--signal", "-k", "--kill-after"],
+            &[
+                "-f",
+                "--foreground",
+                "-p",
+                "--preserve-status",
+                "-v",
+                "--verbose",
+                "--help",
+                "--version",
+            ],
+            1,
+        ),
+        "nice" | "ionice" => (
+            &["-n", "--adjustment", "-c", "-p"],
+            &["-t", "--ignore", "-h", "--help", "--version"],
+            0,
+        ),
+        "stdbuf" => (
+            &["-i", "--input", "-o", "--output", "-e", "--error"],
+            &["--help", "--version"],
+            0,
+        ),
+        "watch" => (
+            &["-n", "--interval"],
+            &[
+                "-b",
+                "--beep",
+                "-c",
+                "--color",
+                "-d",
+                "--differences",
+                "-e",
+                "--errexit",
+                "-g",
+                "--chgexit",
+                "-p",
+                "--precise",
+                "-t",
+                "--no-title",
+                "-w",
+                "--no-wrap",
+                "-x",
+                "--exec",
+                "-h",
+                "--help",
+                "-v",
+                "--version",
+            ],
+            0,
+        ),
+        "nohup" => (&[], &["--help", "--version"], 0),
+        "setsid" => (
+            &[],
+            &[
+                "-c",
+                "--ctty",
+                "-f",
+                "--fork",
+                "-w",
+                "--wait",
+                "--help",
+                "--version",
+            ],
+            0,
+        ),
+        "time" => (
+            &["-o", "--output", "-f", "--format"],
+            &[
+                "-p",
+                "--portability",
+                "-a",
+                "--append",
+                "-v",
+                "--verbose",
+                "--help",
+                "--version",
+            ],
+            0,
+        ),
         "sudo" | "doas" => (
             &["-u", "--user", "-g", "--group", "-C", "-p", "--prompt"],
+            &[
+                "-n",
+                "--non-interactive",
+                "-E",
+                "--preserve-env",
+                "-H",
+                "-i",
+                "--login",
+                "-s",
+                "--shell",
+                "-S",
+                "--stdin",
+                "-k",
+                "-b",
+                "-A",
+                "-L",
+                "-l",
+                "-h",
+                "-v",
+                "-V",
+            ],
             0,
         ),
         "ssh" => (
@@ -1876,10 +2012,57 @@ fn wrapper_flag_shape(bin: &str) -> (&'static [&'static str], usize) {
                 "-p", "-i", "-o", "-l", "-F", "-J", "-L", "-R", "-D", "-W", "-S", "-E", "-b", "-c",
                 "-m", "-I", "-e", "-Q",
             ],
+            &[
+                "-4", "-6", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q",
+                "-s", "-T", "-t", "-V", "-v", "-X", "-x", "-Y", "-y",
+            ],
             1,
         ),
-        _ => (&[], 0),
+        _ => (&[], &[], 0),
     }
+}
+
+/// Is this self-contained dash-prefixed token part of the wrapper's understood
+/// flag grammar? Covers `--long`, `--long=value`, a glued short value (`-n1`),
+/// bundled boolean shorts (`-tx`), and `nice`'s bare `-10` adjustment.
+///
+/// Returning `false` is what makes classification FAIL CLOSED: the caller
+/// treats an unrecognised flag as an argv it cannot reason about.
+fn wrapper_flag_recognised(
+    bin: &str,
+    tok: &str,
+    value_flags: &[&str],
+    bool_flags: &[&str],
+) -> bool {
+    if bool_flags.contains(&tok) {
+        return true;
+    }
+    // `--unset=FOO` / `-nFOO`: the NAME must be a flag we know.
+    if let Some((name, _)) = tok.split_once('=') {
+        return value_flags.contains(&name) || bool_flags.contains(&name);
+    }
+    let body = &tok[1..];
+    if body.is_empty() {
+        return false; // a bare `-` only counts where it is listed explicitly
+    }
+    // `nice -10` / `ionice -3`: a bare numeric priority adjustment.
+    if matches!(bin, "nice" | "ionice") && body.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if tok.starts_with("--") {
+        return false; // long flags must match the table exactly
+    }
+    // Short-flag cluster: a value glued to a value-taking flag (`-n1`, `-I{}`),
+    // or a bundle of booleans (`-tx`). Every element must be recognised.
+    if body.len() > 1 && value_flags.contains(&&tok[..2]) {
+        return true;
+    }
+    body.chars().all(|c| {
+        c.is_ascii()
+            && bool_flags
+                .iter()
+                .any(|f| f.len() == 2 && f.as_bytes()[1] == c as u8)
+    })
 }
 
 /// Resolve a wrapper program to the argv it will actually exec, so the
@@ -1904,7 +2087,7 @@ fn resolve_wrapper(bin: &str, args: &[String]) -> Option<Wrapped> {
     {
         return Some(Wrapped::Opaque);
     }
-    let (value_flags, positionals) = wrapper_flag_shape(bin);
+    let (value_flags, bool_flags, positionals) = wrapper_flag_shape(bin);
     let mut i = 0;
     while i < args.len() {
         let tok = args[i].as_str();
@@ -1925,9 +2108,16 @@ fn resolve_wrapper(bin: &str, args: &[String]) -> Option<Wrapped> {
                 return Some(Wrapped::Opaque); // dangling value
             }
             i += 2;
-        } else {
+        } else if wrapper_flag_recognised(bin, tok, value_flags, bool_flags) {
             // `--flag=value`, bundled shorts (`-n1`), bare booleans.
             i += 1;
+        } else {
+            // FAIL CLOSED: an unrecognised dash-prefixed token means we cannot
+            // tell which token starts the wrapped command, so we must not
+            // resolve to an inner argv that might look read-only.
+            // `nice --bogus 10 rm -rf /x` used to skip `--bogus` and run
+            // unprompted; it now classifies as opaque and confirms.
+            return Some(Wrapped::Opaque);
         }
     }
     for _ in 0..positionals {
@@ -8387,6 +8577,55 @@ them by review age\nthen file a report";
             name: "git stash list stays quiet",
             program: "git",
             args: &["stash", "list"],
+            normal: false,
+            careful: false,
+        },
+        // ── unrecognised wrapper flags fail closed (TASK-938 R4) ──
+        // Before the fix the normaliser SKIPPED any dash-prefixed token it did
+        // not recognise, so an unknown flag let the wrapped command resolve —
+        // `nice --bogus 10 rm -rf /x` ran unprompted. Unknown argv shapes must
+        // now classify as opaque and confirm.
+        GateCase {
+            name: "env with an unknown option fails closed",
+            program: "env",
+            args: &["--unknown-opt", "ls"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "nice with a bogus flag cannot smuggle rm -rf",
+            program: "nice",
+            args: &["--bogus", "10", "rm", "-rf", "/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "xargs with an unknown option fails closed",
+            program: "xargs",
+            args: &["--unknown-opt", "ls"],
+            normal: true,
+            careful: true,
+        },
+        // Positive controls: RECOGNISED flags must still normalise, so the
+        // fail-closed rule does not over-block ordinary reads.
+        GateCase {
+            name: "env -i ls still normalises to a read",
+            program: "env",
+            args: &["-i", "ls"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "timeout 5 ls still normalises to a read",
+            program: "timeout",
+            args: &["5", "ls"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "nice -n 10 ls still normalises to a read",
+            program: "nice",
+            args: &["-n", "10", "ls"],
             normal: false,
             careful: false,
         },
