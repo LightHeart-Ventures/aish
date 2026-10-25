@@ -868,10 +868,18 @@ pub fn set_midturn_inline(styled_prompt: &str, text: &str) {
 /// `cols` visible columns via [`clip_visible`] so a long paste can never wrap
 /// and scroll the body twice.
 ///
+/// With colour ON the receipt is wrapped in the OPERATOR-INPUT highlight band
+/// ([`crate::style::input_echo_block_with`]) — pad row, receipt, pad row — so a
+/// queued line looks like the submitted-input echo it will become, instead of
+/// disappearing into the engine's output. With colour off there is no band, so
+/// the pads are dropped and a single plain row is emitted (degrade, never
+/// mangle).
+///
 /// Leading `\r\x1b[2K` (same convention as [`midturn_inline_seq`]) homes the
-/// cursor and erases the row before painting, and the trailing `\r\n` scrolls
-/// the body by exactly one row — the footer lives OUTSIDE the scroll region, so
-/// it is untouched. Pure builder, so the format is unit-tested without a tty.
+/// cursor and erases each row before painting, and every row is `\r\n`
+/// terminated, so the body scrolls by exactly the number of rows emitted (3
+/// banded, 1 plain) — the footer lives OUTSIDE the scroll region, so it is
+/// untouched. Pure builder, so the format is unit-tested without a tty.
 pub fn midturn_queued_seq(
     text: &str,
     position: usize,
@@ -895,8 +903,23 @@ pub fn midturn_queued_seq(
     } else {
         format!("{sigil} queued{pos} {arrow} {text}")
     };
-    let clipped = clip_visible(&body, cols.max(1) as usize);
-    format!("\r\x1b[2K{clipped}\x1b[0m\r\n")
+    let cols = cols.max(1) as usize;
+    let clipped = clip_visible(&body, cols);
+    if !color_on {
+        // Degrade, never mangle (same contract as `style::highlight_row`):
+        // with no color there is no band to draw, so two empty pad rows would
+        // cost scrollback and carry zero signal. One plain row it is.
+        return format!("\r\x1b[2K{clipped}\x1b[0m\r\n");
+    }
+    // Colour on → paint the receipt in exactly the band the submitted-input
+    // echo uses: a pad row above, the receipt, a pad row below, every row a
+    // full-width background fill. The queued line IS operator input — it just
+    // hasn't run yet — so it should read the same in the transcript as a line
+    // that ran immediately, and the eye can find it without hunting.
+    crate::style::input_echo_block_with(&clipped, cols, true, &crate::style::input_highlight_bg())
+        .iter()
+        .map(|row| format!("\r\x1b[2K{row}\r\n"))
+        .collect()
 }
 
 /// Emit the "queued" receipt for a mid-turn submitted line into the text output
@@ -4228,12 +4251,36 @@ mod tests {
             "\r\x1b[2K⏳ queued #2 → git status\x1b[0m\r\n"
         );
 
-        // Colour on → the label is dimmed, the operator's own text is NOT (so it
-        // reads as their input, not as chrome).
-        assert_eq!(
-            midturn_queued_seq("ls", 1, wide, true, true),
-            "\r\x1b[2K\x1b[2m⏳ queued →\x1b[0m ls\x1b[0m\r\n"
-        );
+        // Colour on → the receipt is wrapped in the SAME operator-input
+        // highlight band the submitted-input echo uses (pad row, receipt, pad
+        // row), because a queued line IS operator input that simply hasn't run
+        // yet. Without the band it reads as engine chrome and vanishes into the
+        // turn's output. The label stays dimmed inside the band; the operator's
+        // own text is not.
+        let bg = crate::style::input_highlight_bg();
+        let banded = midturn_queued_seq("ls", 1, wide, true, true);
+        let rows: Vec<&str> = banded.split("\r\n").filter(|r| !r.is_empty()).collect();
+        assert_eq!(rows.len(), 3, "pad + receipt + pad, like standard input");
+        for row in &rows {
+            assert!(
+                row.starts_with(&format!("\r\x1b[2K{bg}")),
+                "every band row homes, erases, then arms the bg: {row:?}"
+            );
+            assert!(row.ends_with("\x1b[0m"), "band row resets: {row:?}");
+            assert_eq!(
+                crate::style::visible_cols(row.trim_start_matches("\r\x1b[2K")),
+                wide as usize,
+                "band fills the full width so it reads as one block"
+            );
+        }
+        assert!(rows[1].contains("\x1b[2m⏳ queued →\x1b[0m"), "dim label");
+        assert!(rows[1].contains("ls"), "operator text is in the middle row");
+        for pad in [rows[0], rows[2]] {
+            assert!(
+                !pad.contains("queued"),
+                "pads carry background only, no text: {pad:?}"
+            );
+        }
 
         // Non-UTF-8 locale → ASCII sigil + arrow, no mojibake.
         assert_eq!(
