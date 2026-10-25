@@ -252,7 +252,117 @@ impl PlanGraph {
         }
         Some(ready)
     }
+
+    /// Ids of every ready node, in declaration order — the operator-facing
+    /// answer to "what MAY be dispatched right now".
+    pub fn ready_ids(&self, done: &HashSet<NodeId>) -> Vec<NodeId> {
+        self.ready_set(done).iter().map(|n| n.id.clone()).collect()
+    }
+
+    /// THE DISPATCH GATE. Decide whether `node_id` may be dispatched right now,
+    /// given the done-set and the ids of plan nodes ALREADY in flight.
+    ///
+    /// This is what makes [`PlanGraph::ready_set`] / [`PlanGraph::fan_out_candidates`]
+    /// the single source of truth on the spawn path instead of a test-only
+    /// property: a dispatch that isn't ready-set-derived is refused here, before
+    /// a credential is spent or a host process is forked.
+    ///
+    /// Rules, in order:
+    ///   1. the node must exist in the plan (`UnknownNode`);
+    ///   2. it must not already be complete (`AlreadyDone`);
+    ///   3. every `depends_on` must be in `done` — i.e. it must be in the ready
+    ///      set (`NotReady`, naming the blockers);
+    ///   4. when anything ELSE is already in flight, the dispatch is a FAN-OUT,
+    ///      so `fan_out_candidates` must authorize it: the ready work must be
+    ///      file-disjoint and must include this node (`FanOutNotIndependent`).
+    ///
+    /// Pure → unit-tested.
+    pub fn authorize_dispatch<'g>(
+        &'g self,
+        done: &HashSet<NodeId>,
+        node_id: &str,
+        concurrent: &[NodeId],
+    ) -> Result<&'g PlanNode, DispatchDenial> {
+        let node = self
+            .node(node_id)
+            .ok_or_else(|| DispatchDenial::UnknownNode(node_id.to_string()))?;
+        if done.contains(&node.id) {
+            return Err(DispatchDenial::AlreadyDone(node.id.clone()));
+        }
+        let blocked: Vec<NodeId> = node
+            .depends_on
+            .iter()
+            .filter(|d| !done.contains(*d))
+            .cloned()
+            .collect();
+        if !blocked.is_empty() {
+            return Err(DispatchDenial::NotReady {
+                node: node.id.clone(),
+                blocked_by: blocked,
+            });
+        }
+        let peers: Vec<NodeId> = concurrent
+            .iter()
+            .filter(|p| **p != node.id)
+            .cloned()
+            .collect();
+        if peers.is_empty() {
+            // Solo dispatch of a ready node — nothing to be independent OF.
+            return Ok(node);
+        }
+        match self.fan_out_candidates(done) {
+            Some(cands) if cands.iter().any(|n| n.id == node.id) => Ok(node),
+            _ => Err(DispatchDenial::FanOutNotIndependent {
+                node: node.id.clone(),
+                peers,
+            }),
+        }
+    }
 }
+
+/// Why [`PlanGraph::authorize_dispatch`] refused a dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchDenial {
+    /// No node with this id is in the plan.
+    UnknownNode(NodeId),
+    /// The node is already recorded complete for this scope.
+    AlreadyDone(NodeId),
+    /// Unsatisfied dependencies — the node is not in the ready set.
+    NotReady {
+        node: NodeId,
+        blocked_by: Vec<NodeId>,
+    },
+    /// Other work is in flight and `fan_out_candidates` does not authorize
+    /// running this node alongside it (ready work isn't file-disjoint, or this
+    /// node isn't among the candidates).
+    FanOutNotIndependent { node: NodeId, peers: Vec<NodeId> },
+}
+
+impl std::fmt::Display for DispatchDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DispatchDenial::UnknownNode(id) => {
+                write!(f, "'{id}' is not a node in this plan")
+            }
+            DispatchDenial::AlreadyDone(id) => {
+                write!(f, "plan node '{id}' is already done")
+            }
+            DispatchDenial::NotReady { node, blocked_by } => write!(
+                f,
+                "plan node '{node}' is not ready — still blocked by: {}",
+                blocked_by.join(", ")
+            ),
+            DispatchDenial::FanOutNotIndependent { node, peers } => write!(
+                f,
+                "fanning out '{node}' is not authorized: work already in flight ({}) and the \
+ready set is not file-disjoint (fan_out_candidates declined)",
+                peers.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DispatchDenial {}
 
 #[cfg(test)]
 mod tests {
@@ -597,5 +707,114 @@ mod tests {
         let decoded: PlanNode =
             serde_json::from_str(r#"{"id":"a","intent":"do a"}"#).expect("defaults apply");
         assert_eq!(decoded, node("a", &[]));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_gate_tests {
+    use super::*;
+
+    fn n(id: &str, deps: &[&str], files: &[&str]) -> PlanNode {
+        PlanNode {
+            id: id.to_string(),
+            intent: format!("do {id}"),
+            files: files.iter().map(|s| s.to_string()).collect(),
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            acceptance: Vec::new(),
+            est_calls: 0,
+        }
+    }
+
+    fn graph(nodes: Vec<PlanNode>) -> PlanGraph {
+        PlanGraph {
+            scope_key: "goal:test".to_string(),
+            nodes,
+            created_at: 0,
+        }
+    }
+
+    fn done(ids: &[&str]) -> HashSet<NodeId> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn solo_dispatch_of_a_ready_node_is_authorized() {
+        let g = graph(vec![n("a", &[], &["x.rs"]), n("b", &["a"], &["y.rs"])]);
+        let node = g.authorize_dispatch(&done(&[]), "a", &[]).unwrap();
+        assert_eq!(node.id, "a");
+    }
+
+    #[test]
+    fn unknown_node_is_refused() {
+        let g = graph(vec![n("a", &[], &[])]);
+        assert_eq!(
+            g.authorize_dispatch(&done(&[]), "nope", &[]),
+            Err(DispatchDenial::UnknownNode("nope".into()))
+        );
+    }
+
+    #[test]
+    fn completed_node_is_refused() {
+        let g = graph(vec![n("a", &[], &[])]);
+        assert_eq!(
+            g.authorize_dispatch(&done(&["a"]), "a", &[]),
+            Err(DispatchDenial::AlreadyDone("a".into()))
+        );
+    }
+
+    #[test]
+    fn blocked_node_is_refused_and_names_its_blockers() {
+        let g = graph(vec![n("a", &[], &[]), n("b", &["a"], &[])]);
+        assert_eq!(
+            g.authorize_dispatch(&done(&[]), "b", &[]),
+            Err(DispatchDenial::NotReady {
+                node: "b".into(),
+                blocked_by: vec!["a".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn fan_out_onto_disjoint_ready_work_is_authorized() {
+        let g = graph(vec![n("a", &[], &["x.rs"]), n("b", &[], &["y.rs"])]);
+        let node = g
+            .authorize_dispatch(&done(&[]), "b", &["a".to_string()])
+            .unwrap();
+        assert_eq!(node.id, "b");
+    }
+
+    #[test]
+    fn fan_out_onto_overlapping_ready_work_is_refused() {
+        let g = graph(vec![
+            n("a", &[], &["shared.rs"]),
+            n("b", &[], &["shared.rs"]),
+        ]);
+        assert_eq!(
+            g.authorize_dispatch(&done(&[]), "b", &["a".to_string()]),
+            Err(DispatchDenial::FanOutNotIndependent {
+                node: "b".into(),
+                peers: vec!["a".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn concurrency_list_containing_only_self_is_treated_as_solo() {
+        // A re-dispatch/renew of the same node must not be judged as a fan-out.
+        let g = graph(vec![
+            n("a", &[], &["shared.rs"]),
+            n("b", &[], &["shared.rs"]),
+        ]);
+        let node = g
+            .authorize_dispatch(&done(&[]), "a", &["a".to_string()])
+            .unwrap();
+        assert_eq!(node.id, "a");
+    }
+
+    #[test]
+    fn ready_ids_tracks_the_done_set() {
+        let g = graph(vec![n("a", &[], &[]), n("b", &["a"], &[])]);
+        assert_eq!(g.ready_ids(&done(&[])), vec!["a".to_string()]);
+        assert_eq!(g.ready_ids(&done(&["a"])), vec!["b".to_string()]);
     }
 }
