@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.71.3] - 2026-10-25
+
+### Fixed
+- **Re-release of 0.71.2 with build artifacts.** `v0.71.2` was published before its production build ran and shipped with no assets, so `:update` could not install it. No code changes in this release.
+
 ## [0.71.2] - 2026-10-25
 
 ### Fixed
