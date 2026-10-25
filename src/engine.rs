@@ -36,6 +36,33 @@ pub fn quiet_summary() -> bool {
     QUIET_SUMMARY.load(AtomicOrdering::Relaxed)
 }
 
+/// Verbose-diagnostics mode. OFF by default: the activity stream's job is to
+/// show what the shell DID, not to narrate its own internals. While disarmed,
+/// the per-round engine telemetry — prompt-cache hit lines, serial-chain-guard
+/// and call-budget-guard advisories — is suppressed; each of those events still
+/// has a user-visible consequence that survives the suppression (a guard yield
+/// prints its tagged turn-stop banner, a soft call-budget warning is folded into
+/// the next round's prompt, and cumulative cache hit rate shows on the
+/// statusline via [`statusline_stats`]), so nothing load-bearing is lost — only
+/// the per-round play-by-play. Armed with `:verbose on` (persisted) or the
+/// `AISH_VERBOSE` env var.
+///
+/// Process-wide rather than a `Session` field because the hottest consumer —
+/// prompt-cache telemetry in [`crate::backend`] — parses a model response with
+/// no `Session` in scope, exactly like [`QUIET_SUMMARY`].
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Whether verbose engine diagnostics are armed — see [`VERBOSE`].
+pub fn verbose() -> bool {
+    VERBOSE.load(AtomicOrdering::Relaxed)
+}
+
+/// Arm/disarm verbose diagnostics. Called once at startup from the resolved
+/// env-override-then-persisted-setting pair, and by `:verbose on|off`.
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, AtomicOrdering::Relaxed);
+}
+
 /// Frames for the quiet-summary line: a magnifier flipping orientation reads as
 /// "looking something over" at a glance, and both frames are the same width so
 /// the in-place `\r`+erase redraw never jitters the label beside it.
@@ -967,7 +994,9 @@ calls and no work."
         // well-formed), then yield AFTER the round — see the `serial_yield`
         // check past the tool loop.
         let serial_yield = serial_chain_guard.record(turn.tool_calls.len());
-        if let Some(depth) = serial_yield {
+        if let Some(depth) = serial_yield
+            && verbose()
+        {
             eprintln!(
                 "\x1b[2m  ⚠ serial-chain-guard: {depth} consecutive single-call rounds — yielding to re-plan toward batching\x1b[0m"
             );
@@ -980,10 +1009,14 @@ calls and no work."
         let call_budget = call_budget_guard.record(turn.tool_calls.len());
         match call_budget {
             crate::loopguard::CallBudgetAction::SoftWarn { count } => {
-                eprintln!(
-                    "\x1b[2m  ⚠ call-budget-guard: {count} tool calls this turn (soft {}) — consider converging\x1b[0m",
-                    call_budget_soft
-                );
+                // Advisory line is verbose-only; the BINDING half (the in-prompt
+                // nudge assigned just below) fires either way.
+                if verbose() {
+                    eprintln!(
+                        "\x1b[2m  ⚠ call-budget-guard: {count} tool calls this turn (soft {}) — consider converging\x1b[0m",
+                        call_budget_soft
+                    );
+                }
                 // Make the soft warning BINDING, not advisory-only. Fold a
                 // converge/batch directive into the NEXT round's prompt via the
                 // same one-shot carrier the batch-guard and serial-chain advisor
@@ -1001,10 +1034,14 @@ calls and no work."
                 ));
             }
             crate::loopguard::CallBudgetAction::HardYield { count } => {
-                eprintln!(
-                    "\x1b[2m  ⚠ call-budget-guard: {count} tool calls this turn (hard {}) — yielding to resume with fresh context\x1b[0m",
-                    call_budget_hard
-                );
+                // Verbose-only: the yield itself still surfaces as a tagged
+                // `[call-budget-exceeded]` turn-stop banner the REPL prints.
+                if verbose() {
+                    eprintln!(
+                        "\x1b[2m  ⚠ call-budget-guard: {count} tool calls this turn (hard {}) — yielding to resume with fresh context\x1b[0m",
+                        call_budget_hard
+                    );
+                }
             }
             crate::loopguard::CallBudgetAction::Continue => {}
         }
@@ -1720,10 +1757,38 @@ fn emit_activity_stream(session: &Session, result: &ToolResult) {
     // Count against the same body Ctrl-O would reveal so the summary and the
     // expanded view agree (raw_body substitutes a placeholder / pretty JSON for
     // an empty `content`).
-    let line_count = raw_body(result).lines().count();
-    for line in activity_stream_lines(line_count) {
+    let body = raw_body(result);
+    let line_count = body.lines().count();
+    // A FAILED (✗) call auto-expands its first lines: the error message is the
+    // whole point of the line, and making the operator press Ctrl-O to find out
+    // WHY something broke is the one case where collapsing costs more than it
+    // saves. Successful calls stay collapsed.
+    let head = if result.is_error {
+        error_head(&body, ERROR_HEAD_LINES)
+    } else {
+        Vec::new()
+    };
+    for line in activity_stream_lines(line_count, &head) {
         eprintln!("\x1b[2m{}\x1b[0m", truncate_to_cols(&line, cols));
     }
+}
+
+/// How many leading lines of a failed call's output are auto-expanded beneath
+/// its ✗ header. Three is enough for an error message plus its first frame of
+/// context without re-creating the wall of output the collapse exists to avoid.
+const ERROR_HEAD_LINES: usize = 3;
+
+/// First `max` non-blank lines of a failed tool result's body — the auto-expanded
+/// head of an error. Blank lines are skipped (a leading newline shouldn't eat the
+/// budget) and trailing whitespace trimmed; the caller dims and width-clamps each
+/// line. Pure, so the format contract is unit-testable.
+fn error_head(body: &str, max: usize) -> Vec<String> {
+    body.lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .take(max)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Compact running session stats for the main statusline — `tokens in/out`,
@@ -1754,20 +1819,31 @@ pub fn statusline_stats(session: &Session) -> String {
     )
 }
 
-/// Pure builder for the interactive activity-stream line beneath a tool header:
-/// a collapsed `N lines of output — Ctrl-O to expand` summary (omitted when the
-/// call produced nothing). Indented to column 5 so it nests under the ✓/✗ tool
-/// header and lines up with the expanded body ([`reveal_last_turn`]) — Ctrl-O
-/// toggling no longer shifts it a column. The running token/tool/turn stats now
-/// live on the main statusline ([`statusline_stats`]), not here. Kept free of
-/// ANSI/terminal I/O so the format contract is unit-testable; the caller dims +
-/// width-clamps each line.
-fn activity_stream_lines(line_count: usize) -> Vec<String> {
+/// Pure builder for the interactive activity-stream lines beneath a tool header:
+/// any auto-expanded `head` lines (populated only for a FAILED call — see
+/// [`error_head`]) followed by a collapsed `N lines of output — Ctrl-O to expand`
+/// summary. The summary is omitted when the call produced nothing, and when the
+/// head already showed every line; when a head WAS shown the remainder is
+/// counted and labelled `more`, so head + summary always add up to `line_count`.
+/// Everything is indented to column 5 so it nests under the ✓/✗ tool header and
+/// lines up with the expanded body ([`reveal_last_turn`]) — Ctrl-O toggling no
+/// longer shifts it a column. The running token/tool/turn stats now live on the
+/// main statusline ([`statusline_stats`]), not here. Kept free of ANSI/terminal
+/// I/O so the format contract is unit-testable; the caller dims + width-clamps
+/// each line.
+fn activity_stream_lines(line_count: usize, head: &[String]) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    if line_count > 0 {
-        let noun = if line_count == 1 { "line" } else { "lines" };
+    for line in head {
+        lines.push(format!("     {line}"));
+    }
+    // Never under-report: `head` is drawn from the same body, so the remainder
+    // is what Ctrl-O would still add.
+    let remaining = line_count.saturating_sub(head.len());
+    if remaining > 0 {
+        let noun = if remaining == 1 { "line" } else { "lines" };
+        let more = if head.is_empty() { "" } else { "more " };
         lines.push(format!(
-            "     … {line_count} {noun} of output — Ctrl-O to expand"
+            "     … {remaining} {more}{noun} of output — Ctrl-O to expand"
         ));
     }
     lines
@@ -3039,10 +3115,11 @@ mod tests {
 
     #[test]
     fn activity_stream_summarizes_output() {
-        // The stream shows a single collapsed summary line (line count + Ctrl-O
-        // hint), indented to column 5 to nest under the tool header. The running
-        // token/tool/turn stats moved to the main statusline.
-        let lines = activity_stream_lines(8);
+        // A SUCCESSFUL call (no auto-expanded head) shows a single collapsed
+        // summary line (line count + Ctrl-O hint), indented to column 5 to nest
+        // under the tool header. The running token/tool/turn stats moved to the
+        // main statusline.
+        let lines = activity_stream_lines(8, &[]);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "     … 8 lines of output — Ctrl-O to expand");
     }
@@ -3050,12 +3127,66 @@ mod tests {
     #[test]
     fn activity_stream_handles_single_and_empty_output() {
         // One line → singular noun.
-        let lines = activity_stream_lines(1);
+        let lines = activity_stream_lines(1, &[]);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "     … 1 line of output — Ctrl-O to expand");
         // No output → nothing at all (no summary row, stats live elsewhere).
-        let lines = activity_stream_lines(0);
+        let lines = activity_stream_lines(0, &[]);
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn activity_stream_auto_expands_failed_call_head() {
+        // A failed call's head is printed verbatim at the same column 5 as the
+        // collapsed summary, and the remainder is relabelled `more lines` so
+        // head + summary account for every line Ctrl-O would reveal.
+        let head = error_head(
+            "boom: permission denied\n  at frob.rs:12\nhint: sudo?\nrest\n",
+            3,
+        );
+        assert_eq!(head.len(), 3);
+        let lines = activity_stream_lines(9, &head);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "     boom: permission denied");
+        assert_eq!(lines[1], "       at frob.rs:12");
+        assert_eq!(lines[2], "     hint: sudo?");
+        assert_eq!(lines[3], "     … 6 more lines of output — Ctrl-O to expand");
+    }
+
+    #[test]
+    fn activity_stream_omits_summary_when_head_shows_everything() {
+        // Short error fully shown → no dangling "0 more lines" row.
+        let head = error_head("boom\n", 3);
+        let lines = activity_stream_lines(1, &head);
+        assert_eq!(lines, vec!["     boom".to_string()]);
+        // Exactly-at-the-cap case: 3 lines shown, nothing remaining.
+        let head = error_head("a\nb\nc\n", 3);
+        let lines = activity_stream_lines(3, &head);
+        assert_eq!(lines.len(), 3);
+        assert!(!lines.iter().any(|l| l.contains("Ctrl-O")));
+    }
+
+    #[test]
+    fn error_head_skips_blanks_and_trims() {
+        // A leading newline must not eat the 3-line budget, and trailing
+        // whitespace is trimmed so the dim line doesn't carry invisible padding.
+        let head = error_head("\n\nError: nope   \n\nsecond line\nthird\nfourth", 3);
+        assert_eq!(head, vec!["Error: nope", "second line", "third"]);
+        // Nothing but whitespace → no head at all (caller falls back to summary).
+        assert!(error_head("\n   \n\t\n", 3).is_empty());
+        assert!(error_head("anything", 0).is_empty());
+    }
+
+    #[test]
+    fn verbose_flag_round_trips() {
+        // Default is OFF — the whole point of the flip. (Serial with other tests
+        // touching the global is fine: each sets what it asserts.)
+        set_verbose(false);
+        assert!(!verbose());
+        set_verbose(true);
+        assert!(verbose());
+        set_verbose(false);
+        assert!(!verbose());
     }
 
     #[test]

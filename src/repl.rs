@@ -10625,6 +10625,7 @@ async fn handle_colon(
                                                      distribution + missed-inline heuristic (alias :dstats)\n\
                  :output [on|off]             stream background coordinators' activity (💭 thinking + 🛠️/🔧 tool + 🚀 standard/🐌 batch lines) in a contained bordered pane; off (default) keeps them quiet\n\
                  :startup-digest [on|off]            show/suppress the boot-time coordinator digest (completed-result walls + salvage/reattach lines); off (default). env: AISH_STARTUP_DIGEST\n\
+                 :verbose [on|off]                   per-round engine diagnostics (prompt-cache hit lines, serial-chain + call-budget advisories); off (default). env: AISH_VERBOSE\n\
                  \n\
                  :result <job>                       view a finished job's full result (id or prefix)\n\
                  :dispatch <task>                    launch a background coordinator for <task> (runs quietly; :attach <id> to watch/steer)\n\
@@ -11659,6 +11660,7 @@ async fn handle_colon(
         Some("secrets") => handle_secrets(parts.collect(), session),
         Some("batch") => handle_batch(parts.next(), parts.next(), session),
         Some("startup-digest") => handle_startup_digest(parts.next(), session),
+        Some("verbose") => handle_verbose(parts.next(), session),
         Some("update") => {
             // handle_update returns true when the user opted to auto-restart onto
             // the freshly-installed binary — propagate it as the REPL break signal.
@@ -12417,6 +12419,70 @@ fn handle_batch(sub: Option<&str>, arg: Option<&str>, session: &mut Session) {
             println!(
                 "unknown :batch subcommand '{other}' — usage: :batch [on|off|status|clear|model <id>]"
             )
+        }
+    }
+}
+
+/// `:verbose [on|off|status]` arms the per-round engine diagnostics — prompt-cache
+/// hit lines, serial-chain-guard and call-budget-guard advisories. OFF by default:
+/// the activity stream is for what the shell DID, and every suppressed event keeps
+/// a user-visible consequence (guard yields still print their turn-stop banner, a
+/// soft budget warning is still folded into the next round's prompt, cumulative
+/// cache hit rate still shows on the statusline). Unlike `:startup-digest`, this
+/// takes effect IMMEDIATELY — the flag is a process-wide atomic in `engine` — and
+/// is also persisted for the next run. `AISH_VERBOSE` overrides the stored value
+/// for a single run.
+fn handle_verbose(sub: Option<&str>, session: &mut Session) {
+    let persisted = session
+        .db
+        .as_ref()
+        .and_then(|db| db.get_setting("verbose").ok().flatten())
+        .and_then(|v| crate::coordinator::parse_flag(&v));
+    let env_override = std::env::var("AISH_VERBOSE")
+        .ok()
+        .and_then(|v| crate::coordinator::parse_flag(&v));
+    match sub {
+        Some("on") | Some("off") => {
+            let on = sub == Some("on");
+            crate::engine::set_verbose(on);
+            let saved = match session.db.as_ref() {
+                Some(db) => db
+                    .set_setting("verbose", if on { "on" } else { "off" })
+                    .is_ok(),
+                None => false,
+            };
+            println!(
+                "verbose diagnostics {}{}",
+                if on { "on" } else { "off" },
+                if saved {
+                    ""
+                } else {
+                    " (this session only — no persistent store)"
+                }
+            );
+        }
+        None | Some("status") => {
+            println!(
+                "verbose diagnostics: {} (default off; cache + guard telemetry per round)",
+                if crate::engine::verbose() {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            if env_override.is_some() {
+                println!(
+                    "  source: AISH_VERBOSE env override{}",
+                    persisted
+                        .map(|p| format!(" (persisted setting: {})", if p { "on" } else { "off" }))
+                        .unwrap_or_default()
+                );
+            } else if persisted.is_some() {
+                println!("  source: persisted :verbose setting");
+            }
+        }
+        Some(other) => {
+            println!("unknown :verbose subcommand '{other}' — usage: :verbose [on|off|status]")
         }
     }
 }

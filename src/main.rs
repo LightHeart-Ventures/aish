@@ -667,6 +667,21 @@ async fn main() -> Result<()> {
         session.batch_mode = v == "true";
     }
 
+    // Verbose engine diagnostics: OFF by default (the activity stream shows what
+    // the shell DID, not how the engine felt about it). `AISH_VERBOSE` wins over
+    // the persisted `:verbose on|off` setting for a single run.
+    {
+        let persisted = session
+            .db
+            .as_ref()
+            .and_then(|db| db.get_setting("verbose").ok().flatten())
+            .and_then(|v| coordinator::parse_flag(&v));
+        let env_override = std::env::var("AISH_VERBOSE")
+            .ok()
+            .and_then(|v| coordinator::parse_flag(&v));
+        engine::set_verbose(env_override.or(persisted).unwrap_or(false));
+    }
+
     // TASK-277 AC2: load the persistent goal hierarchy from aish.db on start.
     session.load_goals();
     // TASK-282 AC3: reconcile down to a single active goal on startup (demote
