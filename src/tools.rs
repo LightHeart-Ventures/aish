@@ -4749,7 +4749,7 @@ fn tell(call: &ToolCall, session: &Session) -> Result<String> {
             if hit(&r.run_id) && !candidates.iter().any(|(rid, _)| rid == &r.run_id) {
                 candidates.push((
                     r.run_id.clone(),
-                    matches!(r.phase.as_str(), "done" | "failed" | "checkpoint"),
+                    crate::style::phase_beat_is_frozen(&r.phase),
                 ));
             }
         }
@@ -4820,7 +4820,7 @@ fn stop(call: &ToolCall, session: &Session) -> Result<String> {
     if let Ok(rows) = store.load_all() {
         for r in rows {
             if hit(&r.run_id) && !candidates.iter().any(|(rid, _, _)| rid == &r.run_id) {
-                let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
+                let terminal = crate::style::phase_beat_is_frozen(&r.phase);
                 candidates.push((r.run_id.clone(), terminal, None));
             }
         }
@@ -5142,7 +5142,7 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
             .map(|r| {
                 crate::style::fmt_heartbeat_age(
                     r.heartbeat_at.as_deref(),
-                    matches!(r.phase.as_str(), "done" | "failed" | "checkpoint"),
+                    crate::style::phase_beat_is_frozen(&r.phase),
                     now_epoch,
                 )
             })
@@ -5218,7 +5218,7 @@ until the Phase 1 `repo_key` column lands. Use `scope:\"all\"` (every session) o
                     };
                 // done/failed/checkpoint rows have no live beat → em-dash; a
                 // running "coordinating" row shows ♥ age (alive) or ⚠ age (stale).
-                let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
+                let terminal = crate::style::phase_beat_is_frozen(&r.phase);
                 let beat =
                     crate::style::fmt_heartbeat_age(r.heartbeat_at.as_deref(), terminal, now_epoch);
                 full_tasks.push((

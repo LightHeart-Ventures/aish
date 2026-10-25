@@ -5883,7 +5883,7 @@ pub(crate) fn workers_listing_ctx(ctx: &OpsCtx, show_all: bool) -> String {
                     .created_at
                     .as_deref()
                     .and_then(crate::style::parse_sqlite_utc);
-                let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
+                let terminal = crate::style::phase_beat_is_frozen(&r.phase);
                 let finished = if terminal {
                     r.heartbeat_at
                         .as_deref()
@@ -6654,7 +6654,7 @@ fn durable_worker_row(
         .created_at
         .as_deref()
         .and_then(crate::style::parse_sqlite_utc);
-    let terminal = matches!(r.phase.as_str(), "done" | "failed" | "checkpoint");
+    let terminal = crate::style::phase_beat_is_frozen(&r.phase);
     let finished = if terminal {
         r.heartbeat_at
             .as_deref()
@@ -7512,7 +7512,12 @@ fn parse_forget_cmd(parts: &[&str]) -> ForgetCmd {
 /// states (`done`/`failed`, or a stale label whose container is gone) are
 /// forgettable. Pure -> unit-tested.
 fn forget_status_is_live(status: &str) -> bool {
-    matches!(status.trim(), "running" | "coordinating" | "awaiting_batch")
+    // `waiting` is live work too: the run's own turns are over but its spawned
+    // sub-workers are still going, so `:forget` must not reap it (ISS-W1).
+    matches!(
+        status.trim(),
+        "running" | "coordinating" | "awaiting_batch" | "waiting"
+    )
 }
 
 /// Remove every durable trace of one (already-confirmed-exited) worker: its
@@ -9090,7 +9095,13 @@ fn goal_command(session: &mut Session, sub: &str, args: &str) -> String {
 /// message. (TASK-286 AC1/AC2: check phase; reject done/failed/missing.) Pure →
 /// unit-tested.
 fn phase_is_live(phase: &str) -> bool {
-    !crate::coordinator::Phase::parse(phase).is_terminal()
+    let p = crate::coordinator::Phase::parse(phase);
+    // `waiting` is non-terminal but has NO live process behind it: the run's own
+    // turns are over and the row is parked until its sub-workers exit. Nobody
+    // will ever read a next round, so a `:tell` queued there would be silently
+    // swallowed — the exact failure this gate exists to prevent. Treat it as
+    // not-live and steer one of its still-running children instead.
+    !p.is_terminal() && p != crate::coordinator::Phase::Waiting
 }
 
 /// The decision `tell_coordinator` reaches after matching `<id>` against the live
@@ -9498,7 +9509,7 @@ pub(crate) fn stop_coordinator_ctx(id: Option<&str>, any: bool, ctx: &OpsCtx) ->
             if hit(&r.run_id) && !candidates.iter().any(|(rid, _, _, _)| rid == &r.run_id) {
                 candidates.push((
                     r.run_id.clone(),
-                    matches!(r.phase.as_str(), "done" | "failed" | "checkpoint"),
+                    crate::style::phase_beat_is_frozen(&r.phase),
                     r.session_id.clone(),
                     None,
                 ));
@@ -15932,6 +15943,9 @@ mod tests {
         assert!(phase_is_live("awaiting_batch"));
         assert!(!phase_is_live("done"));
         assert!(!phase_is_live("failed"));
+        // `waiting` is non-terminal but parked: no process is left to read a
+        // queued message, so :tell must refuse it instead of swallowing one.
+        assert!(!phase_is_live("waiting"));
         // Missing (empty) and unknown/legacy phase strings parse to Failed and
         // are therefore dead — a row we cannot interpret must not swallow a msg.
         assert!(!phase_is_live(""));
@@ -15951,7 +15965,9 @@ mod tests {
         for live in ["coordinating", "awaiting_batch"] {
             assert!(!terminal(live), "{live} must attach in TAIL mode");
         }
-        for dead in ["done", "failed", "", "zombie"] {
+        // `waiting` has no live stream either (the parent's turns are over, it
+        // is parked on its children), so it reviews rather than tails forever.
+        for dead in ["done", "failed", "waiting", "", "zombie"] {
             assert!(terminal(dead), "{dead} must attach in REVIEW mode");
         }
     }
@@ -16434,6 +16450,8 @@ mod tests {
         assert!(forget_status_is_live("running"));
         assert!(forget_status_is_live("coordinating"));
         assert!(forget_status_is_live("awaiting_batch"));
+        // ISS-W1: a parked parent still has live children — never reapable.
+        assert!(forget_status_is_live("waiting"));
         assert!(forget_status_is_live("  running  ")); // trimmed
         // Terminal states are forgettable.
         assert!(!forget_status_is_live("done"));

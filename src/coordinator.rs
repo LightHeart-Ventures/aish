@@ -569,6 +569,14 @@ pub enum Phase {
     /// round boundary. Non-terminal — the run stops without finishing and can be
     /// resumed manually later. Never orphan-reaped.
     Checkpoint,
+    /// Non-terminal: this coordinator finished its OWN turns but the sub-workers
+    /// it spawned are still running, so the delegated work is not done. A run
+    /// that fans children out and then reports `done` is lying — the operator
+    /// sees a finished worker while its subtree is still burning tokens — so
+    /// `drive` parks it here instead and the LAST child to reach a terminal
+    /// phase settles it to `done` (`CoordinatorStore::settle_waiting_runs`).
+    /// Never orphan-reaped, never parent-reconciled: no live process owns it.
+    Waiting,
     /// Terminal: the task finished, `result` holds the assembled output.
     Done,
     /// Terminal: the run hit the round cap, errored, or was orphaned.
@@ -582,6 +590,7 @@ impl Phase {
             Phase::Coordinating => "coordinating",
             Phase::AwaitingBatch => "awaiting_batch",
             Phase::Checkpoint => "checkpoint",
+            Phase::Waiting => "waiting",
             Phase::Done => "done",
             Phase::Failed => "failed",
         }
@@ -594,6 +603,7 @@ impl Phase {
             "coordinating" => Phase::Coordinating,
             "awaiting_batch" => Phase::AwaitingBatch,
             "checkpoint" => Phase::Checkpoint,
+            "waiting" => Phase::Waiting,
             "done" => Phase::Done,
             _ => Phase::Failed,
         }
@@ -1288,10 +1298,11 @@ final status plus your best partial result. After this turn you are terminated."
             // Stand-down wrap-up still gets the sub-work verification block: a run
             // told to stop must not report unfinished sub-items as done (TASK-311).
             let answer = subwork.finalize(answer);
-            persist_terminal(store, run_id, Phase::Done, Some(&answer), None, session);
-            finalize_worker_store(run_id, "done", Some(&answer));
+            let phase = terminal_phase_with_children(store, run_id);
+            persist_terminal(store, run_id, phase, Some(&answer), None, session);
+            finalize_worker_store(run_id, phase.as_str(), Some(&answer));
             return Outcome {
-                phase: Phase::Done,
+                phase,
                 result: Some(answer),
                 error: None,
                 rounds,
@@ -1576,10 +1587,11 @@ delivered above). Fold them into your work: continue the task, or give the final
         // verification block (TASK-311) so the final answer carries a per-item
         // pass/fail roll-up rather than an unchecked "all done".
         let answer = subwork.finalize(answer);
-        persist_terminal(store, run_id, Phase::Done, Some(&answer), None, session);
-        finalize_worker_store(run_id, "done", Some(&answer));
+        let phase = terminal_phase_with_children(store, run_id);
+        persist_terminal(store, run_id, phase, Some(&answer), None, session);
+        finalize_worker_store(run_id, phase.as_str(), Some(&answer));
         return Outcome {
-            phase: Phase::Done,
+            phase,
             result: Some(answer),
             error: None,
             rounds,
@@ -1660,6 +1672,15 @@ pub fn rehydrate(session: &mut Session) {
     let Some(store) = session.coordinator_store.clone() else {
         return;
     };
+    // Release any `waiting` parent whose last child settled while nobody was
+    // around to run the post-terminal settle (the child crashed, or the whole
+    // machine went down mid-subtree). Runs BEFORE the snapshot below so a row
+    // settled here is surfaced as `done` in this same startup pass.
+    // Silent on success: a row settled here simply shows up as `done` in the
+    // snapshot below and travels the normal surface/reap path.
+    if let Err(e) = store.settle_waiting_runs() {
+        eprintln!("\x1b[2maish: couldn't settle waiting runs: {e:#}\x1b[0m");
+    }
     let rows = match store.load_all() {
         Ok(r) => r,
         Err(e) => {
@@ -1699,6 +1720,13 @@ pub fn rehydrate(session: &mut Session) {
             // it stays parked at `checkpoint` for a later manual resume even when
             // its launching session is gone.
             Phase::Checkpoint => {}
+            // A `waiting` run finished its OWN turns but still has live
+            // sub-workers: not terminal (no result to surface, nothing to reap)
+            // and not orphan-reapable either — its heartbeat is deliberately
+            // frozen because the process is gone, and the children settle it to
+            // `done` via `settle_waiting_runs` (called above and from every
+            // child's terminal write). Left untouched here.
+            Phase::Waiting => {}
             Phase::Coordinating | Phase::AwaitingBatch => {
                 // Non-terminal. If it's ours (same session id — only possible
                 // after an in-process resume, since ids are per-run) or its
@@ -2405,7 +2433,25 @@ fn persist_terminal(
     let mut last_err: Option<String> = None;
     for attempt in 1..=TERMINAL_PERSIST_ATTEMPTS {
         match s.finish_run(run_id, phase.as_str(), result, error, metrics) {
-            Ok(()) => return,
+            Ok(()) => {
+                // The subtree just shrank. If this row was the LAST live child
+                // of a `waiting` parent, settle that parent (and any waiting
+                // ancestor above it) to `done`: a `waiting` row must never
+                // outlive the children it is waiting on.
+                //
+                // Fired for a `waiting` write too, not just a terminal one, and
+                // that arm is load-bearing: between `terminal_phase_with_children`
+                // counting a live child and this row landing, that child can
+                // itself finish and run its own settle pass — which sees us still
+                // `coordinating` and so leaves nothing behind to release us. A
+                // self-directed pass right after the write closes that race (the
+                // SQL only moves rows whose children are ALL terminal, so it is a
+                // no-op when children really are still live).
+                if let Err(e) = s.settle_waiting_runs() {
+                    eprintln!("\x1b[2maish: settle_waiting_runs failed: {e}\x1b[0m");
+                }
+                return;
+            }
             Err(e) => {
                 last_err = Some(e.to_string());
                 if attempt < TERMINAL_PERSIST_ATTEMPTS {
@@ -2441,6 +2487,39 @@ const TERMINAL_PERSIST_BACKOFF_MS: u64 = 100;
 fn terminal_persist_backoff(attempt: u32) -> std::time::Duration {
     let shift = attempt.saturating_sub(1).min(16);
     std::time::Duration::from_millis(TERMINAL_PERSIST_BACKOFF_MS << shift)
+}
+
+/// The terminal phase a finishing coordinator should ACTUALLY persist. A run
+/// that spawned sub-workers has not finished the work it was handed just
+/// because its own turns are over — the children are still going. Writing
+/// `done` there is the bug this fixes: `:workers` and `background_status` show
+/// a completed parent sitting above a live subtree, and the operator reads a
+/// final result that doesn't yet reflect what those workers produce. So while
+/// any DIRECT child is still live we park at [`Phase::Waiting`] instead, and
+/// the last child to reach a terminal phase settles us to `done` (see
+/// [`CoordinatorStore::settle_waiting_runs`], driven from [`persist_terminal`]).
+///
+/// Degrades to `done` with no store (ad-hoc drive, no durable row) or on a
+/// store read error — better to finish than to park a row nobody will settle.
+fn terminal_phase_with_children(store: Option<&CoordinatorStore>, run_id: &str) -> Phase {
+    let Some(s) = store else { return Phase::Done };
+    match s.live_child_count(run_id) {
+        Ok(0) => Phase::Done,
+        Ok(n) => {
+            eprintln!(
+                "\x1b[2maish: {n} sub-worker(s) still running — parking {run_id} as 'waiting' \
+                 (settles to 'done' when the last child finishes)\x1b[0m"
+            );
+            Phase::Waiting
+        }
+        Err(e) => {
+            eprintln!(
+                "\x1b[33maish: could not count live sub-workers of {run_id}: {e} \
+                 — finishing as 'done'\x1b[0m"
+            );
+            Phase::Done
+        }
+    }
 }
 
 /// Best-effort current git branch of `dir`, recorded in the worker `meta.json`

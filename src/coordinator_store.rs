@@ -289,7 +289,8 @@ impl CoordinatorStore {
                  run_id       TEXT PRIMARY KEY,
                  task         TEXT NOT NULL,
                  phase        TEXT NOT NULL CHECK (phase IN
-                              ('coordinating', 'awaiting_batch', 'checkpoint', 'done', 'failed')),
+                              ('coordinating', 'awaiting_batch', 'checkpoint', 'waiting',
+                               'done', 'failed')),
                  result       TEXT,
                  error        TEXT,
                  session_id   TEXT,
@@ -561,9 +562,107 @@ impl CoordinatorStore {
         // read back NULL, i.e. "a normal run", which is the correct default for
         // every row written before the salvage pass started stamping this.
         let _ = conn.execute("ALTER TABLE coordinator_runs ADD COLUMN kind TEXT", []);
+        // Widen the phase CHECK to admit the 'waiting' phase — a coordinator
+        // that finished its own turns while the sub-workers it spawned are
+        // still running. SQLite can't ALTER a CHECK, so a table predating the
+        // phase is rebuilt. Unlike the checkpoint rebuild above (which carries a
+        // hand-written column list and therefore drops any column added after
+        // it was written), this one DERIVES both the new DDL and the copy list
+        // from the live schema: the stored CREATE SQL with the phase list
+        // widened, and `PRAGMA table_info` for the columns. So it preserves
+        // every column — including `subwork`, `parent_run_id`, `kind`, and
+        // anything added later — without needing to be kept in sync. It runs
+        // LAST so all additive columns already exist. Idempotent: once the
+        // literal 'waiting' is in the CHECK this is a no-op. There are no
+        // indexes on coordinator_runs, so the DROP loses nothing.
+        let runs_sql = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='coordinator_runs'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(sql) = runs_sql.filter(|s| !s.contains("'waiting'")) {
+            // Widen the phase list in place. Prefer anchoring on 'checkpoint'
+            // (present on every table the checkpoint migration has touched);
+            // fall back to 'done', which any phase CHECK must contain.
+            let widened = if sql.contains("'checkpoint'") {
+                sql.replace("'checkpoint'", "'checkpoint', 'waiting'")
+            } else {
+                sql.replace("'done'", "'waiting', 'done'")
+            };
+            // CREATE TABLE "coordinator_runs" (…) → …_new (first hit only, so a
+            // column or comment mentioning the name downstream is untouched).
+            let new_ddl = widened.replacen("coordinator_runs", "coordinator_runs_new", 1);
+            let cols: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA table_info(coordinator_runs)")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let cols = cols.join(", ");
+            conn.execute_batch(&format!(
+                "BEGIN;
+                 {new_ddl};
+                 INSERT INTO coordinator_runs_new ({cols}) SELECT {cols} FROM coordinator_runs;
+                 DROP TABLE coordinator_runs;
+                 ALTER TABLE coordinator_runs_new RENAME TO coordinator_runs;
+                 COMMIT;"
+            ))
+            .context("coordinator_runs waiting-phase migration failed")?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// How many DIRECT children of `run_id` are still live (non-terminal).
+    /// Drives the `waiting` phase: a coordinator whose own turns are over but
+    /// whose sub-workers are still running must not report `done`. Counts only
+    /// the immediate generation — a live grandchild always has a live parent
+    /// (its own parent parks as `waiting`), so the subtree stays covered
+    /// transitively without a recursive query.
+    pub fn live_child_count(&self, run_id: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM coordinator_runs \
+             WHERE parent_run_id = ?1 AND phase NOT IN ('done', 'failed')",
+            [run_id],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Settle every `waiting` run that has no live children left to `done`.
+    /// Called after a terminal write (the moment a subtree can shrink), so the
+    /// last child to finish releases its parent — and, because the parent's own
+    /// flip to `done` makes IT terminal, a chain of waiting ancestors collapses
+    /// in the same pass. Looping until no row changes handles that cascade
+    /// without recursion. Returns the number of runs settled.
+    ///
+    /// Idempotent and safe to call from any process: it only ever moves
+    /// `waiting` → `done` for rows whose children are all terminal, so a
+    /// concurrent caller either finds nothing to do or performs the same write.
+    pub fn settle_waiting_runs(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut settled = 0usize;
+        // Bounded: each pass settles at least one row or stops, and the tree is
+        // finite. The cap is pure belt-and-braces against a cycle in
+        // `parent_run_id` (which the spawn path can't produce).
+        for _ in 0..64 {
+            let n = conn.execute(
+                "UPDATE coordinator_runs SET phase = 'done', heartbeat_at = current_timestamp \
+                 WHERE phase = 'waiting' AND NOT EXISTS ( \
+                     SELECT 1 FROM coordinator_runs c \
+                     WHERE c.parent_run_id = coordinator_runs.run_id \
+                       AND c.phase NOT IN ('done', 'failed'))",
+                [],
+            )?;
+            if n == 0 {
+                break;
+            }
+            settled += n;
+        }
+        Ok(settled)
     }
 
     /// Back-compat 4-arg insert for a run with NO parent (a root coordinator
@@ -986,7 +1085,10 @@ impl CoordinatorStore {
             )?;
             Ok(())
         })?;
-        if matches!(phase, "done" | "failed") {
+        // `waiting` releases its leases too: the run's OWN work is finished
+        // (it is only parked until its sub-workers exit), so holding plan-node
+        // packages would block peers for the lifetime of the whole subtree.
+        if matches!(phase, "done" | "failed" | "waiting") {
             self.release_runs_packages(run_id);
         }
         Ok(())
@@ -1843,6 +1945,119 @@ mod tests {
         // The ledger's whole purpose is outliving the process that wrote it.
         let reopened = CoordinatorStore::open(&path).unwrap();
         assert_eq!(reopened.list_orphaned_worktrees(24).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A coordinator that fanned sub-workers out must NOT read `done` while
+    /// those children are live: it parks at `waiting` and only the LAST child
+    /// to settle releases it. Covers the counter, the no-op settle while a
+    /// sibling is still running, and the release on the final child.
+    #[test]
+    fn waiting_parent_settles_only_when_last_child_finishes() {
+        let path = std::env::temp_dir().join(format!("aish_coordwait_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+        let metrics = RunMetrics {
+            tokens_in: 1,
+            tokens_out: 1,
+            turns: 1,
+            tool_calls: 1,
+        };
+
+        store.insert("run_p", "fan out", "sess-p", None).unwrap();
+        store
+            .insert_with_parent("run_c1", "child 1", "sess-c1", None, Some("run_p"))
+            .unwrap();
+        store
+            .insert_with_parent("run_c2", "child 2", "sess-c2", None, Some("run_p"))
+            .unwrap();
+        // A childless run is free to finish immediately; the parent is not.
+        assert_eq!(store.live_child_count("run_c1").unwrap(), 0);
+        assert_eq!(store.live_child_count("run_p").unwrap(), 2);
+
+        // Parent's own turns are over with children live → park as `waiting`.
+        store.set_phase("run_p", "waiting").unwrap();
+
+        // First child settles: one sibling still live, so the parent stays put.
+        store
+            .finish_run("run_c1", "done", Some("ok"), None, metrics)
+            .unwrap();
+        assert_eq!(store.settle_waiting_runs().unwrap(), 0);
+        assert_eq!(store.live_child_count("run_p").unwrap(), 1);
+        let rows = store.load_all().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.run_id == "run_p").unwrap().phase,
+            "waiting",
+            "parent must not report done while a child is live"
+        );
+
+        // Last child settles — `failed` counts as settled too — releasing it.
+        store
+            .finish_run("run_c2", "failed", None, Some("boom"), metrics)
+            .unwrap();
+        assert_eq!(store.settle_waiting_runs().unwrap(), 1);
+        // Idempotent: a second caller (another process) finds nothing to do.
+        assert_eq!(store.settle_waiting_runs().unwrap(), 0);
+
+        // And the released phase survives a reopen (the widened CHECK admits
+        // 'waiting', so the migration can't have rejected the parked write).
+        let reopened = CoordinatorStore::open(&path).unwrap();
+        let rows = reopened.load_all().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.run_id == "run_p").unwrap().phase,
+            "done"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A chain of `waiting` ancestors collapses in ONE settle pass: the
+    /// grandchild's terminal write releases the parent, whose own flip to
+    /// `done` makes it terminal and releases the grandparent.
+    #[test]
+    fn waiting_cascade_collapses_chain_of_ancestors() {
+        let path = std::env::temp_dir().join(format!("aish_coordcasc_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = CoordinatorStore::open(&path).unwrap();
+
+        store.insert("run_gp", "root", "sess-gp", None).unwrap();
+        store
+            .insert_with_parent("run_p", "mid", "sess-p", None, Some("run_gp"))
+            .unwrap();
+        store
+            .insert_with_parent("run_gc", "leaf", "sess-gc", None, Some("run_p"))
+            .unwrap();
+        store.set_phase("run_gp", "waiting").unwrap();
+        store.set_phase("run_p", "waiting").unwrap();
+        // Nothing settles while the leaf is live.
+        assert_eq!(store.settle_waiting_runs().unwrap(), 0);
+
+        store
+            .finish_run(
+                "run_gc",
+                "done",
+                Some("ok"),
+                None,
+                RunMetrics {
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    turns: 1,
+                    tool_calls: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.settle_waiting_runs().unwrap(),
+            2,
+            "both waiting ancestors settle in the same pass"
+        );
+        let rows = store.load_all().unwrap();
+        for id in ["run_gp", "run_p", "run_gc"] {
+            assert_eq!(
+                rows.iter().find(|r| r.run_id == id).unwrap().phase,
+                "done",
+                "{id} should be settled"
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 
