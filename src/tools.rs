@@ -954,6 +954,12 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "sha256sum",
 ];
 
+/// git subcommands that CAN be read-only. Membership is necessary but NOT
+/// sufficient: `branch`, `remote`, `diff`, `show` and `log` are only reads for
+/// SOME argv shapes (`git branch -D x` deletes, `git remote add …` writes,
+/// `git diff --ext-diff` execs a configured command), so `git_is_read_only`
+/// runs a per-subcommand argv check for those — see
+/// `git_subcommand_argv_is_read_only` (TASK-941 R5).
 const GIT_READ_ONLY: &[&str] = &[
     "status",
     "log",
@@ -967,6 +973,61 @@ const GIT_READ_ONLY: &[&str] = &[
     "describe",
     "rev-parse",
 ];
+
+/// `git branch` flags that only LIST/inspect. Anything else — a bare operand
+/// (`git branch newname` creates) or an unlisted flag — is treated as mutating
+/// (FAIL CLOSED), so `-d/-D/-m/-M/-c/-C/-f/--force/--set-upstream-to` never
+/// need enumerating.
+const GIT_BRANCH_READ_FLAGS: &[&str] = &[
+    "-a",
+    "--all",
+    "-r",
+    "--remotes",
+    "-v",
+    "-vv",
+    "--verbose",
+    "--list",
+    "--show-current",
+    "--merged",
+    "--no-merged",
+    "--contains",
+    "--no-contains",
+    "--points-at",
+    "--sort",
+    "--format",
+    "--color",
+    "--no-color",
+    "--column",
+    "--no-column",
+    "-i",
+    "--ignore-case",
+    "--omit-empty",
+    "--abbrev",
+    "--no-abbrev",
+];
+
+/// `git branch` read flags that consume a SEPARATE value token.
+const GIT_BRANCH_READ_VALUE_FLAGS: &[&str] = &[
+    "--contains",
+    "--no-contains",
+    "--merged",
+    "--no-merged",
+    "--points-at",
+    "--sort",
+    "--format",
+    "--color",
+    "--column",
+    "--abbrev",
+];
+
+/// `git remote` verbs that only read. `None` (bare `git remote`) also reads.
+/// Every other verb (`add`, `remove`, `rm`, `rename`, `set-url`,
+/// `set-branches`, `set-head`, `prune`, `update`) mutates.
+const GIT_REMOTE_READ_VERBS: &[&str] = &["show", "get-url"];
+
+/// Diff-family options that EXECUTE a configured command or WRITE a file, so
+/// `git diff`/`show`/`log` stop being reads when they appear.
+const GIT_DIFF_UNSAFE_FLAGS: &[&str] = &["--ext-diff", "--output"];
 
 /// Programs whose whole purpose is to mutate — always confirm.
 const DESTRUCTIVE_PROGRAMS: &[&str] = &[
@@ -1165,8 +1226,44 @@ const GIT_EXEC_CONFIG_KEYS: &[&str] = &[
     "gpg.program",
     "ssh.variant",
     "protocol.ext.allow",
+    "core.gitproxy",
+    "core.alternaterefscommand",
+    "http.proxy",
+    "https.proxy",
+    "web.browser",
 ];
-const GIT_EXEC_CONFIG_PREFIXES: &[&str] = &["alias.", "pager.", "includeif.", "filter."];
+/// Key FAMILIES whose members execute a command or redirect the transport.
+/// `diff.<driver>.command`/`.textconv`, `http.<url>.proxy`, `uploadpack.*` and
+/// `receive.*` (TASK-941 R3) all land here. Over-matching is deliberate: a
+/// false positive only costs ONE confirm prompt on a config write or a
+/// `git -c k=v` invocation, while a false negative is arbitrary code exec.
+const GIT_EXEC_CONFIG_PREFIXES: &[&str] = &[
+    "alias.",
+    "pager.",
+    "includeif.",
+    "filter.",
+    "uploadpack.",
+    "receive.",
+    "diff.",
+    "difftool.",
+    "merge.",
+    "mergetool.",
+    "http.",
+    "https.",
+    "url.",
+    "remote.",
+    "protocol.",
+    "credential.",
+    "ssh.",
+    "gpg.",
+    "sequence.",
+    "browser.",
+    "instaweb.",
+    "man.",
+    "help.",
+    "svn-remote.",
+    "trace2.",
+];
 const GIT_EXEC_CONFIG_SUFFIXES: &[&str] = &[
     ".sshcommand",
     ".clean",
@@ -1175,6 +1272,17 @@ const GIT_EXEC_CONFIG_SUFFIXES: &[&str] = &[
     ".receivepack",
     ".helper",
     ".pager",
+    ".textconv",
+    ".command",
+    ".cmd",
+    ".driver",
+    ".process",
+    ".program",
+    ".proxy",
+    ".askpass",
+    ".editor",
+    ".hookspath",
+    ".browser",
 ];
 
 // ---------------------------------------------------------------------------
@@ -2226,11 +2334,37 @@ fn find_has_mutating_action(args: &[String]) -> bool {
         .any(|a| FIND_MUTATING_ACTIONS.contains(&a.as_str()))
 }
 
-/// Strip leading git GLOBAL flags so callers see the subcommand first:
-/// `git -C /r push origin main` → `["push", "origin", "main"]`.
-/// Returns the remaining argv and whether the shape was fully understood;
-/// `recognised == false` means FAIL CLOSED at every call site.
-fn normalize_git_argv(args: &[String]) -> (Vec<String>, bool) {
+/// A git argv split into the three things the gate needs to decide.
+///
+/// The predecessor returned only `(sub, recognised)` and THREW AWAY what the
+/// global flags carried, which is exactly how `git -c core.pager=evil log`
+/// classified as a read and ran unprompted (TASK-940 R7 == TASK-941 R4) and how
+/// `git -C /other/repo push` was checked against the SESSION's default branch
+/// instead of the target repo's (TASK-940 R6). Normalisation must PRESERVE the
+/// global flags' payload, not discard it.
+struct GitArgv {
+    /// Argv with the global flags removed — subcommand first.
+    sub: Vec<String>,
+    /// False ⇒ a shape we do not fully understand: FAIL CLOSED.
+    recognised: bool,
+    /// Inline config settings from `-c key=value` / `--config-env=key=ENV`,
+    /// in order, raw (`key=value`).
+    configs: Vec<String>,
+    /// The repo this invocation actually targets, from `-C` / `--git-dir` /
+    /// `--work-tree` (last one wins). `None` ⇒ the session cwd.
+    repo: Option<String>,
+}
+
+/// Split a git argv into [`GitArgv`]. This is the ONE place git global flags
+/// are parsed; every git classifier goes through it.
+fn split_git_argv(args: &[String]) -> GitArgv {
+    let mut configs: Vec<String> = Vec::new();
+    let mut repo: Option<String> = None;
+    let mut note = |flag: &str, value: &str| match flag {
+        "-c" | "--config-env" => configs.push(value.to_string()),
+        "-C" | "--git-dir" | "--work-tree" => repo = Some(value.to_string()),
+        _ => {}
+    };
     let mut i = 0;
     while i < args.len() {
         let tok = args[i].as_str();
@@ -2242,9 +2376,16 @@ fn normalize_git_argv(args: &[String]) -> (Vec<String>, bool) {
             break;
         }
         if GIT_GLOBAL_VALUE_FLAGS.contains(&tok) {
-            if i + 1 >= args.len() {
-                return (Vec::new(), false); // dangling value
-            }
+            let Some(value) = args.get(i + 1) else {
+                // Dangling value: nothing trustworthy to hand back.
+                return GitArgv {
+                    sub: Vec::new(),
+                    recognised: false,
+                    configs,
+                    repo,
+                };
+            };
+            note(tok, value);
             i += 2;
             continue;
         }
@@ -2252,16 +2393,125 @@ fn normalize_git_argv(args: &[String]) -> (Vec<String>, bool) {
             i += 1;
             continue;
         }
-        if let Some((head, _)) = tok.split_once('=')
+        if let Some((head, value)) = tok.split_once('=')
             && GIT_GLOBAL_VALUE_FLAGS.contains(&head)
         {
+            note(head, value);
             i += 1;
             continue;
         }
         // Unrecognised global flag: hand back the tail and fail closed.
-        return (args[i..].to_vec(), false);
+        return GitArgv {
+            sub: args[i..].to_vec(),
+            recognised: false,
+            configs,
+            repo,
+        };
     }
-    (args[i..].to_vec(), true)
+    GitArgv {
+        sub: args[i..].to_vec(),
+        recognised: true,
+        configs,
+        repo,
+    }
+}
+
+/// Strip leading git GLOBAL flags so callers see the subcommand first:
+/// `git -C /r push origin main` → `["push", "origin", "main"]`.
+/// Returns the remaining argv and whether the shape was fully understood;
+/// `recognised == false` means FAIL CLOSED at every call site.
+fn normalize_git_argv(args: &[String]) -> (Vec<String>, bool) {
+    let g = split_git_argv(args);
+    (g.sub, g.recognised)
+}
+
+/// True when an inline `-c key=value` arms an exec-enabling config key
+/// (TASK-940 R7 / TASK-941 R4). Checked on the RAW git argv; settings parsed
+/// before an unrecognised flag still count, so a malformed tail cannot launder
+/// a `-c core.pager=evil` that precedes it.
+fn git_inline_config_is_exec(args: &[String]) -> bool {
+    split_git_argv(args)
+        .configs
+        .iter()
+        .any(|entry| git_config_key_is_exec(entry.split('=').next().unwrap_or(entry)))
+}
+
+/// The repo a git invocation actually targets: the `-C` / `--git-dir` /
+/// `--work-tree` value when present (resolved against `cwd` when relative),
+/// else `cwd` itself (TASK-940 R6).
+fn git_effective_repo(args: &[String], cwd: &Path) -> PathBuf {
+    match split_git_argv(args).repo {
+        Some(p) => {
+            let p = PathBuf::from(p);
+            if p.is_absolute() { p } else { cwd.join(p) }
+        }
+        None => cwd.to_path_buf(),
+    }
+}
+
+/// Per-subcommand argv check for the entries of [`GIT_READ_ONLY`] that are
+/// only reads for SOME argv shapes (TASK-941 R5). `rest` is the argv AFTER the
+/// subcommand. Subcommands with no argv-dependent danger return `true`.
+fn git_subcommand_argv_is_read_only(sub: &str, rest: &[String]) -> bool {
+    match sub {
+        "branch" => git_branch_argv_is_read_only(rest),
+        "remote" => git_remote_argv_is_read_only(rest),
+        // `--ext-diff` runs a configured diff driver; `--output` writes a file.
+        "diff" | "show" | "log" => !rest.iter().any(|a| {
+            let head = a.split('=').next().unwrap_or(a);
+            GIT_DIFF_UNSAFE_FLAGS.contains(&head)
+        }),
+        _ => true,
+    }
+}
+
+/// `git branch` is a read only when EVERY token is a listing flag. Any bare
+/// operand (`git branch newname`, `git branch -D x`) or unlisted flag means a
+/// create/delete/rename/force — FAIL CLOSED.
+fn git_branch_argv_is_read_only(rest: &[String]) -> bool {
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i].as_str();
+        if !tok.starts_with('-') || tok == "--" {
+            return false;
+        }
+        let (head, inline_value) = match tok.split_once('=') {
+            Some((h, _)) => (h, true),
+            None => (tok, false),
+        };
+        if !GIT_BRANCH_READ_FLAGS.contains(&head) {
+            return false;
+        }
+        if !inline_value && GIT_BRANCH_READ_VALUE_FLAGS.contains(&head) {
+            if i + 1 >= rest.len() {
+                return false; // dangling value
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `git remote` is a read for the bare form, `-v`, and the `show` / `get-url`
+/// verbs. `add`, `remove`, `rm`, `rename`, `set-url`, `set-head`,
+/// `set-branches`, `prune` and `update` all mutate.
+fn git_remote_argv_is_read_only(rest: &[String]) -> bool {
+    let mut i = 0;
+    while let Some(tok) = rest.get(i).map(String::as_str) {
+        if !tok.starts_with('-') {
+            break;
+        }
+        if !matches!(tok, "-v" | "--verbose") {
+            return false;
+        }
+        i += 1;
+    }
+    match rest.get(i).map(String::as_str) {
+        None => true,
+        Some(verb) => GIT_REMOTE_READ_VERBS.contains(&verb),
+    }
 }
 
 /// True when a config key's VALUE gets executed by a later git command
@@ -2339,14 +2589,26 @@ fn git_config_writes_exec_key(args: &[String]) -> bool {
 }
 
 fn git_is_read_only(args: &[String]) -> bool {
-    let (norm, recognised) = normalize_git_argv(args);
-    if !recognised {
+    let g = split_git_argv(args);
+    if !g.recognised {
         return false; // fail closed on argv shapes we don't understand
     }
+    // An inline `-c key=value` that arms an exec hook is NEVER a read, whatever
+    // the subcommand claims: `git -c core.pager=evil log` runs `evil`
+    // (TASK-940 R7 == TASK-941 R4).
+    if git_inline_config_is_exec(args) {
+        return false;
+    }
+    let norm = &g.sub;
     match norm.first().map(String::as_str) {
         Some("config") => git_config_is_read_only(&norm[1..]) && !git_config_writes_exec_key(args),
         Some("stash") => matches!(norm.get(1).map(String::as_str), Some("list") | Some("show")),
-        Some(sub) => GIT_READ_ONLY.contains(&sub),
+        // Membership in GIT_READ_ONLY is necessary but NOT sufficient: the
+        // subcommand's own argv decides too (`git branch -D x` deletes, `git
+        // remote add …` writes — TASK-941 R5).
+        Some(sub) => {
+            GIT_READ_ONLY.contains(&sub) && git_subcommand_argv_is_read_only(sub, &norm[1..])
+        }
         None => true,
     }
 }
@@ -2414,7 +2676,9 @@ fn is_destructive_at(program: &str, args: &[String], depth: usize) -> bool {
         return true;
     }
     if bin == "git" {
-        if git_config_writes_exec_key(args) {
+        // Two exec-arming forms, both always-confirm: the `git config k v`
+        // WRITE form and the inline `git -c k=v …` form (TASK-941 R3/R4).
+        if git_config_writes_exec_key(args) || git_inline_config_is_exec(args) {
             return true;
         }
         return !git_is_read_only(args);
@@ -2670,7 +2934,11 @@ fn git_default_branch_guard(args: &[String], cwd: &Path) -> Option<String> {
     if !mutating {
         return None;
     }
-    protected_git_mutation(args, current_git_branch(cwd).as_deref())
+    // Probe the repo this invocation actually TARGETS, not the session cwd:
+    // `git -C /other/repo push` must be checked against /other/repo's branch
+    // (TASK-940 R6).
+    let repo = git_effective_repo(args, cwd);
+    protected_git_mutation(args, current_git_branch(&repo).as_deref())
 }
 
 /// Pure default-branch detection (split out for testing — no IO). `args` is the
@@ -8662,10 +8930,25 @@ them by review age\nthen file a report";
             normal: true,
             careful: true,
         },
+        // ── TASK-940 R7 / TASK-941 R4: inline `-c key=value` exec hooks ──
+        GateCase {
+            name: "git -c core.pager=evil log is gated",
+            program: "git",
+            args: &["-c", "core.pager=evil", "log"],
+            normal: true,
+            careful: true,
+        },
         GateCase {
             name: "nice with a bogus flag cannot smuggle rm -rf",
             program: "nice",
             args: &["--bogus", "10", "rm", "-rf", "/x"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git -c diff.x.textconv=evil diff is gated",
+            program: "git",
+            args: &["-c", "diff.x.textconv=evil", "diff"],
             normal: true,
             careful: true,
         },
@@ -8711,9 +8994,23 @@ them by review age\nthen file a report";
             careful: true,
         },
         GateCase {
+            name: "git --config-env pager hook is gated",
+            program: "git",
+            args: &["--config-env=core.pager=EVIL", "log"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
             name: "sed --in-place rewrites the file in place",
             program: "sed",
             args: &["--in-place", "s/a/b/", "f"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git -c http.x.proxy=evil fetch is gated",
+            program: "git",
+            args: &["-c", "http.x.proxy=evil", "fetch"],
             normal: true,
             careful: true,
         },
@@ -8725,9 +9022,39 @@ them by review age\nthen file a report";
             careful: true,
         },
         GateCase {
+            name: "git -c uploadpack.x=evil log is gated",
+            program: "git",
+            args: &["-c", "uploadpack.packObjectsHook=evil", "log"],
+            normal: true,
+            careful: true,
+        },
+        // ── TASK-941 R3: `git config` write form, widened denylist ──
+        GateCase {
+            name: "git config diff.x.command write is gated",
+            program: "git",
+            args: &["config", "diff.x.command", "evil"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
             name: "sed -ni (i bundled in a short cluster)",
             program: "sed",
             args: &["-ni", "s/a/b/p", "f"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git config receive.denyCurrentBranch write is gated",
+            program: "git",
+            args: &["config", "receive.denyCurrentBranch", "updateInstead"],
+            normal: true,
+            careful: true,
+        },
+        // ── TASK-941 R5: subcommand-argv-aware branch/remote/diff ──
+        GateCase {
+            name: "git branch -D is gated",
+            program: "git",
+            args: &["branch", "-D", "x"],
             normal: true,
             careful: true,
         },
@@ -8739,9 +9066,23 @@ them by review age\nthen file a report";
             careful: true,
         },
         GateCase {
+            name: "git branch -m rename is gated",
+            program: "git",
+            args: &["branch", "-m", "old", "new"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
             name: "just runs an arbitrary recipe",
             program: "just",
             args: &["deploy"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git branch create (bare operand) is gated",
+            program: "git",
+            args: &["branch", "newbranch"],
             normal: true,
             careful: true,
         },
@@ -8753,9 +9094,23 @@ them by review age\nthen file a report";
             careful: true,
         },
         GateCase {
+            name: "git remote add is gated",
+            program: "git",
+            args: &["remote", "add", "x", "url"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
             name: "cmake --build runs arbitrary build rules",
             program: "cmake",
             args: &["--build", "."],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git remote set-url is gated",
+            program: "git",
+            args: &["remote", "set-url", "origin", "url"],
             normal: true,
             careful: true,
         },
@@ -8811,7 +9166,99 @@ them by review age\nthen file a report";
             normal: false,
             careful: true,
         },
+        GateCase {
+            name: "git remote prune is gated",
+            program: "git",
+            args: &["remote", "prune", "origin"],
+            normal: true,
+            careful: true,
+        },
+        // ── TASK-940 R6: `-C` must retarget the branch probe ──
+        GateCase {
+            name: "git -C other repo push is gated",
+            program: "git",
+            args: &["-C", "/tmp/otherrepo", "push"],
+            normal: true,
+            careful: true,
+        },
+        GateCase {
+            name: "git diff --ext-diff execs a driver, so it is gated",
+            program: "git",
+            args: &["diff", "--ext-diff"],
+            normal: true,
+            careful: true,
+        },
         // ── reads must stay unprompted (no false-positive regression) ──
+        GateCase {
+            name: "git branch list stays quiet",
+            program: "git",
+            args: &["branch"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git branch -a stays quiet",
+            program: "git",
+            args: &["branch", "-a"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git branch --show-current stays quiet",
+            program: "git",
+            args: &["branch", "--show-current"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git branch --contains value flag stays quiet",
+            program: "git",
+            args: &["branch", "--contains", "HEAD"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git remote -v stays quiet",
+            program: "git",
+            args: &["remote", "-v"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git remote show stays quiet",
+            program: "git",
+            args: &["remote", "show", "origin"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git status stays quiet",
+            program: "git",
+            args: &["status", "--porcelain"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git diff plain stays quiet",
+            program: "git",
+            args: &["diff", "--stat"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git -c color.ui=never log stays quiet (benign -c key)",
+            program: "git",
+            args: &["-c", "color.ui=never", "log"],
+            normal: false,
+            careful: false,
+        },
+        GateCase {
+            name: "git -C other repo log stays quiet",
+            program: "git",
+            args: &["-C", "/tmp/otherrepo", "log"],
+            normal: false,
+            careful: false,
+        },
         GateCase {
             // Baseline control: a plainly read-only program must never prompt
             // in ANY mode. If this row ever flips, the harness is over-gating.
@@ -9007,6 +9454,190 @@ them by review age\nthen file a report";
         assert!(!exec(&["config", "--get", "core.pager"])); // reading is fine
         assert!(!exec(&["config", "user.name", "nobody"]));
         assert!(!exec(&["status"]));
+    }
+
+    #[test]
+    fn git_inline_config_flags_are_preserved_and_classified() {
+        // TASK-940 R7 == TASK-941 R4: normalisation used to DISCARD `-c k=v`,
+        // so `git -c core.pager=evil log` classified as a read and ran
+        // unprompted. The payload must survive normalisation.
+        let cfgs = |a: &[&str]| split_git_argv(&owned(a)).configs;
+        assert_eq!(
+            cfgs(&["-c", "core.pager=evil", "log"]),
+            vec!["core.pager=evil"]
+        );
+        assert_eq!(
+            cfgs(&["--config-env=core.pager=EVIL", "log"]),
+            vec!["core.pager=EVIL"]
+        );
+        assert_eq!(
+            cfgs(&["-c", "a.b=1", "-c", "c.d=2", "status"]),
+            owned(&["a.b=1", "c.d=2"])
+        );
+        assert!(cfgs(&["log"]).is_empty());
+        // settings parsed BEFORE an unrecognised flag still count, so a
+        // malformed tail cannot launder a preceding exec hook.
+        assert_eq!(
+            cfgs(&["-c", "core.pager=evil", "--bogus"]),
+            vec!["core.pager=evil"]
+        );
+
+        let exec = |a: &[&str]| git_inline_config_is_exec(&owned(a));
+        let ro = |a: &[&str]| git_is_read_only(&owned(a));
+        let dz = |a: &[&str]| is_destructive("git", &owned(a));
+        for argv in [
+            vec!["-c", "core.pager=evil", "log"],
+            vec!["-c", "diff.x.textconv=evil", "diff"],
+            vec!["-c", "diff.x.command=evil", "diff"],
+            vec!["-c", "http.x.proxy=evil", "fetch"],
+            vec!["-c", "uploadpack.packObjectsHook=evil", "log"],
+            vec!["-c", "receive.denyCurrentBranch=updateInstead", "log"],
+            vec!["-c", "core.hooksPath=/tmp/h", "status"],
+            vec!["-c", "alias.st=!sh", "status"],
+            vec!["-c", "credential.helper=/tmp/h", "fetch"],
+            vec!["--config-env=core.pager=EVIL", "log"],
+            vec!["-c", "CORE.PAGER=evil", "log"], // case-insensitive
+        ] {
+            assert!(exec(&argv), "{argv:?} must be seen as exec-arming");
+            assert!(!ro(&argv), "{argv:?} must NOT be read-only");
+            assert!(dz(&argv), "{argv:?} must be destructive/always-confirm");
+        }
+        // benign `-c` keys must not be over-blocked
+        for argv in [
+            vec!["-c", "color.ui=never", "log"],
+            vec!["-c", "advice.detachedHead=false", "status"],
+            vec!["-c", "log.date=iso", "log"],
+        ] {
+            assert!(!exec(&argv), "{argv:?} is benign");
+            assert!(ro(&argv), "{argv:?} must stay read-only");
+            assert!(!dz(&argv), "{argv:?} must stay unprompted");
+        }
+    }
+
+    #[test]
+    fn git_config_denylist_covers_the_required_families() {
+        // TASK-941 R3: the same denylist must bind BOTH the `git -c k=v` form
+        // and the `git config <key> <value>` write form.
+        for key in [
+            "core.pager",
+            "core.hooksPath",
+            "credential.helper",
+            "alias.st",
+            "diff.mydriver.command",
+            "diff.mydriver.textconv",
+            "http.https://example.com.proxy",
+            "uploadpack.packObjectsHook",
+            "receive.denyCurrentBranch",
+        ] {
+            assert!(
+                git_config_key_is_exec(key),
+                "{key} must be on the dangerous-config denylist"
+            );
+            assert!(
+                git_config_writes_exec_key(&owned(&["config", key, "evil"])),
+                "git config {key} evil must be gated"
+            );
+            assert!(
+                git_inline_config_is_exec(&owned(&["-c", &format!("{key}=evil"), "log"])),
+                "git -c {key}=evil must be gated"
+            );
+        }
+        for key in ["user.name", "color.ui", "log.date", "advice.detachedHead"] {
+            assert!(!git_config_key_is_exec(key), "{key} must stay allowed");
+        }
+    }
+
+    #[test]
+    fn git_branch_and_remote_classification_is_argv_aware() {
+        // TASK-941 R5: membership in GIT_READ_ONLY is necessary, not
+        // sufficient — `git branch -D x` and `git remote add …` mutate.
+        let ro = |a: &[&str]| git_is_read_only(&owned(a));
+        let dz = |a: &[&str]| is_destructive("git", &owned(a));
+        for argv in [
+            vec!["branch", "-d", "x"],
+            vec!["branch", "-D", "x"],
+            vec!["branch", "-m", "old", "new"],
+            vec!["branch", "-M", "old", "new"],
+            vec!["branch", "--force", "x", "HEAD"],
+            vec!["branch", "-f", "x", "HEAD"],
+            vec!["branch", "newbranch"], // bare operand creates
+            vec!["branch", "--set-upstream-to=origin/x"],
+            vec!["branch", "--edit-description"],
+            vec!["remote", "add", "x", "url"],
+            vec!["remote", "remove", "x"],
+            vec!["remote", "rm", "x"],
+            vec!["remote", "rename", "a", "b"],
+            vec!["remote", "set-url", "origin", "url"],
+            vec!["remote", "set-head", "origin", "main"],
+            vec!["remote", "set-branches", "origin", "main"],
+            vec!["remote", "prune", "origin"],
+            vec!["remote", "update"],
+            vec!["diff", "--ext-diff"],
+            vec!["diff", "--output", "/tmp/x"],
+            vec!["log", "--ext-diff"],
+            vec!["show", "--output=/tmp/x"],
+        ] {
+            assert!(!ro(&argv), "{argv:?} must NOT be read-only");
+            assert!(dz(&argv), "{argv:?} must be destructive/always-confirm");
+        }
+        // plain reads must stay unprompted (no over-blocking)
+        for argv in [
+            vec!["branch"],
+            vec!["branch", "-a"],
+            vec!["branch", "-v"],
+            vec!["branch", "-vv"],
+            vec!["branch", "--all"],
+            vec!["branch", "--list"],
+            vec!["branch", "--show-current"],
+            vec!["branch", "--contains", "HEAD"],
+            vec!["branch", "--merged=main"],
+            vec!["branch", "--sort", "-committerdate"],
+            vec!["branch", "-r", "--format", "%(refname)"],
+            vec!["remote"],
+            vec!["remote", "-v"],
+            vec!["remote", "--verbose"],
+            vec!["remote", "show", "origin"],
+            vec!["remote", "get-url", "origin"],
+            vec!["diff", "--stat"],
+            vec!["log", "--oneline", "-5"],
+            vec!["status", "--porcelain"],
+            vec!["-C", "/repo", "branch", "-a"],
+        ] {
+            assert!(ro(&argv), "{argv:?} must stay read-only");
+            assert!(!dz(&argv), "{argv:?} must stay unprompted");
+        }
+        // dangling value flag fails closed
+        assert!(!ro(&["branch", "--contains"]));
+    }
+
+    #[test]
+    fn git_effective_repo_follows_the_global_flags() {
+        // TASK-940 R6: the default-branch probe must read the repo the
+        // invocation TARGETS, not the session cwd.
+        let cwd = Path::new("/session/cwd");
+        let r = |a: &[&str]| git_effective_repo(&owned(a), cwd);
+        assert_eq!(r(&["push"]), PathBuf::from("/session/cwd"));
+        assert_eq!(
+            r(&["-C", "/other/repo", "push"]),
+            PathBuf::from("/other/repo")
+        );
+        assert_eq!(
+            r(&["--git-dir=/other/repo/.git", "push"]),
+            PathBuf::from("/other/repo/.git")
+        );
+        assert_eq!(
+            r(&["--work-tree", "/other/repo", "push"]),
+            PathBuf::from("/other/repo")
+        );
+        // relative -C resolves against the session cwd
+        assert_eq!(r(&["-C", "sub", "push"]), PathBuf::from("/session/cwd/sub"));
+        // last one wins
+        assert_eq!(r(&["-C", "/a", "-C", "/b", "push"]), PathBuf::from("/b"));
+        // unrecognised tail still yields the -C parsed before it
+        assert_eq!(
+            r(&["-C", "/other/repo", "--bogus", "push"]),
+            PathBuf::from("/other/repo")
+        );
     }
 
     #[test]
