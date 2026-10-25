@@ -760,6 +760,14 @@ async fn main() -> Result<()> {
     }
     timer.mark("activity store open");
 
+    // Durable question tray: re-surface every choice block a background worker
+    // parked and nobody answered yet. This is the half of the fix that survives
+    // a full RESTART — the worker that asked may have exited hours ago, so the
+    // ask would otherwise be unreachable by any attach.
+    if interactive && let Some(n) = crate::question::startup_notice() {
+        startup_notices.push(n);
+    }
+
     // Load the lifecycle-hook registry for the non-interactive entry paths
     // (one-shot `-c`, background coordinator, script). The interactive REPL loads
     // it itself in `repl::run` (right before firing SessionStart). This is what

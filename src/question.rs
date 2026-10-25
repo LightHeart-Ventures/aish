@@ -320,7 +320,10 @@ pub fn park(worker: &str, spec: &ChoiceSpec) -> Option<PendingQuestion> {
     // The first park wins; later identical asks return the live record so the
     // caller can re-surface the SAME id.
     let asking = spec.question.trim();
-    if let Some(dup) = pending_for(worker).into_iter().find(|q| q.question == asking) {
+    if let Some(dup) = pending_for(worker)
+        .into_iter()
+        .find(|q| q.question == asking)
+    {
         return Some(dup);
     }
     let q = PendingQuestion {
@@ -475,8 +478,8 @@ pub fn resolve(id: &str) -> Result<PendingQuestion, String> {
 
 /// Record the operator's answer for `id` and clear it from the tray.
 ///
-/// Writes the answer file (so a worker still polling can pick it up) and
-/// REMOVES the question file, which is what takes the row out of every
+/// Writes the answer file (a durable record of what was decided, which also
+/// stops a dismissal being mistaken for a choice) and REMOVES the question file, which is what takes the row out of every
 /// subsequent `pending()` / `attach_notice` / `startup_notice`. Returns the
 /// question it answered so the caller can echo what was just decided and route
 /// the answer on to the worker over the ordinary `tell` channel.
@@ -509,21 +512,6 @@ pub fn dismiss(id: &str) -> Result<PendingQuestion, String> {
     // dismissed question cannot be resurrected by a stale verdict.
     let _ = std::fs::remove_file(answer_path(&dir, &q.id));
     Ok(q)
-}
-
-/// Read and consume the answer a worker is waiting for, if the operator has
-/// given one. `None` means "not answered yet" — the worker keeps waiting.
-pub fn take_answer(id: &str) -> Option<String> {
-    let dir = questions_dir();
-    let path = answer_path(&dir, id);
-    let text = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
 }
 
 /// Drop questions whose worker is long gone. Best-effort and silent: a sweep
@@ -662,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_rebuilds_mode_and_options_for_repromptingx() {
+    fn spec_rebuilds_mode_and_options_for_reprompting() {
         let q = PendingQuestion {
             id: "q1".into(),
             worker: "w_1".into(),
@@ -699,8 +687,11 @@ mod tests {
         let _g = HOME_LOCK.lock().unwrap();
         let _home = TempHome::new("persist");
 
-        let parked = park("w_5RN6BgsW", &spec("ship it?", ChoiceMode::One, &[("y", "Yes")]))
-            .expect("parks");
+        let parked = park(
+            "w_5RN6BgsW",
+            &spec("ship it?", ChoiceMode::One, &[("y", "Yes")]),
+        )
+        .expect("parks");
 
         // Simulated detach + fresh session: every read goes back to disk.
         let after_reload = pending();
@@ -753,7 +744,11 @@ mod tests {
         let _g = HOME_LOCK.lock().unwrap();
         let _home = TempHome::new("answer");
 
-        let q = park("w_1234abcd", &spec("ship?", ChoiceMode::One, &[("y", "Yes")])).expect("parks");
+        let q = park(
+            "w_1234abcd",
+            &spec("ship?", ChoiceMode::One, &[("y", "Yes")]),
+        )
+        .expect("parks");
         assert_eq!(pending().len(), 1);
 
         let answered = answer(&q.id, "{\"choice\":\"y\"}").expect("answers");
@@ -764,9 +759,19 @@ mod tests {
         assert!(attach_notice("w_1234abcd").is_none());
         assert!(startup_notice().is_none());
 
-        // And the worker can collect it exactly once.
-        assert_eq!(take_answer(&q.id).as_deref(), Some("{\"choice\":\"y\"}"));
-        assert!(take_answer(&q.id).is_none(), "answer must be consumed once");
+        // And the decision is durably recorded next to the (now removed)
+        // question, so nothing downstream has to trust in-process state.
+        let dir = questions_dir();
+        assert_eq!(
+            std::fs::read_to_string(answer_path(&dir, &q.id))
+                .expect("answer file")
+                .trim(),
+            "{\"choice\":\"y\"}"
+        );
+        assert!(
+            !question_path(&dir, &q.id).exists(),
+            "question file remains"
+        );
     }
 
     /// (b) Dismissal clears the entry WITHOUT recording an answer — nothing
@@ -776,8 +781,11 @@ mod tests {
         let _g = HOME_LOCK.lock().unwrap();
         let _home = TempHome::new("dismiss");
 
-        let q = park("w_9999zzzz", &spec("ship?", ChoiceMode::Many, &[("y", "Yes")]))
-            .expect("parks");
+        let q = park(
+            "w_9999zzzz",
+            &spec("ship?", ChoiceMode::Many, &[("y", "Yes")]),
+        )
+        .expect("parks");
         assert_eq!(pending().len(), 1);
 
         let dropped = dismiss(&q.id).expect("dismisses");
@@ -785,7 +793,7 @@ mod tests {
         assert!(pending().is_empty(), "dismissed question still pending");
         assert!(attach_notice("w_9999zzzz").is_none());
         assert!(
-            take_answer(&q.id).is_none(),
+            !answer_path(&questions_dir(), &q.id).exists(),
             "dismissal must not look like an answer"
         );
 
@@ -801,7 +809,11 @@ mod tests {
         let _g = HOME_LOCK.lock().unwrap();
         let _home = TempHome::new("esc");
 
-        let q = park("w_esc00000", &spec("ship?", ChoiceMode::One, &[("y", "Yes")])).expect("parks");
+        let q = park(
+            "w_esc00000",
+            &spec("ship?", ChoiceMode::One, &[("y", "Yes")]),
+        )
+        .expect("parks");
         // …operator opens the popup and hits Esc: no answer, no dismiss.
         assert_eq!(pending().len(), 1);
         assert_eq!(pending()[0].id, q.id);

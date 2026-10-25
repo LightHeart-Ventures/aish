@@ -1835,12 +1835,28 @@ pub async fn run(
                     // a second way to return operator input to a live agent.
                     // Esc answers nothing: we fall through and the raw text is
                     // printed, which is also what a malformed block does.
-                    if let Some(spec) = reply.as_deref().and_then(crate::choice::first_choice)
-                        && let Some(answer) =
-                            crate::choice::prompt_choice(spec, crate::escalation::ROWS_PER_BANNER)
-                    {
-                        next_input = answer;
-                        continue 'resume;
+                    if let Some(spec) = reply.as_deref().and_then(crate::choice::first_choice) {
+                        if let Some(answer) = crate::choice::prompt_choice(
+                            spec.clone(),
+                            crate::escalation::ROWS_PER_BANNER,
+                        ) {
+                            next_input = answer;
+                            continue 'resume;
+                        }
+                        // There is no tty to pop over, so this turn belongs to a
+                        // background coordinator and is about to end with the
+                        // question unasked. PARK it: the store outlives the turn,
+                        // survives detach/attach, and still holds the row after a
+                        // whole new session starts (`:questions` / `:answer`).
+                        // An Esc in an INTERACTIVE session lands here too but
+                        // parks nothing — `AISH_RUN_ID` is unset there, which is
+                        // what keeps inline choice blocks behaving as before.
+                        if let Some(worker) =
+                            std::env::var("AISH_RUN_ID").ok().filter(|s| !s.is_empty())
+                            && let Some(q) = crate::question::park(&worker, &spec)
+                        {
+                            eprintln!("{}", q.console_note());
+                        }
                     }
                     break 'resume;
                 }
@@ -3326,6 +3342,11 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "recoverable tray of fired :alerts / notable events (last N); clear",
     ),
     ("allow", "list / revoke always-allowed tools & dir grants"),
+    // The durable question tray — operator side of a worker-parked `choice`.
+    (
+        "answer",
+        "resolve a parked worker question <id> [option-id|text]",
+    ),
     // SEC-2.4: operator side of the sensitive-path approval broker.
     ("approvals", "pending sensitive-path approval requests"),
     ("approve", "approve a parked sensitive-path request <id>"),
@@ -3349,6 +3370,10 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
     // catalog test enforces it.
     ("deny", "deny a parked sensitive-path request <id>"),
     ("detach", "stop watching the attached coordinator"),
+    (
+        "dismiss",
+        "drop a parked worker question <id> without answering",
+    ),
     ("dispatch", "launch a background coordinator"),
     (
         "dispatch-stats",
@@ -3379,6 +3404,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "plugin",
         "plugins (list|info|config|enable|disable|reload|errors|create|add|remove <id>)",
     ),
+    ("questions", "pending worker questions parked in the tray"),
     ("quit", "exit aish"),
     (
         "reasoning",
@@ -6721,6 +6747,13 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
             if let Some(note) = crate::approval::attach_notice(run_id) {
                 println!("{note}");
             }
+            // Same deal for a parked `choice` block: the worker asked the
+            // operator to pick, the popup it drew is long gone, and the ask is
+            // still unanswered. Re-surface it (with `:answer`/`:dismiss`) as the
+            // last thing in the pane. Silent when nothing is pending.
+            if let Some(note) = crate::question::attach_notice(run_id) {
+                println!("{note}");
+            }
         }
         many => {
             println!(
@@ -8035,6 +8068,11 @@ fn cycle_worker(session: &mut Session) -> bool {
     }
     let (run_id, terminal, task) = workers[next_idx - 1].clone();
     *session.attached.lock().unwrap() = Some(run_id.clone());
+    // Same re-surface as `attach_worker` — Shift-Tab is the OTHER attach path,
+    // and a question parked by this worker has to reappear on both.
+    if let Some(n) = crate::question::attach_notice(&run_id) {
+        println!("{n}");
+    }
     let short = crate::batch::short_id(&run_id);
     let task_suffix = attach_task_suffix(&task);
     if terminal {
@@ -8983,6 +9021,99 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
     let out = tell_coordinator_ctx(id, message, any, &ops_ctx(session));
     if !out.is_empty() {
         println!("{out}");
+    }
+}
+
+/// `:questions` — the durable decision tray. Lists every choice block a
+/// background worker parked that nobody has answered or dismissed yet. The rows
+/// outlive the asking turn, the attach, and the whole session (see `question.rs`).
+fn print_pending_questions() {
+    let pending = crate::question::pending();
+    if pending.is_empty() {
+        println!("\x1b[2mno pending questions\x1b[0m");
+        return;
+    }
+    println!(
+        "\x1b[36m?\x1b[0m {} pending question{}",
+        pending.len(),
+        if pending.len() == 1 { "" } else { "s" }
+    );
+    for q in &pending {
+        println!("{}", q.row());
+    }
+    println!("\x1b[2manswer with `:answer <id> <option-id>`, drop it with `:dismiss <id>`\x1b[0m");
+}
+
+/// `:answer <id> [option-id|text]` — resolve a parked question. The answer is
+/// recorded in the store AND delivered over the existing `:tell` mailbox when
+/// the coordinator is still live — the same channel the in-process popup fed, so
+/// there is no second way to return operator input to an agent.
+///
+/// With the answer OMITTED, the stored spec is re-rendered through the ordinary
+/// `choice.rs` popup, so a parked question can still be answered by picking
+/// rather than by typing an option id from memory. Esc there decides nothing
+/// and leaves the row pending, exactly as it does on the asking turn.
+fn answer_question(id: Option<&str>, answer: &str, session: &mut Session) {
+    const USAGE: &str =
+        "usage: :answer <question-id> [option-id|text]   — resolve a parked worker question";
+    let Some(id) = id else {
+        println!("{USAGE}");
+        return;
+    };
+    // `:answer <id>` with nothing to answer WITH re-opens the stored spec in the
+    // ordinary popup rather than erroring: the operator asked to decide, they
+    // just did not want to retype an option id from the table. Esc there decides
+    // nothing, so the row stays pending — same contract as the asking turn.
+    let mut answer = answer.to_string();
+    if answer.is_empty() {
+        let Some(q) = crate::question::pending()
+            .into_iter()
+            .find(|q| q.id.eq_ignore_ascii_case(id))
+        else {
+            println!("{USAGE}");
+            return;
+        };
+        match crate::choice::prompt_choice(q.spec(), crate::escalation::ROWS_PER_BANNER) {
+            Some(picked) => answer = picked,
+            None => {
+                println!(
+                    "\x1b[2m… {} still pending — :answer {} <option-id>, or :dismiss {}\x1b[0m",
+                    q.id, q.id, q.id
+                );
+                return;
+            }
+        }
+    }
+    match crate::question::answer(id, &answer) {
+        Ok(q) => {
+            println!(
+                "\x1b[32m✓\x1b[0m answered {} \x1b[2m→\x1b[0m {answer}",
+                q.id
+            );
+            let out = tell_coordinator_ctx(Some(&q.worker), &answer, true, &ops_ctx(session));
+            if !out.is_empty() {
+                println!("{out}");
+            }
+        }
+        Err(e) => println!("\x1b[33maish:\x1b[0m {e}"),
+    }
+}
+
+/// `:dismiss <id>` — drop a parked question WITHOUT answering it. Esc leaves a
+/// question pending on purpose (the operator may want it later), so this is the
+/// explicit way to clear one.
+fn dismiss_question(id: Option<&str>) {
+    let Some(id) = id else {
+        println!("usage: :dismiss <question-id>            — drop a parked question unanswered");
+        return;
+    };
+    match crate::question::dismiss(id) {
+        Ok(q) => println!(
+            "\x1b[2m✕ dismissed {} ({})\x1b[0m",
+            q.id,
+            crate::escalation::one_line(&q.question, 56)
+        ),
+        Err(e) => println!("\x1b[33maish:\x1b[0m {e}"),
     }
 }
 
@@ -10932,6 +11063,9 @@ async fn handle_colon(
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
                  :forget <id>|--all-exited           remove an exited worker's container + state dir + run record (refuses a running one)\n\
                  :close [id]                         remove the attached (or named) coordinator from :workers + the Shift-Tab rotation\n\
+                 :questions                          pending worker questions parked in the tray (survive detach/restart; alias :asks)\n\
+                 :answer <id> [reply]                answer a parked worker question — bare id re-opens the popup, else send <reply> as the choice\n\
+                 :dismiss <id>                       drop a parked worker question without answering it\n\
                  :skill <add|search|list|remove>     install, search, list, or remove skill.fish skills\n\
                  :rename <name>                      name the session (prefixes the prompt); auto-set to the repo name at startup, bare :rename clears\n\
                  :rewrite <intent>                   AI-rewrite intent into ONE command, prefilled to edit/accept before it runs (alias :rw)\n\
@@ -11486,6 +11620,14 @@ async fn handle_colon(
             }
         }
         Some("close") => close_worker(parts.next(), session),
+        // The durable question tray (worker-parked `choice` blocks).
+        Some("questions" | "asks") => print_pending_questions(),
+        Some("answer") => {
+            let toks: Vec<&str> = parts.collect();
+            let message = toks.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+            answer_question(toks.first().copied(), message.trim(), session);
+        }
+        Some("dismiss") => dismiss_question(parts.next()),
         Some("tell" | "msg" | "send") => {
             // Steer an in-flight coordinator: queue an operator message that the
             // running coordinator folds into its next round (see coordinator::drive).
