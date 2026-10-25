@@ -2664,7 +2664,7 @@ fn refresh_escalation_status_from(
 ///
 /// Only a NON-TERMINAL, recently-beating child is newly pinned. A finished child
 /// keeps its durable row forever, so pinning on parentage alone would re-pin a
-/// verdict that already aged out of the tray ([`crate::escalation::DWELL`]) on
+/// verdict that already aged out of the tray ([`crate::escalation::DWELL_MAX`]) on
 /// the very next poll — an immortal row that outlives the work. A child ALREADY
 /// pinned keeps getting refreshed either way, so one that finishes while on
 /// screen still shows its verdict and then retires for good.

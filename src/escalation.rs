@@ -106,7 +106,7 @@
 //!
 //! LIFECYCLE. [`pin`] on escalation, [`set_status`] on every footer paint (the
 //! REPL owns the worker list, so it composes each status row), [`note_terminal`]
-//! when a coordinator finishes, and each banner self-retires [`DWELL`] after
+//! when a coordinator finishes, and each banner self-retires [`DWELL_MAX`] after
 //! that so the final verdict is readable but the footer shrinks back on its own.
 //! Every mutator is ID-SCOPED: with several banners live, a finishing worker
 //! must only ever freeze its OWN row.
@@ -202,10 +202,20 @@ pub const QUEUED_LABEL: &str = "queued";
 /// Pulse frame cadence; the footer repaint task uses this same interval.
 pub const FRAME_MS: u64 = 220;
 
-/// How long a FINISHED escalation stays pinned before its banner retires and the
-/// footer shrinks back. Long enough to read the verdict after stepping away,
-/// short enough that the footer doesn't stay fat forever.
-pub const DWELL: Duration = Duration::from_secs(45);
+/// FLOOR on a finished escalation's dwell: its verdict is never reclaimed
+/// before this, even when the tray is full and a new worker is competing for the
+/// slot. A fixed 45s dwell retired verdicts while the operator was still reading
+/// them; one minute is the shortest window that survives stepping away from the
+/// terminal.
+pub const DWELL_MIN: Duration = Duration::from_secs(60);
+
+/// CEILING on a finished escalation's dwell: [`sweep`] retires the banner once
+/// this has elapsed, whether or not anything needs the slot. A quiet tray
+/// therefore holds its verdicts for a quarter hour — long enough to come back
+/// from a meeting and read what happened — instead of the old 45s, while still
+/// shrinking the footer on its own so a forgotten session doesn't keep a fat
+/// footer forever.
+pub const DWELL_MAX: Duration = Duration::from_secs(15 * 60);
 
 /// Max visible width of the task hint on the escalation row.
 pub(crate) const TASK_HINT_MAX: usize = 56;
@@ -294,7 +304,7 @@ struct Banner {
     ///
     /// Display-only: it decides where the row sorts and how far it indents (see
     /// [`ordered_rows`]). A child whose parent is no longer tracked (evicted, or
-    /// retired after its [`DWELL`]) renders as a root rather than disappearing —
+    /// retired after its dwell) renders as a root rather than disappearing —
     /// live work is never dropped in favour of a stale verdict.
     parent: Option<String>,
     /// The escalated task, rendered as a compact one-line hint.
@@ -302,7 +312,8 @@ struct Banner {
     /// When the banner was pinned — drives the animation frame.
     pinned_at: Instant,
     /// When the coordinator reached a terminal state (`done`/`failed`), if it
-    /// has. Freezes the animation and starts the [`DWELL`] retirement clock.
+    /// has. Freezes the animation and starts the dwell retirement clock
+    /// ([`DWELL_MIN`] floor, [`DWELL_MAX`] ceiling).
     terminal_at: Option<Instant>,
     /// True when the terminal outcome was a failure (⚠️ instead of ✅).
     failed: bool,
@@ -472,6 +483,9 @@ fn push_banner_inner(id: &str, task: &str, parent: Option<&str>, age_ms: u64) {
         };
         return;
     }
+    // A NEW row at a full tray reclaims the stalest verdict that has served its
+    // floor (no-op when there's room, or when every verdict is still fresh).
+    evict_for_tray_pressure(&mut banners);
     banners.push(fresh);
     // Bound the store. Evict the oldest FINISHED escalation first so a burst of
     // fan-out never retires a coordinator that is still working, then the
@@ -511,6 +525,7 @@ pub fn pin_queued(line: &str) -> String {
         let Ok(mut banners) = BANNERS.lock() else {
             return;
         };
+        evict_for_tray_pressure(&mut banners);
         banners.push(Banner {
             kind: Kind::Queued,
             id,
@@ -587,7 +602,7 @@ pub fn queued_count() -> usize {
 ///
 /// This is the DISMISSAL path, and it exists because [`sweep`] can't serve it:
 /// sweep only retires a banner that already reached a terminal state AND then
-/// outlived [`DWELL`]. A `:close`d coordinator that is still RUNNING never
+/// outlived its dwell. A `:close`d coordinator that is still RUNNING never
 /// reaches that state from this session's point of view — the operator stopped
 /// tracking it — so without an explicit removal its two footer rows would keep
 /// animating forever, advertising a worker that is gone from `:workers` and the
@@ -898,7 +913,7 @@ pub fn set_beat(id: &str, beat: Option<i64>) {
 }
 
 /// Record that coordinator `id` reached a terminal state: freezes THAT banner's
-/// animation glyph and starts its [`DWELL`] retirement clock. Idempotent — the
+/// animation glyph and starts its dwell retirement clock. Idempotent — the
 /// first call wins, so the dwell measures from the real finish — and strictly
 /// id-scoped, so a worker finishing can never stamp another banner's verdict.
 pub fn note_terminal(id: &str, failed: bool) {
@@ -917,13 +932,42 @@ pub fn note_terminal(id: &str, failed: bool) {
     }
 }
 
-/// Retire each finished banner once [`DWELL`] has elapsed since its terminal
-/// mark. Called on each footer refresh; cheap no-op while workers are live.
-/// Per-banner, so one finished escalation retiring leaves its live siblings
-/// pinned.
+/// Retire each finished banner once [`DWELL_MAX`] has elapsed since its
+/// terminal mark. Called on each footer refresh; cheap no-op while workers are
+/// live. Per-banner, so one finished escalation retiring leaves its live
+/// siblings pinned.
+///
+/// This is the UNCONDITIONAL half of the dwell policy — the deadline a quiet
+/// tray retires on with nobody asking for the room. The conditional half lives
+/// in [`evict_for_tray_pressure`], which reclaims a verdict EARLY (but never
+/// before [`DWELL_MIN`]) when a new row arrives at a full tray.
 pub fn sweep() {
     if let Ok(mut banners) = BANNERS.lock() {
-        banners.retain(|b| b.terminal_at.is_none_or(|t| t.elapsed() < DWELL));
+        banners.retain(|b| b.terminal_at.is_none_or(|t| t.elapsed() < DWELL_MAX));
+    }
+}
+
+/// Reclaim ONE slot for an incoming row when the tray is already full: drop the
+/// oldest finished banner that has served its [`DWELL_MIN`]. No-op when the tray
+/// has room, or when every finished banner is still inside its floor — a fresh
+/// verdict is never evicted to make way for a newer one, it just waits for the
+/// next arrival (or [`sweep`]).
+///
+/// "Full" is measured against [`max_visible`], the same live cap [`row_count`]
+/// paints to: once the tray is at its visible ceiling an extra banner only
+/// deepens the `+N more` tail, which is exactly when a stale verdict is worth
+/// less than the arriving row. LIVE banners are never candidates — only a
+/// `terminal_at` row can be reclaimed — so pressure can't drop running work.
+fn evict_for_tray_pressure(banners: &mut Vec<Banner>) {
+    if banners.len() < max_visible() {
+        return;
+    }
+    // Oldest-first store, so the first qualifying position is the stalest
+    // verdict — the one whose dwell has run longest.
+    if let Some(victim) = banners.iter().position(|b| {
+        b.kind == Kind::Escalation && b.terminal_at.is_some_and(|t| t.elapsed() >= DWELL_MIN)
+    }) {
+        banners.remove(victim);
     }
 }
 
@@ -2042,15 +2086,100 @@ mod tests {
         pin("w_live000000001", "live");
         pin("w_done000000001", "done");
         note_terminal("w_done000000001", false);
-        // Force the finished banner past its dwell without sleeping 45s.
+        // Force the finished banner past its dwell without sleeping DWELL_MAX.
         if let Ok(mut banners) = BANNERS.lock()
             && let Some(b) = banners.iter_mut().find(|b| b.id == "w_done000000001")
         {
-            b.terminal_at = Some(Instant::now() - DWELL - Duration::from_secs(1));
+            b.terminal_at = Some(Instant::now() - DWELL_MAX - Duration::from_secs(1));
         }
         sweep();
         assert_eq!(count(), 1, "only the dwelled-out banner retires");
         assert_eq!(pinned_ids(), vec!["w_live000000001".to_string()]);
+        clear();
+    }
+
+    /// Age a banner's dwell clock without sleeping.
+    fn age_verdict(id: &str, by: Duration) {
+        if let Ok(mut banners) = BANNERS.lock()
+            && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+        {
+            b.terminal_at = Some(Instant::now() - by);
+        }
+    }
+
+    #[test]
+    fn a_quiet_tray_holds_a_verdict_until_the_ceiling() {
+        let _g = lock();
+        clear();
+        pin("w_slow000000001", "done");
+        note_terminal("w_slow000000001", false);
+        // Well past the old 45s dwell, and past the 60s floor, but nothing is
+        // asking for the room — so the verdict stays readable.
+        age_verdict("w_slow000000001", DWELL_MIN * 9);
+        sweep();
+        assert_eq!(count(), 1, "no pressure, no retirement before the ceiling");
+        // One tick past the ceiling and the unconditional half fires.
+        age_verdict("w_slow000000001", DWELL_MAX + Duration::from_secs(1));
+        sweep();
+        assert_eq!(count(), 0, "the 15m ceiling always retires a verdict");
+        clear();
+    }
+
+    /// The visible cap is WINDOW-DERIVED ([`max_visible`]), so the pressure
+    /// tests fill to whatever this terminal seats rather than hard-coding three.
+    /// `None` when the window is so tall the store cap ([`MAX_PINNED`]) lands
+    /// first and the tray can never actually fill.
+    fn fillable_cap() -> Option<usize> {
+        let cap = max_visible();
+        (cap <= MAX_PINNED).then_some(cap)
+    }
+
+    #[test]
+    fn a_full_tray_reclaims_the_stalest_dwelled_verdict() {
+        let _g = lock();
+        clear();
+        let Some(cap) = fillable_cap() else { return };
+        // Fill to the visible cap with verdicts that have ALL served the floor,
+        // staggered so the first-pinned row is also the stalest.
+        for i in 0..cap {
+            let id = format!("w_old{i:010}");
+            pin(&id, "done");
+            note_terminal(&id, false);
+            age_verdict(&id, DWELL_MIN * (cap - i) as u32);
+        }
+        assert_eq!(count(), cap);
+        pin("w_new000000001", "live");
+        assert_eq!(count(), cap, "the tray stays at its visible cap");
+        let ids = pinned_ids();
+        assert!(!ids.contains(&"w_old0000000000".to_string()), "{ids:?}");
+        assert!(ids.contains(&"w_new000000001".to_string()), "{ids:?}");
+        clear();
+    }
+
+    #[test]
+    fn tray_pressure_spares_fresh_verdicts_and_live_work() {
+        let _g = lock();
+        clear();
+        let Some(cap) = fillable_cap() else { return };
+        // Fill every slot but one with LIVE work, which pressure may never
+        // touch...
+        for i in 0..cap.saturating_sub(1) {
+            pin(&format!("w_live{i:010}"), "live");
+        }
+        // ...and make the last slot a verdict that landed seconds ago. It is
+        // INSIDE its floor: the operator has not had time to read it, so an
+        // arriving row waits instead of reclaiming the slot.
+        pin("w_fresh00000001", "done");
+        note_terminal("w_fresh00000001", false);
+        age_verdict("w_fresh00000001", DWELL_MIN / 2);
+        assert_eq!(count(), cap);
+        pin("w_new000000001", "live");
+        assert_eq!(
+            count(),
+            cap + 1,
+            "nothing qualified, so the tray overflows into +N more instead"
+        );
+        assert!(pinned_ids().contains(&"w_fresh00000001".to_string()));
         clear();
     }
 
