@@ -1708,8 +1708,18 @@ fn emit_narration(session: &mut Session, text: &str) {
         crate::md::render(text.trim(), "")
     };
     if session.nested {
-        for line in rendered.lines() {
-            eprintln!("🗨 {line}");
+        // ONE narration block = ONE turn. Only the FIRST line carries the `🗨`
+        // turn sentinel; every CONTINUATION line is stamped `🗪` instead. The
+        // parent then renders the turn glyph (🚀) ONCE for the block and
+        // hang-indents the remainder. Stamping `🗨` on every rendered line is
+        // what made a multi-line narration (a table, a code fence) arrive as a
+        // wall of rockets — one per line — and fire a turn pulse per line.
+        for (i, line) in rendered.lines().enumerate() {
+            if i == 0 {
+                eprintln!("🗨 {line}");
+            } else {
+                eprintln!("🗪 {line}");
+            }
         }
     } else {
         eprintln!("{rendered}");
