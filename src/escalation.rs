@@ -1710,7 +1710,6 @@ pub fn render_alert(
     (top, bottom)
 }
 
-
 /// The live banner rows, NEWEST FIRST — one `(escalation_row, status_row)` pair
 /// per painted escalation, empty when nothing is pinned. Reads the global stack
 /// and derives each animation frame from that banner's own clock, so any paint
@@ -1885,6 +1884,122 @@ mod tests {
     /// interleave with each other under the test harness's thread pool.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         super::test_lock()
+    }
+
+    /// An alarm row trades the rule's one-glyph ⏰ badge for three facts, so all
+    /// three have to actually land: the condition on the top row next to the
+    /// glyph, and the watch duration / state / last-update in the SAME three
+    /// columns every other row in the block uses. The column claim is asserted
+    /// by equality against [`render_subwork`]'s status row rather than by
+    /// eyeballing widths — that row is the layout this one was cloned from, so
+    /// equality is the only check that stays true when the cells are retuned.
+    #[test]
+    fn alarm_rows_carry_the_glyph_summary_and_the_shared_status_columns() {
+        let (top, bottom) =
+            render_alert(65_000, "PR 333 is merged", "armed · checked 12s ago", false);
+        assert_eq!(
+            top,
+            format!("{} PR 333 is merged", crate::style::ALERT_GLYPH),
+            "the top row is the glyph plus the condition, nothing else"
+        );
+        let (_, subwork_bottom) =
+            render_subwork(65_000, "any label", "armed · checked 12s ago", false);
+        assert_eq!(
+            bottom, subwork_bottom,
+            "alarm status cells must sit in the ledger row's columns"
+        );
+        assert!(
+            bottom.contains(IDLE_PREFIX),
+            "a monitor executes nothing, so no heartbeat: {bottom}"
+        );
+        assert!(
+            bottom.contains("armed") && bottom.contains("checked 12s ago"),
+            "state and last-update both reach the status cells: {bottom}"
+        );
+
+        // An empty condition still paints a row — the glyph alone — instead of
+        // a stray leading space.
+        let (bare, _) = render_alert(0, "   ", "armed", false);
+        assert_eq!(bare, crate::style::ALERT_GLYPH);
+    }
+
+    /// The lifecycle the row's runtime cell depends on: pinned ONCE when the
+    /// alarm is first seen (clock starts), REFRESHED in place on later polls
+    /// (status changes, clock does not restart), and retired the moment the
+    /// monitor leaves the armed set. Plus the same containment every non-worker
+    /// row needs — `alert:…` is not a run id, so it must never reach the REPL's
+    /// worker lookups or Shift-Tab cycling.
+    #[test]
+    fn alarm_rows_keep_their_clock_across_refreshes_and_retire_when_disarmed() {
+        let _g = lock();
+        let alert_rows = || {
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|b| b.kind == Kind::Alert)
+                .map(|b| (b.id.clone(), b.task.clone(), b.status.clone()))
+                .collect::<Vec<_>>()
+        };
+        sync_alerts(&[]);
+
+        sync_alerts(&[AlertRow {
+            id: "7".to_string(),
+            summary: "PR 333 is merged".to_string(),
+            status: "armed · awaiting first check".to_string(),
+        }]);
+        let pinned_at = BANNERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|b| b.kind == Kind::Alert)
+            .map(|b| b.pinned_at)
+            .expect("the alarm pins a row");
+
+        // Second poll: same monitor, newer check → status text moves, clock doesn't.
+        sync_alerts(&[AlertRow {
+            id: "7".to_string(),
+            summary: "PR 333 is merged".to_string(),
+            status: "armed · checked 2s ago".to_string(),
+        }]);
+        assert_eq!(
+            alert_rows(),
+            vec![(
+                "alert:7".to_string(),
+                "PR 333 is merged".to_string(),
+                "armed · checked 2s ago".to_string()
+            )],
+            "one row per monitor, refreshed in place"
+        );
+        assert_eq!(
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|b| b.kind == Kind::Alert)
+                .map(|b| b.pinned_at),
+            Some(pinned_at),
+            "refresh must not restart the watch clock"
+        );
+
+        // Not a worker: neither REPL-facing id list may hand out `alert:…`.
+        assert!(
+            !pinned_ids().iter().any(|id| id.starts_with("alert:")),
+            "pinned_ids feeds worker lookups"
+        );
+        assert!(
+            !tray_order_ids().iter().any(|id| id.starts_with("alert:")),
+            "tray_order_ids feeds Shift-Tab cycling"
+        );
+
+        // Armed rows survive the dwell sweep — a monitor has no terminal stamp.
+        sweep();
+        assert_eq!(alert_rows().len(), 1, "an armed alarm is never swept");
+
+        // Disarmed (fired or cancelled) → the row leaves rather than keep
+        // claiming a watch that ended.
+        sync_alerts(&[]);
+        assert!(alert_rows().is_empty(), "disarmed alarms retire");
     }
 
     /// A ledger row DESCRIBES a slice of its parent's work; it has no process

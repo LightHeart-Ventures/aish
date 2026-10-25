@@ -2927,7 +2927,6 @@ fn refresh_escalation_alerts(store: Option<&crate::db::AlertStore>) {
     crate::escalation::sync_alerts(&rows);
 }
 
-
 fn refresh_escalation_subworkers(
     store: Option<&crate::db::CoordinatorStore>,
     aliases: &[(String, Vec<String>)],
@@ -16382,6 +16381,12 @@ mod tests {
         // emoji was pure duplication. Whatever the worker state, the badge
         // string stays free of the robot glyph.
         assert!(!status_badges(&session).contains('🤖'));
+        // Nor can an ARMED alarm light the rule: alarms now live as their own
+        // tray rows (elapsed clock + condition + last check), so the rule's
+        // badge set has no alert input at all — the function cannot even see a
+        // store. Asserted on the signature-free path so a future re-wiring that
+        // reintroduces the glyph trips here.
+        assert!(!status_badges(&session).contains(crate::style::ALERT_GLYPH));
     }
 
     #[test]
