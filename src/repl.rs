@@ -822,16 +822,15 @@ pub async fn run(
                                 let _ = store.touch_alert_check(a.id, now);
                                 // Worker monitors probe the coordinator store;
                                 // everything else uses the file/command probes.
-                                let fired = if matches!(
-                                    a.kind,
-                                    crate::alert::AlertKind::WorkerDone { .. }
-                                ) {
-                                    durable_store
-                                        .as_ref()
-                                        .and_then(|s| crate::alert::poll_worker(&a, s))
-                                } else {
-                                    crate::alert::poll(&a)
-                                };
+                                let fired =
+                                    if matches!(a.kind, crate::alert::AlertKind::WorkerDone { .. })
+                                    {
+                                        durable_store
+                                            .as_ref()
+                                            .and_then(|s| crate::alert::poll_worker(&a, s))
+                                    } else {
+                                        crate::alert::poll(&a)
+                                    };
                                 if let Some(fired) = fired {
                                     let _ =
                                         store.mark_alert_fired(a.id, &fired.detail, &fired.short);

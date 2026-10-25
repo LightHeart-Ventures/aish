@@ -61,7 +61,13 @@ surfaced, never silently marked done. If a sub-item cannot be completed, mark it
 reason and say so in your final answer.";
 
 /// Lifecycle state of a single sub-work-item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Serialize`/`Deserialize` are what let the ledger ride the durable
+// `coordinator_runs.subwork` column out of the coordinator subprocess and into
+// the parent shell's escalation tray. `rename_all = "lowercase"` makes the wire
+// form identical to [`SubWorkStatus::as_str`], so the JSON and the `📣` console
+// note can never disagree about what "done" is called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SubWorkStatus {
     /// Declared but not started.
     Pending,
@@ -109,7 +115,7 @@ impl SubWorkStatus {
 
 /// One sub-work-item. Deliberately has NO worktree/branch field: every item
 /// runs in the parent worker's worktree, which the [`SubWorkLedger`] owns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SubWorkItem {
     /// Lowercase-kebab slug the worker uses to refer to this item.
     pub id: String,
@@ -495,6 +501,42 @@ fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Durable transport for the escalation tray.
+//
+// The ledger is built and mutated INSIDE the coordinator subprocess, but the
+// tray that has to draw it lives in the parent shell. Rather than teach the
+// parent to sentinel-parse the child's console stream (fragile, and lost the
+// moment the line scrolls or the shell restarts), the coordinator snapshots the
+// ledger as JSON into `coordinator_runs.subwork` — the same durable table every
+// other tray row is already fed from. These two functions are that wire format.
+// ---------------------------------------------------------------------------
+
+impl SubWorkLedger {
+    /// Snapshot the live items as a compact JSON array of
+    /// `{"id","intent","status","note"}`.
+    ///
+    /// Dropped (cap-rejected) ids are deliberately NOT included: they are not
+    /// work the worker is doing, so they must not appear as tray rows — they
+    /// surface in the verification report instead.
+    ///
+    /// Infallible by construction (a `Vec` of plain strings + a unit enum), but
+    /// we still degrade to `[]` rather than panicking: a cosmetic tray row is
+    /// never worth taking a worker down for.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.items).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+/// Reader half of [`SubWorkLedger::to_json`], for the parent shell.
+///
+/// Returns an empty vec for anything unparseable — a NULL column, a row written
+/// by an older build, or a truncated write. "No ledger" and "bad ledger" collapse
+/// to the same safe outcome: draw no sub-work rows.
+pub fn parse_json(s: &str) -> Vec<SubWorkItem> {
+    serde_json::from_str(s).unwrap_or_default()
 }
 
 #[cfg(test)]

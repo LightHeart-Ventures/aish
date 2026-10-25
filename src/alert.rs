@@ -180,7 +180,6 @@ pub fn poll_worker(alert: &Alert, probe: &dyn WorkerProbe) -> Option<Fired> {
     Some(Fired { detail, short })
 }
 
-
 /// An armed alert. `condition` is the operator's raw request, preserved verbatim
 /// for display and for a delegated coordinator's task.
 #[derive(Clone, Debug)]
