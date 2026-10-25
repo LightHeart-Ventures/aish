@@ -2022,17 +2022,38 @@ pub fn spawn_budget_ok(current: u32) -> bool {
 /// Dispatch gate: `Ok(())` when this process may still fork a coordinator, else
 /// an `Err` carrying an operator-facing message. Called by every spawn site
 /// (`run_in_background`, `:dispatch`, scheduled/alert workers) BEFORE forking.
+///
+/// Checks THREE independent ceilings, because a fork-bomb only needs one of
+/// them to be unbounded:
+///
+/// 1. **Depth** — `AISH_SPAWN_BUDGET` (TASK-287): how many levels of nested
+///    coordinator this chain may still fork.
+/// 2. **Width** — `AISH_SPAWN_WIDTH_MAX`: how many workers this run may have in
+///    flight at once.
+/// 3. **Total** — `AISH_SPAWN_TOTAL_MAX`: how many workers this run may
+///    dispatch over its whole lifetime.
+///
+/// Depth alone left the common case open: a coordinator that never nests can
+/// still fan out a fifty-wide wave, or trickle out workers indefinitely, and the
+/// depth budget waves every one through. Width and total bound that at *every*
+/// depth — see [`crate::spawn_ledger`].
+///
+/// The width/total halves are a non-mutating PRE-CHECK so an over-budget call is
+/// refused up front with a clear message. They can go stale between this check
+/// and the launch, so the launch site ([`run_worker`]) still takes an atomic
+/// [`crate::spawn_ledger::SpawnTicket`], which is the authoritative guard.
 pub fn spawn_budget_gate() -> Result<(), String> {
     let budget = spawn_budget();
-    if spawn_budget_ok(budget) {
-        Ok(())
-    } else {
-        Err(format!(
+    if !spawn_budget_ok(budget) {
+        return Err(format!(
             "coordinator spawn budget exhausted ({SPAWN_BUDGET_ENV}={budget}) — refusing to spawn a \
 nested coordinator to prevent a runaway fork-bomb. This is the depth guard (TASK-287); raise the \
 budget only if you understand the recursion risk."
-        ))
+        ));
     }
+    // Per-run width + total ceilings. Bounds the runaway case at any depth, not
+    // just nesting.
+    crate::spawn_ledger::check().map_err(|denial| denial.message())
 }
 
 /// Build the `tokio::process::Command` that re-execs aish in `--coordinator`
@@ -4223,6 +4244,25 @@ async fn run_worker(
     // through this id; leaving it pointed at the previous (terminal) thread is
     // what let a running worker render as `done`.
     job.set_run_id(&run_id);
+    // Per-run spawn ledger: the AUTHORITATIVE width/total guard (the gate's
+    // check is only a pre-flight fast path that can go stale between the call
+    // and this launch). `acquire` is a single atomic compare-and-swap, so
+    // concurrent launches racing at the ceiling cannot both win.
+    //
+    // The ticket is held for the worker's whole lifetime and released by `Drop`
+    // on EVERY exit path below — the early `return`s, an error, or a panic — so
+    // the width gauge can't leak a slot and wedge the guard shut.
+    let _spawn_ticket = match crate::spawn_ledger::SpawnTicket::acquire() {
+        Ok(ticket) => ticket,
+        Err(denial) => {
+            // Fail loudly rather than silently over-dispatching: the operator
+            // gets the ceiling that was hit, the live counts, and the env var to
+            // raise. Costs one re-dispatch; exceeding the budget costs the host.
+            job.set_failed(denial.message());
+            on_complete(&jobs, &job);
+            return;
+        }
+    };
     // Space this launch off its siblings' (ISS-407772). A fan-out wave otherwise
     // hits `git worktree add`'s index.lock, the re-exec, and the first upstream
     // call all in the same instant — a correlated launch failure that kills the
