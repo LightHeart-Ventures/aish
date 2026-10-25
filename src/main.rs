@@ -321,6 +321,11 @@ async fn main() -> Result<()> {
     timer.mark("args parsed");
     // Honor --no-color process-wide before anything styles output.
     style::set_no_color(args.no_color);
+    // OPT-IN (default OFF): register credential-looking environment variables
+    // with the redactor so a pre-existing secret in the ambient environment is
+    // scrubbed if a background job or program ever echoes it
+    // (SEC-3.2 / TASK-947 AC9). No-op unless AISH_REDACT_ENV is truthy.
+    redact::register_env_secrets();
 
     // `aish --update`: non-interactive self-upgrade. Check the latest release and,
     // if it's newer for this platform, download + swap the binary, then exit.

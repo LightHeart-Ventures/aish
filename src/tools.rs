@@ -3249,8 +3249,10 @@ where
     tokio::spawn(async move {
         let mut lines = BufReader::new(pipe).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            job.push_line(&line);
-            announce(&format!("[job {}]", job.id), &line);
+            // Scrub at capture time, then echo exactly what was retained so
+            // the console stream can never show a secret the buffer hides.
+            let shown = job.push_line(&line);
+            announce(&format!("[job {}]", job.id), &shown);
         }
     });
 }
@@ -3270,7 +3272,11 @@ fn job_output(call: &ToolCall, session: &Session) -> Result<String> {
             .iter()
             .find(|j| j.id == id)
             .ok_or_else(|| anyhow::anyhow!("no such job: {id} (see :jobs)"))?;
-        let buf = job.output();
+        // Defence in depth: `Job::push_line` already scrubs at CAPTURE time,
+        // but scrub again on the way to the model so a secret registered
+        // AFTER the line was buffered (e.g. a `${profile:KEY}` resolved later
+        // in the turn) still never reaches model context (SEC-3.2 / TASK-947).
+        let buf = crate::redact::scrub_owned(job.output());
         return Ok(format!(
             "[job {id}: {}] {}\n{}",
             job.status(),
