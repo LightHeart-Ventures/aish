@@ -4041,7 +4041,7 @@ pub fn resume_in_place(
     // tray's contract is "every live worker has a row" — but by the time an
     // operator types a follow-up, the previous thread's banner has already been
     // retired: it reached a terminal state and `escalation::sweep` dropped it once
-    // `DWELL` elapsed. Without this the worker comes back to life in `:workers`
+    // the dwell elapsed. Without this the worker comes back to life in `:workers`
     // with NO tray row at all, which is the reported bug — five live workers, one
     // banner, the four resumed (`↻N`) ones invisible in the tray.
     //
