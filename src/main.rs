@@ -38,6 +38,7 @@ mod midturn_input;
 mod modelfetch;
 #[cfg(test)]
 mod oracle;
+mod paste_registry;
 mod pipeline;
 mod plan;
 /// TASK-809 — the five-step loop (`review-ask → review-state → identify-delta →

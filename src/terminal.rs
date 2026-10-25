@@ -3414,10 +3414,25 @@ mod tests {
             Some(b"prefix \x1b[200~alpha\nbeta\ngamma\x1b[201~ suffix\r"),
         );
         let output = String::from_utf8_lossy(&bytes);
-        assert!(output.contains("[pasted 3 lines from clipboard]"));
+        // Submit is what turns bracketed paste back off, so the last
+        // `?2004l` is the seam between the LIVE composer and the COMMITTED
+        // echo. The two halves now have opposite invariants.
+        let (editing, echo) = output
+            .rsplit_once("\x1b[?2004l")
+            .expect("bracketed paste was never disabled");
         assert!(
-            !output.contains("beta"),
-            "clipboard payload leaked into prompt: {output}"
+            editing.contains("[pasted 3 lines from clipboard]"),
+            "composer did not collapse the paste: {editing}"
+        );
+        assert!(
+            !editing.contains("beta"),
+            "clipboard payload leaked into the composer: {editing}"
+        );
+        // The committed echo carries the real text, so scrollback is a
+        // self-contained record of what was actually submitted.
+        assert!(
+            echo.contains("beta"),
+            "committed echo kept the stub instead of the pasted text: {echo}"
         );
     }
 
