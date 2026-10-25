@@ -1387,6 +1387,22 @@ final status plus your best partial result. After this turn you are terminated."
         // Pure parsing over text already in hand: no extra model call, no I/O.
         subwork.ingest(&answer);
         if let Some(progress) = subwork.progress_if_changed() {
+            // ── Durable transport for the tray (sub-work ledger → tray rows).
+            // The `📣` note below is a TRANSCRIPT artifact: it lands in the body
+            // stream and dies there. The escalation tray is fed exclusively from
+            // the durable `coordinator_runs` table (that is how every other tray
+            // row — status, phase, title, activity summary, sub-WORKER rows —
+            // arrives), so a ledger that only exists in the console stream can
+            // never become a tray row. Stamp the ledger onto OUR row here and the
+            // interactive shell's existing poll loop picks it up like everything
+            // else, with restart-survival for free.
+            //
+            // Gated behind `progress_if_changed()` so this is one UPDATE per
+            // actual ledger CHANGE, not per round. Errors are swallowed: a failed
+            // cosmetic write must never take down the run.
+            if let Some(s) = store {
+                let _ = s.set_subwork(run_id, &subwork.to_json());
+            }
             // Emit on the ALWAYS-SURFACED `📣` console channel, NOT plain stderr.
             // Plain stderr from a coordinator is filtered by
             // `worker::forward_decision`, which gates it behind `:worker-output`

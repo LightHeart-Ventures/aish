@@ -464,6 +464,18 @@ impl CoordinatorStore {
         // present, so the migration is idempotent, and pre-migration rows read
         // back NULL (callers fall back to clipping the brief).
         let _ = conn.execute("ALTER TABLE coordinator_runs ADD COLUMN title TEXT", []);
+        // Sub-WORK ledger snapshot (`crate::subwork::SubWorkLedger`), as a
+        // compact JSON array of `{id,intent,status,note}`. The ledger lives
+        // inside the coordinator SUBPROCESS, so before this column its only
+        // escape hatch was a `📣` console note in the body transcript — the
+        // escalation tray, which is fed exclusively by polling THIS table,
+        // could never see it. One column makes the ledger a durable, pollable
+        // fact like every other tray input (it also survives a restart, which
+        // a scrolled-past console note does not). Additive `ADD COLUMN` — the
+        // duplicate-column error is swallowed once present, so the migration
+        // is idempotent, and pre-migration rows read back NULL (no ledger
+        // rows, which is exactly the pre-feature behaviour).
+        let _ = conn.execute("ALTER TABLE coordinator_runs ADD COLUMN subwork TEXT", []);
         // Worker-run cost/effort metrics captured from the coordinator session
         // totals at terminal exit: cumulative prompt/completion tokens, agentic
         // turns, and tool-call count. Additive `ADD COLUMN` with a constant
@@ -773,6 +785,49 @@ impl CoordinatorStore {
             .unwrap()
             .query_row(
                 "SELECT activity_summary FROM coordinator_runs WHERE run_id = ?1",
+                rusqlite::params![run_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Persist this run's sub-work ledger snapshot (see [`crate::subwork`]) as
+    /// JSON. Written by the coordinator SUBPROCESS each time the ledger
+    /// actually changes; read by the PARENT shell to draw indented sub-work
+    /// rows in the escalation tray.
+    ///
+    /// Last-write-wins on a single column, exactly like `set_activity_summary`,
+    /// so a concurrent heartbeat / phase / summary write can never be clobbered
+    /// by it — and like those it is deliberately OUTSIDE the terminal
+    /// `finish_run` transaction: a tray row is cosmetic and must never
+    /// interfere with the run's real bookkeeping.
+    pub fn set_subwork(&self, run_id: &str, json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE coordinator_runs SET subwork = ?2 WHERE run_id = ?1",
+            rusqlite::params![run_id, json],
+        )?;
+        Ok(())
+    }
+
+    /// Read back one run's sub-work ledger JSON. `None` when the row is absent,
+    /// pre-migration, or the worker declared no sub-work at all — all three mean
+    /// the same thing to the tray: draw no ledger rows.
+    ///
+    /// Single-column point lookup on the primary key, polled by the parent for a
+    /// LIVE worker whose ledger is written by its coordinator subprocess (so the
+    /// in-memory [`crate::worker::WorkerJob`] never sees it directly). Callers
+    /// throttle — see `refresh_escalation_subworkers`'s `SUB_POLL` gate.
+    pub fn subwork(&self, run_id: &str) -> Option<String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT subwork FROM coordinator_runs WHERE run_id = ?1",
                 rusqlite::params![run_id],
                 |r| r.get::<_, Option<String>>(0),
             )

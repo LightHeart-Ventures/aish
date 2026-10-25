@@ -64,7 +64,7 @@
 //! ```text
 //!   🚀 w_a7k3m2 · ship the sprint
 //!      ♥ 4m02s · running · fanning out the card work
-//!     ↳ 🚀 wire the tray rows                   <- sub-work, one indent in
+//!     ↳ 🚀 wire the tray rows                   <- sub-WORKER, one indent in
 //!        ♥ 1m12s · running · 🔧 read_file src/escalation.rs
 //! ```
 //!
@@ -73,6 +73,31 @@
 //! `+N more` tail). Only a LIVE child is pinned — a finished one keeps its
 //! durable row forever, so pinning on phase alone would resurrect a verdict that
 //! had already aged out and give the tray an immortal row.
+//!
+//! SUB-WORK LEDGER (decomposition, NOT fan-out). A worker that keeps a slice
+//! list for ITSELF — `crate::subwork`'s ledger, which explicitly tells workers
+//! NOT to spawn a child per slice — produces zero `coordinator_runs` rows, so
+//! the `parent_run_id` walk above can never find it; before [`pin_subwork`] the
+//! ledger escaped only as a `📣` console note in the transcript. The coordinator
+//! now also writes the ledger to its own durable row (`coordinator_runs.subwork`)
+//! on every change, the REPL reads it back for each visible worker, and
+//! [`sync_subwork`] reconciles one STATIC row per item under the parent:
+//!
+//! ```text
+//!   🚀 w_a7k3m2 · ship the sprint
+//!      ♥ 4m02s · running · fanning out the card work
+//!     ↳ ✅ read the board                       <- sub-WORK ledger item
+//!        · 2m41s · done · 7 cards, 3 blocked
+//!     ↳ 🧩 write the specs
+//!        · 1m09s · running · drafting card 2 of 3
+//! ```
+//!
+//! These rows are DELIBERATELY inert: no heartbeat (nothing is executing per
+//! item — the parent's own heart covers them all), not in [`pinned_ids`] (the
+//! REPL would look up a worker that doesn't exist), not in [`tray_order_ids`]
+//! (Shift-Tab must not cycle onto a row you cannot attach to) and not in
+//! [`animating`]. Their ids are namespaced `sw:{parent}:{item}` so they can
+//! never be mistaken for a run id.
 //!
 //! ANIMATION AND LIVENESS. The head row keeps its static rocket identity.
 //! The status row uses one heart for both the heartbeat animation and worker
@@ -199,6 +224,12 @@ pub const QUEUED_GLYPH: &str = "⏳";
 /// The head-row label for a queued line (where an escalation shows its `w_…`).
 pub const QUEUED_LABEL: &str = "queued";
 
+/// The head-row glyph for an OPEN sub-work ledger item — a slice of the parent's
+/// own work, which is what a puzzle piece says and a rocket (a launched worker)
+/// would not. Width-2 like 🚀/⏳/✅, so a ledger row's task hint starts on the
+/// same column as every other row's.
+pub const SUBWORK_GLYPH: &str = "🧩";
+
 /// Pulse frame cadence; the footer repaint task uses this same interval.
 pub const FRAME_MS: u64 = 220;
 
@@ -274,12 +305,21 @@ pub(crate) const BEAT_COL: usize = 8;
 
 /// What a tray row is tracking.
 ///
-/// The tray holds two kinds of PENDING work, and the distinction is load-bearing
-/// rather than cosmetic: a [`Kind::Escalation`] has a live coordinator behind it
-/// (so it animates, carries a liveness heart, and is refreshed from the worker
-/// list), while a [`Kind::Queued`] line has nothing running yet (so it is static
-/// and is skipped by every coordinator-scoped mutator). Mixing them in one store
-/// is what lets a single footer block show everything the operator is waiting on.
+/// The tray holds three kinds of PENDING work, and the distinction is
+/// load-bearing rather than cosmetic: a [`Kind::Escalation`] has a live
+/// coordinator PROCESS behind it (so it animates, carries a liveness heart, and
+/// is refreshed from the worker list), while a [`Kind::Queued`] line and a
+/// [`Kind::SubWork`] ledger item have no process of their own (so both are
+/// static and are skipped by every coordinator-scoped mutator). Mixing them in
+/// one store is what lets a single footer block show everything the operator is
+/// waiting on.
+///
+/// Every coordinator-scoped mutator ([`set_status`], [`set_task`], [`set_beat`],
+/// [`note_terminal`], [`unpin`], [`sweep`]) and every id-exporting accessor
+/// ([`pinned_ids`], [`tray_order_ids`], [`animating`]) already filters on
+/// `kind == Kind::Escalation`, so a new process-less kind is excluded from all
+/// of them by construction — adding [`Kind::SubWork`] cannot hand the REPL a row
+/// id with no worker behind it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     /// A background coordinator launched by `run_in_background`.
@@ -287,6 +327,12 @@ enum Kind {
     /// A line the operator submitted mid-turn, parked in the REPL's type-ahead
     /// queue until the current turn ends.
     Queued,
+    /// One item from a worker's SUB-WORK LEDGER (`crate::subwork`): a slice of
+    /// work the coordinator declared and is doing ITSELF, in its own worktree.
+    /// There is no child process and no `coordinator_runs` row — the ledger
+    /// rides the parent's durable `subwork` column — so the row is static, has
+    /// no heartbeat, and is never a Shift-Tab target.
+    SubWork,
 }
 
 /// One pinned escalation. Many can be live at once — see the STACKING note in
@@ -499,6 +545,138 @@ fn push_banner_inner(id: &str, task: &str, parent: Option<&str>, age_ms: u64) {
             .or_else(|| banners.iter().position(|b| b.kind == Kind::Escalation))
             .unwrap_or(0);
         banners.remove(victim);
+    }
+}
+
+/// One item of a worker's SUB-WORK LEDGER, flattened for the tray.
+///
+/// Deliberately NOT `crate::subwork::SubWorkItem`: the tray is a rendering
+/// surface and the ledger is a coordinator-side protocol, so the caller
+/// (`repl::refresh_escalation_subworkers`) does the translation and this module
+/// stays free of coordinator imports — which is also what keeps the unit tests
+/// below able to build a row without a ledger, a store or a subprocess.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubWorkRow {
+    /// The ledger's own kebab slug for the item (`SubWorkItem::id`). Scoped to
+    /// its parent, so it only has to be unique within one ledger.
+    pub id: String,
+    /// What the item is meant to accomplish — the row's task hint.
+    pub label: String,
+    /// Lifecycle word (`pending` / `running` / `done` / `failed`), matching the
+    /// vocabulary [`split_status`] already understands.
+    pub status: String,
+    /// Latest one-line note from the worker, or empty.
+    pub note: String,
+}
+
+/// The tray id a ledger item occupies: `sw:{parent}:{item}`.
+///
+/// NAMESPACED ON PURPOSE. Coordinator ids are `w_…`, queued rows are `q#…`, so
+/// an `sw:` prefix can never collide with a real run id — which matters because
+/// a collision would let a ledger item answer to a coordinator-scoped mutator
+/// (or worse, be handed to the REPL as a worker to look up). The parent id is
+/// part of the key so two workers declaring the same slug (`wire-the-tests`)
+/// keep separate rows.
+fn subwork_row_id(parent: &str, item: &str) -> String {
+    format!("sw:{parent}:{item}")
+}
+
+/// Pin (or refresh) ONE ledger item as a static row nested under `parent`.
+///
+/// UPDATE IN PLACE, unlike [`pin_sub`]: a ledger is polled from the parent's
+/// durable `subwork` column and re-read on every pass, so the same key arrives
+/// over and over with a MOVING status (`pending` → `running` → `done`). The row
+/// therefore keeps its original `pinned_at` (so its clock reads "how long this
+/// item has been on screen" rather than restarting every poll) while taking the
+/// newest label and status text.
+///
+/// Ledger rows NEVER displace real work: at a full tray the push is dropped
+/// instead of running [`evict_for_tray_pressure`], because a row that merely
+/// describes a slice of a worker's own work is worth strictly less than the row
+/// of a worker that is actually running. The ledger itself is capped
+/// (`crate::subwork::MAX_SUBWORK_ITEMS`), so the drop is a backstop, not the
+/// normal path.
+pub fn pin_subwork(parent: &str, key: &str, label: &str, status: &str) {
+    crate::terminal::repaint_escalation_around(|| {
+        let Ok(mut banners) = BANNERS.lock() else {
+            return;
+        };
+        let id = subwork_row_id(parent, key);
+        if let Some(slot) = banners
+            .iter_mut()
+            .find(|b| b.kind == Kind::SubWork && b.id == id)
+        {
+            slot.task = label.to_string();
+            slot.status = status.to_string();
+            slot.parent = Some(parent.to_string());
+            return;
+        }
+        if banners.len() >= MAX_PINNED {
+            return;
+        }
+        banners.push(Banner {
+            kind: Kind::SubWork,
+            id,
+            task: label.to_string(),
+            parent: Some(parent.to_string()),
+            pinned_at: Instant::now(),
+            // No process, so no verdict to stamp and no heartbeat to claim:
+            // `phase` reads this row's lifecycle out of `status` instead (see
+            // the SubWork note there), and the renderer draws the static
+            // [`IDLE_PREFIX`] where a live row draws its heart.
+            terminal_at: None,
+            failed: false,
+            status: status.to_string(),
+            beat: None,
+        });
+    });
+}
+
+/// Reconcile `parent`'s ledger rows against `items` in one pass: pin/refresh
+/// everything present, drop every `sw:{parent}:…` row whose item is gone.
+///
+/// The unpin half is why this exists rather than a bare loop of [`pin_subwork`]:
+/// a worker can RETRACT an item (a slice it decided it didn't need), and a row
+/// with nothing behind it would otherwise sit in the tray until the parent
+/// retired. Scoped to this parent's prefix, so one worker's ledger can never
+/// reap another's rows.
+///
+/// An empty `items` is the normal case (most workers declare no sub-work at
+/// all): it clears this parent's ledger rows and touches nothing else, so the
+/// sub-WORKER rows fed by [`pin_sub`] are undisturbed.
+pub fn sync_subwork(parent: &str, items: &[SubWorkRow]) {
+    let prefix = format!("sw:{parent}:");
+    let stale: Vec<String> = {
+        let Ok(banners) = BANNERS.lock() else {
+            return;
+        };
+        banners
+            .iter()
+            .filter(|b| b.kind == Kind::SubWork && b.id.starts_with(&prefix))
+            .filter(|b| {
+                !items
+                    .iter()
+                    .any(|it| b.id == subwork_row_id(parent, &it.id))
+            })
+            .map(|b| b.id.clone())
+            .collect()
+    };
+    if !stale.is_empty() {
+        crate::terminal::repaint_escalation_around(|| {
+            if let Ok(mut banners) = BANNERS.lock() {
+                banners.retain(|b| !(b.kind == Kind::SubWork && stale.contains(&b.id)));
+            }
+        });
+    }
+    for item in items {
+        // The status cell wants `state · detail`, which is exactly what
+        // [`split_status`] parses back apart on the render path.
+        let status = if item.note.trim().is_empty() {
+            item.status.clone()
+        } else {
+            format!("{} · {}", item.status, item.note)
+        };
+        pin_subwork(parent, &item.id, &item.label, &status);
     }
 }
 
@@ -762,6 +940,12 @@ impl Phase {
 /// decides. An unrecognised head is treated as live rather than as `Starting`:
 /// a row with a pinned coordinator behind it is something the operator is still
 /// waiting on, and mis-sorting it to the bottom would hide active work.
+///
+/// A [`Kind::SubWork`] row needs no special case and deliberately doesn't get
+/// one: it never carries a `terminal_at` (nothing finishes a ledger item but the
+/// worker saying so), so it falls straight through to the status-word match,
+/// which is exactly the classification its ledger status wants — `done` → Done,
+/// `failed` → Failed, `pending` → Starting, `running` → Running.
 fn phase(b: &Banner) -> Phase {
     if b.kind == Kind::Queued {
         return Phase::Starting;
@@ -944,6 +1128,24 @@ pub fn note_terminal(id: &str, failed: bool) {
 pub fn sweep() {
     if let Ok(mut banners) = BANNERS.lock() {
         banners.retain(|b| b.terminal_at.is_none_or(|t| t.elapsed() < DWELL_MAX));
+        // Reap orphaned ledger rows. A [`Kind::SubWork`] row is only ever
+        // refreshed while its parent is pinned (the REPL syncs per VISIBLE
+        // worker), so once the parent retires nothing updates — or removes —
+        // the children, and [`ordered_rows`] would promote them to roots and
+        // paint a slice of work as if it were a worker. Tied to the parent's
+        // lifetime here rather than at the unpin call sites so every path that
+        // can drop a parent (unpin, dwell expiry, tray pressure) is covered.
+        let live: Vec<String> = banners
+            .iter()
+            .filter(|b| b.kind == Kind::Escalation)
+            .map(|b| b.id.clone())
+            .collect();
+        banners.retain(|b| {
+            b.kind != Kind::SubWork
+                || b.parent
+                    .as_deref()
+                    .is_some_and(|p| live.iter().any(|id| id == p))
+        });
     }
 }
 
@@ -1296,6 +1498,58 @@ pub fn render_queued(
     (top, bottom)
 }
 
+/// Build ONE sub-work ledger item's two rows. Pure, like [`render`], and
+/// STATIC like [`render_queued`] — for the same reason: there is no process
+/// behind a ledger item, so a pulsing heart would claim liveness that does not
+/// exist. The parent's own row carries the heartbeat for all of its sub-work.
+///
+/// Dim on BOTH rows: a ledger item is the parent's work broken out, not an
+/// independent escalation, so it reads as detail under the row above instead of
+/// competing with it for the eye. No id cell either — the item's slug is a
+/// coordinator-internal key the operator can't reach for (same argument as
+/// [`render_sub`], one step further: a ledger item isn't even a worker).
+///
+/// `elapsed_ms` is how long the ITEM has been on screen, not how long the worker
+/// has been on it: the ledger is a declaration, not an instrumented span, so the
+/// row's clock starts when the tray first saw the item. It keeps the fixed
+/// [`BEAT_COL`] cell so the runtime column lands on the live rows' runtime
+/// column.
+pub fn render_subwork(
+    elapsed_ms: u64,
+    label: &str,
+    status: &str,
+    color_on: bool,
+) -> (String, String) {
+    use crate::style::{Color, paint_with};
+    let (state, message) = split_status(status);
+    // Same verdict glyphs as a banner so a finished slice reads the way a
+    // finished worker does; everything still open wears the puzzle piece —
+    // "part of the thing above", which is precisely what a ledger item is.
+    let glyph = match state {
+        "done" => "✅",
+        "failed" | "stopped" => "⚠️",
+        _ => SUBWORK_GLYPH,
+    };
+    let hint = one_line(label, TASK_HINT_MAX);
+    let head = if hint.is_empty() {
+        glyph.to_string()
+    } else {
+        format!("{glyph} {hint}")
+    };
+    let top = paint_with(&head, Color::Dim, color_on);
+    let bottom = format!(
+        "{}{} {}",
+        paint_with("   ", Color::Dim, color_on),
+        pad_styled(&paint_with(IDLE_PREFIX, Color::Dim, color_on), BEAT_COL),
+        paint_with(
+            &status_cells(elapsed_ms, state, message),
+            Color::Dim,
+            color_on
+        )
+    );
+    (top, bottom)
+}
+
 /// The live banner rows, NEWEST FIRST — one `(escalation_row, status_row)` pair
 /// per painted escalation, empty when nothing is pinned. Reads the global stack
 /// and derives each animation frame from that banner's own clock, so any paint
@@ -1360,6 +1614,19 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
                     &extra,
                     color_on,
                 );
+            }
+            if b.kind == Kind::SubWork {
+                // Ledger rows are ALWAYS nested: the row describes a slice of
+                // the PARENT's work, so even an orphan (parent evicted, or
+                // retired after its dwell) keeps its indent rather than posing
+                // as a root escalation the operator could attach to.
+                let pair = render_subwork(
+                    elapsed_ms,
+                    &b.task,
+                    &format!("{}{extra}", b.status),
+                    color_on,
+                );
+                return indent_pair(pair, depth.max(1), color_on);
             }
             let terminal = b.terminal_at.map(|_| b.failed);
             // Age the absolute beat here, on the paint path, so each heart keeps
@@ -1437,6 +1704,117 @@ mod tests {
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         static L: Mutex<()> = Mutex::new(());
         L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A ledger row DESCRIBES a slice of its parent's work; it has no process
+    /// of its own. Three things therefore have to hold at once, and all three
+    /// have bitten a nesting feature before: the row paints INDENTED under its
+    /// parent and spends no columns on an id (the arrow already says whose work
+    /// it is), it draws the STATIC idle prefix rather than a pulsing heart (a
+    /// beat would claim a liveness nothing is producing), and it stays out of
+    /// `pinned_ids`/`tray_order_ids` — both feed the REPL, which would try to
+    /// resolve `sw:…` as a coordinator run id and Shift-Tab onto a worker that
+    /// does not exist.
+    #[test]
+    fn subwork_rows_render_nested_static_and_stay_out_of_the_worker_cycle() {
+        let _g = lock();
+        let drop_probes = || {
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|b| b.id != "w_sw_probe" && !b.id.starts_with("sw:w_sw_probe:"));
+        };
+        let sw_rows = || {
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|b| b.kind == Kind::SubWork)
+                .map(|b| (b.id.clone(), b.task.clone(), b.status.clone()))
+                .collect::<Vec<_>>()
+        };
+        drop_probes();
+        push_banner("w_sw_probe", "parent worker");
+
+        sync_subwork(
+            "w_sw_probe",
+            &[SubWorkRow {
+                id: "wire-tray".to_string(),
+                label: "wire the tray rows".to_string(),
+                status: "running".to_string(),
+                note: "editing escalation.rs".to_string(),
+            }],
+        );
+        assert_eq!(
+            sw_rows(),
+            vec![(
+                "sw:w_sw_probe:wire-tray".to_string(),
+                "wire the tray rows".to_string(),
+                "running · editing escalation.rs".to_string()
+            )],
+            "the note rides the status cell as `state · detail`"
+        );
+
+        // Paint and locate the ledger row by its label.
+        let painted = rows(false, 8);
+        let pair = painted
+            .iter()
+            .find(|(a, b)| a.contains("wire the tray rows") || b.contains("wire the tray rows"))
+            .expect("the ledger row paints");
+        let text = format!("{}\n{}", pair.0, pair.1);
+        assert!(text.contains(SUB_ARROW), "ledger rows are always nested");
+        assert!(
+            !text.contains("w_sw_probe"),
+            "nested rows carry no id cell: {text}"
+        );
+        assert!(
+            text.contains(IDLE_PREFIX),
+            "a ledger row has no process, so it draws the static prefix: {text}"
+        );
+
+        // Neither REPL-facing id list may ever hand out a synthetic row id.
+        assert!(
+            !pinned_ids().iter().any(|id| id.starts_with("sw:")),
+            "pinned_ids feeds worker lookups"
+        );
+        assert!(
+            !tray_order_ids().iter().any(|id| id.starts_with("sw:")),
+            "tray_order_ids feeds Shift-Tab cycling"
+        );
+
+        // Same key, moved status → UPDATE IN PLACE, never a second row.
+        sync_subwork(
+            "w_sw_probe",
+            &[SubWorkRow {
+                id: "wire-tray".to_string(),
+                label: "wire the tray rows".to_string(),
+                status: "done".to_string(),
+                note: String::new(),
+            }],
+        );
+        assert_eq!(
+            sw_rows(),
+            vec![(
+                "sw:w_sw_probe:wire-tray".to_string(),
+                "wire the tray rows".to_string(),
+                "done".to_string()
+            )],
+            "re-syncing refreshes the row instead of duplicating it"
+        );
+
+        // A RETRACTED item (and the empty-ledger case) clears this parent's
+        // rows and leaves the parent's own banner alone.
+        sync_subwork("w_sw_probe", &[]);
+        assert!(sw_rows().is_empty(), "vanished items are unpinned");
+        assert!(
+            BANNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|b| b.id == "w_sw_probe" && b.kind == Kind::Escalation),
+            "syncing a ledger must not evict the parent"
+        );
+        drop_probes();
     }
 
     /// A queued line's tray row means "typed, NOT yet run", so the rows must
