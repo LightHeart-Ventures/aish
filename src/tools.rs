@@ -952,7 +952,6 @@ const READ_ONLY_PROGRAMS: &[&str] = &[
     "type",
     "md5sum",
     "sha256sum",
-    "diff",
 ];
 
 const GIT_READ_ONLY: &[&str] = &[
@@ -8765,6 +8764,18 @@ them by review age\nthen file a report";
             program: "cmake",
             args: &["-P", "script.cmake"],
             normal: true,
+            careful: true,
+        },
+        // `diff` is no longer on the read-only allowlist (TASK-939 AC): it is
+        // not provably read-only in the sense the allowlist promises, so
+        // Careful mode must ask about it instead of auto-allowing it. Normal
+        // mode still stays quiet -- dropping the allowlist entry re-enables
+        // the fuzzy verb scan, it does not reclassify `diff` as destructive.
+        GateCase {
+            name: "diff is off the read-only allowlist (Careful asks)",
+            program: "diff",
+            args: &["a", "b"],
+            normal: false,
             careful: true,
         },
         // Positive controls for the rows above: the stdout form of `sed` is a
