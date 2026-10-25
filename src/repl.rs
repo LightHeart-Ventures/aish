@@ -5918,12 +5918,53 @@ fn liftoff_banner_body(verb: &str, short: &str, summary: &str) -> String {
 /// context …` directly above a tray row reading `w_MvA9HUdU · dai-TODO gap
 /// analysis & build plan`. The title is written by the coordinator SUBPROCESS a
 /// moment after it boots (credential + one lightweight model call), so the
-/// parent cannot have it at spawn time — it has to wait for it.
+/// parent never has it at spawn time.
 ///
-/// Bounded, because the title is COSMETIC: a run with no Claude credential never
-/// writes one, and the banner must still print. On a TTY the wait is spent
-/// animating the liftoff frames, so it reads as the launch it is, not a stall.
-const LIFTOFF_TITLE_WAIT: Duration = Duration::from_secs(5);
+/// It also cannot GET it quickly, and that is the whole point of this knob. The
+/// child has to re-exec aish, open the store, take its own `git worktree` (behind
+/// the repo's `index.lock`), resolve a credential, and finish a model call before
+/// any title exists — and in a fan-out every launch is additionally spaced by
+/// `worker`'s spawn stagger. Seconds, typically. The original 5s grace therefore
+/// almost never WON that race: it just blocked the REPL thread — the operator's
+/// prompt — for the full budget and then printed the clipped brief anyway, once
+/// per dispatch and N times over across a fan-out wave. That is the "significant
+/// delay right after the 🚀 dispatched-to-background-worker line" bug.
+///
+/// So the default grace is deliberately short: long enough to pick up a title
+/// that is ALREADY stamped (a re-dispatch, a resumed run, a `--no-isolate` child
+/// that booted while we were still animating), never long enough to hold the
+/// prompt hostage waiting for one that is still being written. Nothing is lost
+/// when the title lands late — the tray row and `:workers` swap it in the moment
+/// it appears (`refresh_escalation_status`); only the static scrollback line
+/// keeps the brief. Bounded in the other direction too, because the title is
+/// COSMETIC: a run with no credential never writes one, and the banner must
+/// still print.
+///
+/// Operators who want the old wait-for-the-name behaviour can raise it
+/// (`AISH_LIFTOFF_TITLE_WAIT_MS=5000`); `0` skips the title poll entirely and
+/// prints the brief with no delay at all.
+pub(crate) const LIFTOFF_TITLE_WAIT_ENV: &str = "AISH_LIFTOFF_TITLE_WAIT_MS";
+
+/// Default title grace: a few frames past the arrow sweep, so the banner still
+/// resolves an already-stamped title without ever becoming a perceptible stall.
+const DEFAULT_LIFTOFF_TITLE_WAIT_MS: u64 = 600;
+
+/// Pure parse of the title-grace override → testable without touching the env.
+/// Anything unparseable falls back to the default, so a typo degrades to the
+/// shipped behaviour instead of silently disabling (or unbounding) the wait.
+fn liftoff_title_wait_from(raw: Option<&str>) -> Duration {
+    Duration::from_millis(
+        raw.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_LIFTOFF_TITLE_WAIT_MS),
+    )
+}
+
+/// The live title grace, honouring [`LIFTOFF_TITLE_WAIT_ENV`].
+fn liftoff_title_wait() -> Duration {
+    liftoff_title_wait_from(std::env::var(LIFTOFF_TITLE_WAIT_ENV).ok().as_deref())
+}
 
 /// Frame cadence of the liftoff animation — and, after the arrow sweep settles,
 /// the spacing of the title poll (a single-column primary-key lookup).
@@ -5954,22 +5995,26 @@ fn liftoff_label(
     let deadline = Instant::now() + wait;
     let mut i = 0usize;
     loop {
+        // Resolve BEFORE sleeping, so a label we can already settle costs zero
+        // wall-clock: no store, a stamped title, or an exhausted grace all exit
+        // here. Only an undecided label pays for another frame. The sweep is
+        // non-negotiable, so the first `min_frames` iterations skip the check
+        // and just animate — a title that is already stamped cannot swallow the
+        // animation, and a zero grace still can't cost more than the sweep.
+        if i >= min_frames {
+            let Some(store) = store else {
+                return liftoff_summary(task, budget);
+            };
+            if let Some(title) = store.title(run_id) {
+                return liftoff_summary(&title, budget);
+            }
+            if Instant::now() >= deadline {
+                return liftoff_summary(task, budget);
+            }
+        }
         frame(i);
         std::thread::sleep(LIFTOFF_FRAME);
         i += 1;
-        // The sweep is non-negotiable; only afterwards do frames buy title time.
-        if i < min_frames {
-            continue;
-        }
-        let Some(store) = store else {
-            return liftoff_summary(task, budget);
-        };
-        if let Some(title) = store.title(run_id) {
-            return liftoff_summary(&title, budget);
-        }
-        if Instant::now() >= deadline {
-            return liftoff_summary(task, budget);
-        }
     }
 }
 
@@ -6008,7 +6053,7 @@ fn print_liftoff_banner(
     if !is_tty {
         // No animation, but still WAIT for the title: a piped transcript must
         // name the worker the way the tray and `:workers` name it.
-        let label = liftoff_label(store, run_id, task, LIFTOFF_TITLE_WAIT, 0, |_| {});
+        let label = liftoff_label(store, run_id, task, liftoff_title_wait(), 0, |_| {});
         println!(
             "\x1b[1;33m{LIFTOFF_GLYPH}{}",
             liftoff_banner_body(verb, short, &label)
@@ -6020,11 +6065,18 @@ fn print_liftoff_banner(
     let budget = crate::activity_summary::current_title_budget();
     let provisional = liftoff_banner_body(verb, short, &liftoff_summary(task, budget));
     let mut anim = std::io::stdout();
-    let label = liftoff_label(store, run_id, task, LIFTOFF_TITLE_WAIT, FRAMES.len(), |i| {
-        let frame = FRAMES[i.min(FRAMES.len() - 1)];
-        let _ = write!(anim, "\r\x1b[2K\x1b[1;33m{frame}{provisional}");
-        let _ = anim.flush();
-    });
+    let label = liftoff_label(
+        store,
+        run_id,
+        task,
+        liftoff_title_wait(),
+        FRAMES.len(),
+        |i| {
+            let frame = FRAMES[i.min(FRAMES.len() - 1)];
+            let _ = write!(anim, "\r\x1b[2K\x1b[1;33m{frame}{provisional}");
+            let _ = anim.flush();
+        },
+    );
     // Settle: rewrite the line once more with the RESOLVED label, leave that
     // final frame on screen, and terminate it.
     let mut out = std::io::stdout();
@@ -16339,5 +16391,65 @@ mod liftoff_label_tests {
         assert_eq!(label, "resolved name");
         assert_eq!(seen, vec![0, 1, 2, 3], "every sweep frame must be painted");
         assert!(LIFTOFF_FRAME <= Duration::from_millis(120), "stays snappy");
+    }
+
+    // THE BUG: the title is written by the coordinator SUBPROCESS after it
+    // re-execs, takes a worktree and finishes a model call, so a freshly spawned
+    // worker cannot possibly have one yet. Waiting for it blocks the REPL thread
+    // — the operator's prompt — and then prints the brief anyway. The grace must
+    // therefore be a glance, not a stall: with no title published the banner
+    // settles well inside the old multi-second budget.
+    #[test]
+    fn a_missing_title_does_not_stall_the_prompt() {
+        let store = store("fast");
+        store.insert("w_5", "dispatch me", "s", None).unwrap();
+        let started = Instant::now();
+        let label = liftoff_label(
+            Some(&store),
+            "w_5",
+            "dispatch me",
+            super::liftoff_title_wait(),
+            0,
+            |_| {},
+        );
+        assert_eq!(label, "dispatch me");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the default grace must stay imperceptible, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // `0` is the operator's escape hatch for a fan-out wave: skip the poll
+    // outright and pay nothing per dispatch.
+    #[test]
+    fn a_zero_grace_costs_nothing() {
+        let store = store("zero");
+        store.insert("w_6", "no waiting", "s", None).unwrap();
+        let started = Instant::now();
+        let label = liftoff_label(Some(&store), "w_6", "no waiting", Duration::ZERO, 0, |_| {});
+        assert_eq!(label, "no waiting");
+        assert!(
+            started.elapsed() < LIFTOFF_FRAME,
+            "a zero grace must not sleep even one frame, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // A typo in the override must degrade to the shipped default rather than
+    // disabling the title (or, worse, unbounding the wait).
+    #[test]
+    fn the_grace_override_parses_and_degrades_safely() {
+        use super::liftoff_title_wait_from as parse;
+        let default = parse(None);
+        assert!(
+            default > Duration::ZERO && default < Duration::from_secs(2),
+            "default grace stays sub-stall: {default:?}"
+        );
+        assert_eq!(parse(Some("0")), Duration::ZERO, "0 disables the poll");
+        assert_eq!(parse(Some(" 5000 ")), Duration::from_millis(5000));
+        assert_eq!(parse(Some("banana")), default, "garbage ⇒ default");
+        assert_eq!(parse(Some("")), default, "empty ⇒ default");
+        assert_eq!(parse(Some("-1")), default, "negative ⇒ default");
     }
 }
