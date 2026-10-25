@@ -7982,6 +7982,64 @@ them by review age\nthen file a report";
         let _ = std::fs::remove_file(&creds);
     }
 
+    /// TASK-946 AC: a credential reference materialises EXACTLY the one key it
+    /// names. A credentials section holding several keys must never leak its
+    /// siblings into the child's environment: `resolve_env` emits one pair per
+    /// DECLARED `env` entry (see its loop over `call.args["env"]`), and each
+    /// value comes from a key-exact `profile_lookup`, never a whole-section
+    /// expansion. Asserted on the explicit-section form so the test does not
+    /// mutate the process-wide `AISH_CREDENTIALS_PROFILE` (shared with
+    /// `profile_prefix_semantics`); `${profile:KEY}` differs only in how the
+    /// section is chosen, and `profile_prefix_semantics` pins that half.
+    #[test]
+    fn section_siblings_never_materialise() {
+        let p = std::env::temp_dir()
+            .join(format!("aish_env_creds_siblings_{}", std::process::id()));
+        std::fs::write(
+            &p,
+            "[sweep]\nWANTED_KEY = wanted_value\nSIBLING_KEY = sibling_value\n\
+THIRD_KEY = third_value\n",
+        )
+        .unwrap();
+        let creds = p.to_str().unwrap().to_string();
+        let policy = open_policy();
+        let argv: Vec<String> = vec!["api".into()];
+        let ctx = crate::secrets::SpawnCtx {
+            program: "gh",
+            args: &argv,
+            session_id: "test",
+            policy: &policy,
+        };
+
+        // The declared env map names ONE key; mirror resolve_env's loop.
+        let declared = [("WANTED".to_string(), "${sweep:WANTED_KEY}".to_string())];
+        let materialised: Vec<(String, String)> = declared
+            .iter()
+            .map(|(k, raw)| (k.clone(), resolve_env_value(raw, &[], &creds, &ctx).unwrap()))
+            .collect();
+
+        assert_eq!(materialised.len(), 1, "one declared key → one child var");
+        assert_eq!(materialised[0].0, "WANTED");
+        assert_eq!(materialised[0].1, "wanted_value");
+        // Neither a sibling key NAME nor a sibling VALUE reaches the child.
+        for (k, v) in &materialised {
+            for leaked in ["SIBLING_KEY", "sibling_value", "THIRD_KEY", "third_value"] {
+                assert!(
+                    !k.contains(leaked) && !v.contains(leaked),
+                    "sibling {leaked} leaked into the child env"
+                );
+            }
+        }
+        // A sibling is reachable only by naming it explicitly.
+        assert_eq!(
+            resolve_env_value("${sweep:SIBLING_KEY}", &[], &creds, &ctx).unwrap(),
+            "sibling_value"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// An unresolvable reference comes back VERBATIM — deliberately, so the
     /// An unresolvable reference comes back VERBATIM — deliberately, so the
     /// failure surfaces in the program instead of silently becoming "".
     #[test]
