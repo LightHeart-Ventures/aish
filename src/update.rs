@@ -107,13 +107,16 @@ pub fn channel() -> Channel {
 /// [package] version field in sync with the current release tag to prevent
 /// version detection drift during updates.**
 ///
-/// For dev releases, `AISH_RELEASE_TAG` (if set at build time by the
-/// `release-dev.yml` workflow) appends the snapshot label, making the version
-/// visible as: "0.25.1 (dev snapshot dev-v0.26.0-dev.6)".
+/// For dev releases, `AISH_RELEASE_TAG` (set at build time by the
+/// `release-dev.yml` workflow) is folded in as semver build metadata, so a
+/// snapshot reads `0.71.2+dev.6` — six commits past the 0.71.2 release, and
+/// never mistakable for 0.71.2 itself. See [`crate::version_fmt`].
 pub fn current_version() -> &'static str {
-    // AISH_VERSION_STRING is generated at build time by build.rs, which composes
-    // the base version with an optional dev snapshot tag from AISH_RELEASE_TAG.
-    env!("AISH_VERSION_STRING")
+    // Provenance formatting lives in `version_fmt` (pure, unit-tested): it
+    // composes CARGO_PKG_VERSION with the release tag baked in by build.rs,
+    // rendering a dev snapshot as `0.71.2+dev.6` so it can never be mistaken
+    // for the `0.71.2` release.
+    crate::version_fmt::version()
 }
 
 /// A newer release that has an installable asset for this platform.

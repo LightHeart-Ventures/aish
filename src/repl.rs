@@ -646,7 +646,7 @@ pub async fn run(
         if footer_active {
             if let Some(t) = term.as_mut() {
                 let statusline = crate::style::statusline(
-                    crate::update::current_version(),
+                    crate::version_fmt::statusline_version(),
                     &backend.describe(),
                     &crate::engine::statusline_stats(&session),
                 );
@@ -656,7 +656,7 @@ pub async fn run(
             println!(
                 "{}",
                 crate::style::statusline(
-                    crate::update::current_version(),
+                    crate::version_fmt::statusline_version(),
                     &backend.describe(),
                     &crate::engine::statusline_stats(&session),
                 )
@@ -1176,7 +1176,7 @@ pub async fn run(
                                         t.handle_resize();
                                     }
                                     let statusline = crate::style::statusline(
-                                        crate::update::current_version(),
+                                        crate::version_fmt::statusline_version(),
                                         &backend.describe(),
                                         &crate::engine::statusline_stats(&session),
                                     );
@@ -1191,7 +1191,7 @@ pub async fn run(
                                 println!(
                                     "{}",
                                     crate::style::statusline(
-                                        crate::update::current_version(),
+                                        crate::version_fmt::statusline_version(),
                                         &backend.describe(),
                                         &crate::engine::statusline_stats(&session),
                                     )
@@ -3271,7 +3271,7 @@ const COLON_COMMANDS: &[(&str, &str)] = &[
         "message an in-flight coordinator (--any: cross-session)",
     ),
     ("update", "upgrade aish to the latest release"),
-    ("version", "show aish version + backend"),
+    ("version", "show version, channel, build tag + binary path"),
     (
         "webhook",
         "webhook broker client (status|reload|logs|test|replay)",
@@ -10773,7 +10773,7 @@ async fn handle_colon(
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
                  :telemetry skill-match <task>       show why the semantic matcher ranks skills for a task\n\
                  :tokens                             per-run/aggregate token spend, in:out ratio, top spenders\n\
-                 :version                            show aish version + backend (also `aish --version`)\n\
+                 :version                            version, channel, build tag, binary path (also `aish --version`)\n\
                  :update [prod|dev|ci]               check GitHub for a newer release and upgrade;\n\
                                                      optional channel is a one-off override of AISH_UPDATE_CHANNEL\n\
                  :batch <on|off|status|clear>        interactive batch mode: agent offloads deferrable\n\
@@ -10827,12 +10827,13 @@ async fn handle_colon(
                  :quit                               exit (also Ctrl-D or `exit`)"
             );
         }
+        // Version PROVENANCE, not just a number: which version, which build
+        // lane, which update channel, which tag, and WHICH BINARY on disk.
+        // Those last two are what settle "am I really running the build I
+        // think I am?" — previously unanswerable from inside the shell.
         Some("version" | "ver") => {
-            println!(
-                "\x1b[1maish\x1b[0m \x1b[2mv{}\x1b[0m — {}",
-                crate::update::current_version(),
-                backend.describe()
-            );
+            println!("{}", crate::version_fmt::report());
+            println!("  model      {}", backend.describe());
         }
         Some("jobs") => {
             let jobs = session.jobs.lock().unwrap();

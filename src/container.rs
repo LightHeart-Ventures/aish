@@ -165,7 +165,11 @@ pub fn resolve_selection(
 /// The image tag for a worker, pinned to the running aish version so a new build
 /// rebuilds the image (`current_version()` from `update.rs`). Pure.
 pub fn image_tag(version: &str) -> String {
-    format!("aish-worker:{version}")
+    // A provenance-bearing version is NOT a legal image reference: tags accept
+    // only `[A-Za-z0-9_.-]`, while a dev snapshot reads `0.71.2+dev.6`. Reuse
+    // the same sanitizer the container name uses so the tag stays pullable on
+    // every channel instead of failing the build on dev/ci binaries.
+    format!("aish-worker:{}", sanitize_token(version))
 }
 
 /// The deterministic container NAME for a worker: `aish-<session>-<worker>`
@@ -614,6 +618,9 @@ mod tests {
     fn image_tag_is_version_pinned() {
         assert_eq!(image_tag("0.9.3"), "aish-worker:0.9.3");
         assert_eq!(image_tag("1.0.0-dev"), "aish-worker:1.0.0-dev");
+        // Build metadata from a dev/ci snapshot must not leak an illegal `+`
+        // into the image reference.
+        assert_eq!(image_tag("0.71.2+dev.6"), "aish-worker:0.71.2-dev.6");
     }
 
     #[test]

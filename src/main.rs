@@ -100,6 +100,7 @@ mod tools;
 mod transcript_ring;
 mod turn_audit;
 mod update;
+mod version_fmt;
 mod webhook;
 // `:whatnext` / `:next` / `:wn` — session context handed to the model as an
 // INPUT ("what should I do next?") instead of running a command.
@@ -127,7 +128,10 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "aish",
     about = "An AI-native shell — no bash, just intent",
-    version
+    // Not clap's bare `version` (which is CARGO_PKG_VERSION): a dev snapshot
+    // must print `0.71.2+dev.6` here too, or `aish --version` would disagree
+    // with `:version` and the statusline chip about what's installed.
+    version = crate::version_fmt::version()
 )]
 struct Args {
     /// Run a single prompt non-interactively and exit (login-shell style)
