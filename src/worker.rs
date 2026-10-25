@@ -2239,6 +2239,11 @@ fn apply_rlimits(mem_mb: u64, cpu_secs: u64) {
 /// A dedicated git worktree carved off `src` for one worker, on a fresh branch.
 /// `path` is where the coordinator runs; `branch` is reported on completion so
 /// the parent can review/merge changes (we never auto-merge).
+///
+/// `Clone` because a worker REMEMBERS the tree its last thread ran in (see
+/// `JobInner::worktree`), so an in-place resume can continue in the SAME
+/// checkout/branch instead of carving a fresh one and abandoning the work.
+#[derive(Clone)]
 struct Worktree {
     path: PathBuf,
     branch: String,
@@ -2625,6 +2630,15 @@ where
         }
     }
     false
+}
+
+/// Is a worktree STASHED between worker threads still usable, i.e. does its
+/// checkout actually exist on disk? A tree can disappear between threads
+/// (operator `git worktree remove`, a manual `rm -rf`, an external sweep), and
+/// handing the resuming thread a dead path would fail every git call it makes.
+/// Pure + total so the resume path can stay a one-line `.filter(reclaimable)`.
+fn reclaimable(wt: &Worktree) -> bool {
+    wt.path.is_dir()
 }
 
 /// Create a fresh worktree for worker `id`, branched from `base` (`"main"` for a
@@ -3267,6 +3281,16 @@ struct JobInner {
     /// binding. This is what makes "type a message to a finished worker" continue
     /// the SAME worker instead of spawning a brand-new one each time.
     resumes: u32,
+    /// The isolated git worktree the worker's LAST thread ran in, remembered so
+    /// an in-place resume CONTINUES IN THE SAME WORKER SESSION — same checkout,
+    /// same branch, same commits — instead of carving a fresh tree off `base`
+    /// and stranding the previous thread's work. That stranding was the bug:
+    /// "continue the work of a failed worker" handed the follow-up thread an
+    /// empty worktree branched off trunk, so the half-finished edits/commits of
+    /// the failed attempt were invisible to the very thread asked to finish them.
+    /// `None` for shared-cwd (non-isolated) runs, before the first thread picks a
+    /// tree, and after a CLEAN tree is torn down (nothing left to continue).
+    worktree: Option<Worktree>,
     /// The coordinator `run_id` of the CURRENTLY-RUNNING thread — equal to the
     /// worker's visible `id` for the original run, and a fresh id after every
     /// [`resume_in_place`]. Stamped by `run_worker` as each thread starts.
@@ -3556,6 +3580,23 @@ impl WorkerJob {
         i.started = SystemTime::now();
         i.finished = None;
         i.resumes + 1
+    }
+
+    /// Hand the worker's isolated worktree over for safe-keeping between threads,
+    /// so an in-place resume can CONTINUE IN THE SAME SESSION (same checkout,
+    /// same branch, same commits) instead of carving a fresh tree off the base
+    /// ref. Called by `run_worker` when a thread ends with work worth keeping.
+    fn stash_worktree(&self, wt: Worktree) {
+        self.inner.lock().unwrap().worktree = Some(wt);
+    }
+
+    /// Reclaim the worktree a previous thread left behind, if any. Takes
+    /// ownership (leaving `None`) because the resuming thread becomes
+    /// responsible for the tree's lifetime — it either stashes it again when it
+    /// ends or tears it down. `None` means "no tree to continue" (shared-cwd
+    /// run, first thread, or the previous thread's tree was clean and removed).
+    fn take_worktree(&self) -> Option<Worktree> {
+        self.inner.lock().unwrap().worktree.take()
     }
 
     /// Epoch seconds the worker started — the base for the `:workers` Started /
@@ -3986,6 +4027,7 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
             pid: None,
             status: "running".into(),
             resumes: 0,
+            worktree: None,
             // Thread 1's run id IS the visible id; `run_worker` re-stamps this
             // on every in-place resume.
             run_id: id.clone(),
@@ -4164,17 +4206,43 @@ async fn run_worker(
     // shared cwd (today's behavior). The worktree is torn down on completion if
     // the job made no changes; otherwise it's left intact and its branch reported.
     let worktree = if spec.isolate {
-        // Worker ids are globally unique (`w_########`, #86), so the worktree
-        // leaf is just the id: two sessions / two checkouts share the `{repo-key}`
-        // parent dir but never collide on the leaf. Lives under `~/.aish/worktrees`
-        // (off the OS-reaped temp dir — ISS-2046), swept on startup if abandoned.
-        create_worktree(
-            &spec.cwd,
-            &run_id,
-            &spec.base,
-            Some(task.as_str()),
-            spec.coordinator_store.as_ref(),
-        )
+        // CONTINUE IN THE SAME SESSION on a resume. When a previous thread of
+        // THIS worker ended with real work in its tree, that tree was stashed on
+        // the job (`stash_worktree`) instead of being abandoned — reclaim it so
+        // the follow-up thread lands in the SAME checkout, on the SAME branch,
+        // on top of the SAME commits. Carving a fresh tree off `base` here was
+        // the bug: the thread asked to "continue the work of a failed worker"
+        // started from trunk and couldn't see any of that work.
+        // A stashed tree can VANISH between threads (operator `git worktree
+        // remove`, a manual `rm -rf`, an external sweep). A dead path would
+        // fail every git call the resumed thread makes, so treat "gone" as
+        // "nothing to continue" and carve fresh instead.
+        match job.take_worktree().filter(reclaimable) {
+            Some(wt) => {
+                crate::tools::announce(
+                    &run_id,
+                    &format!(
+                        "continuing in the previous thread's worktree {} (branch `{}`) — same session, prior work intact",
+                        wt.path.display(),
+                        wt.branch,
+                    ),
+                );
+                Some(wt)
+            }
+            // First thread, or the last thread's tree was clean and torn down,
+            // or a stashed tree vanished from disk: carve a fresh one. Worker ids are globally unique (`w_########`,
+            // #86), so the worktree leaf is just the id: two sessions / two
+            // checkouts share the `{repo-key}` parent dir but never collide on
+            // the leaf. Lives under `~/.aish/worktrees` (off the OS-reaped temp
+            // dir — ISS-2046), swept on startup if abandoned.
+            None => create_worktree(
+                &spec.cwd,
+                &run_id,
+                &spec.base,
+                Some(task.as_str()),
+                spec.coordinator_store.as_ref(),
+            ),
+        }
     } else {
         None
     };
@@ -4348,6 +4416,19 @@ from the parent repo; not auto-merged.)",
             WORKER_TIMEOUT.as_secs()
         )),
     }
+    // Hand a KEPT worktree back to the job for the NEXT thread. `kept_branch`
+    // is `Some` exactly when `finalize_worktree` judged the tree worth keeping
+    // (uncommitted changes or commits ahead of base), so the tree is still on
+    // disk. Stashing it is what makes a resume — "continue the work of this
+    // failed worker" — pick up in the SAME session rather than branching off
+    // trunk again and stranding the work. A CLEAN tree was already removed and
+    // leaves `None` here, so the next thread correctly starts fresh.
+    if kept_branch.is_some()
+        && let Some(wt) = worktree
+    {
+        job.stash_worktree(wt);
+    }
+
     // ── Durable-row reconciliation (stale "coordinating" safety net).
     //
     // The child `coordinator::drive` owns finalizing its own `coordinator_runs`
@@ -5095,6 +5176,7 @@ for operator after 4 auto-recovery attempt(s)";
                 pid,
                 status: "running".into(),
                 resumes: 0,
+                worktree: None,
                 run_id: id.to_string(),
                 result: None,
                 error: None,
@@ -5106,6 +5188,89 @@ for operator after 4 auto-recovery attempt(s)";
                 finished: None,
             }),
         })
+    }
+
+    // ── A resume CONTINUES IN THE SAME WORKER SESSION (the stranded-work bug) ──
+    //
+    // A failed isolated thread left real work (edits/commits) in its worktree.
+    // The follow-up thread — the one asked to "continue the work of the failed
+    // worker" — used to carve a FRESH worktree off `base`, so it started from
+    // trunk and could not see any of that work. The worker now REMEMBERS the
+    // kept tree between threads: the resuming thread reclaims the same
+    // checkout, same branch, same commits.
+
+    /// A `Worktree` value standing in for a tree on disk — the stash/reclaim
+    /// handoff is pure bookkeeping, so no real `git worktree` is needed.
+    fn stub_worktree(path: &str, branch: &str) -> Worktree {
+        Worktree {
+            path: PathBuf::from(path),
+            branch: branch.to_string(),
+            src: PathBuf::from("/repo"),
+            base_sha: "deadbeef".to_string(),
+        }
+    }
+
+    #[test]
+    fn resume_reclaims_the_previous_threads_worktree() {
+        let job = barrier_test_job("w_same_session", Some(7));
+        // First thread: nothing stashed yet, so the launch carves a fresh tree.
+        assert!(
+            job.take_worktree().is_none(),
+            "a first thread must start by carving its own worktree"
+        );
+
+        // The thread ends with work worth keeping → tree is stashed, not dropped.
+        job.stash_worktree(stub_worktree("/wt/w_same_session", "aish/fix-x"));
+        job.reset_for_resume();
+
+        // The resuming thread lands in the SAME checkout on the SAME branch.
+        let reclaimed = job
+            .take_worktree()
+            .expect("resume must continue in the previous thread's worktree");
+        assert_eq!(reclaimed.path, PathBuf::from("/wt/w_same_session"));
+        assert_eq!(reclaimed.branch, "aish/fix-x");
+
+        // Ownership MOVED to the resuming thread: it now owns the tree's
+        // lifetime (re-stash or tear down), so the slot is empty again.
+        assert!(
+            job.take_worktree().is_none(),
+            "reclaiming must take ownership, not clone the stash"
+        );
+    }
+
+    #[test]
+    fn a_vanished_worktree_is_not_reclaimable() {
+        // Guard for the dead-checkout case: a stash whose path was removed
+        // between threads must NOT be continued in — `run_worker` filters it
+        // out and carves fresh instead of running git against a missing dir.
+        let live = std::env::temp_dir();
+        assert!(
+            reclaimable(&stub_worktree(
+                live.to_str().expect("temp dir path is utf-8"),
+                "aish/live"
+            )),
+            "an existing checkout must be reclaimable"
+        );
+        assert!(
+            !reclaimable(&stub_worktree(
+                "/nonexistent/aish-worktree-gone",
+                "aish/gone"
+            )),
+            "a removed checkout must not be handed to the next thread"
+        );
+    }
+
+    #[test]
+    fn a_clean_thread_leaves_nothing_to_continue() {
+        // `finalize_worktree` removes a CLEAN tree (no changes, no commits) and
+        // `run_worker` stashes only a KEPT one — so the next thread sees `None`
+        // and correctly starts fresh instead of pointing at a deleted path.
+        let job = barrier_test_job("w_clean_session", Some(9));
+        job.reset_for_resume();
+        assert!(
+            job.take_worktree().is_none(),
+            "a clean (removed) tree must not be handed to the next thread"
+        );
     }
 
     // ── Resume keeps the attachable history (the `:attach` replay bug) ─────
@@ -5458,6 +5623,7 @@ for operator after 4 auto-recovery attempt(s)";
                 status: "running".into(),
                 pid: None,
                 resumes: 0,
+                worktree: None,
                 run_id: String::new(),
                 result: None,
                 error: None,
@@ -5483,6 +5649,7 @@ for operator after 4 auto-recovery attempt(s)";
                 status: "running".into(),
                 pid: None,
                 resumes: 0,
+                worktree: None,
                 run_id: String::new(),
                 result: None,
                 error: None,
@@ -6404,6 +6571,7 @@ for operator after 4 auto-recovery attempt(s)";
                 status: "running".into(),
                 pid: None,
                 resumes: 0,
+                worktree: None,
                 run_id: String::new(),
                 result: None,
                 error: None,
