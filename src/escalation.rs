@@ -1694,6 +1694,16 @@ fn indent_pair(pair: (String, String), depth: usize, color_on: bool) -> (String,
     )
 }
 
+/// Serializes every test in the crate that mutates this module's
+/// process-global state — the banner stack AND the `:attach` mirror. Lives
+/// outside `mod tests` so `repl`'s attach-slot tests take the SAME lock as
+/// escalation's own instead of racing them through the harness thread pool.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1702,8 +1712,7 @@ mod tests {
     /// Serializes the tests that mutate the process-global stack so they can't
     /// interleave with each other under the test harness's thread pool.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        static L: Mutex<()> = Mutex::new(());
-        L.lock().unwrap_or_else(|e| e.into_inner())
+        super::test_lock()
     }
 
     /// A ledger row DESCRIBES a slice of its parent's work; it has no process
