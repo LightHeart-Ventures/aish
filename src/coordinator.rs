@@ -147,7 +147,10 @@ Phase-0 guard only answered \"already shipped?\", this answers \"what exactly is
 --- PHASE 2: PLANNING --- (0 calls, REASONING ONLY) From the Phase 1 delta, emit a PLAN GRAPH — not a \
 bare file list: for each unit of work a node `{ id (lowercase-kebab slug), intent, files[], \
 depends_on[], acceptance[] }`. `depends_on` names the node ids that must land first; two nodes \
-touching the same file are NOT independent and must be merged into one node or chained. You are \
+touching the same file are NOT independent and must be merged into one node or chained. `files[]` \
+is MANDATORY and must list CONCRETE paths: an empty `files[]` is read as UNKNOWN scope (never as \
+\"touches nothing\") and blocks fan-out, so a node that genuinely touches shared or unenumerable \
+scope must declare `files: [\"*\"]` explicitly. You are \
 FORBIDDEN from making ANY tool call in this phase — no reads, no greps, no status checks. If you \
 need another read, it belonged in Phase 1 — fold it into the Phase 3 batch, do not spend a planning \
 turn on it.\n\
@@ -172,8 +175,12 @@ not a re-inspection of every file you just wrote.";
 /// Held as a `const` so the rule is unit-testable without driving a whole run.
 const FAN_OUT_DERIVED: &str = "FAN-OUT IS DERIVED, NOT DISCRETIONARY: Before you fan work out with \
 `run_in_background`, compute `ready` = the Phase-2 plan-graph nodes whose `depends_on` are ALL \
-done. If `ready.len() >= 2` AND those nodes' `files` sets are pairwise disjoint, dispatch one \
-worker per ready node. Otherwise execute solo in this turn. NEVER dispatch a node with an unmet \
+done. If `ready.len() >= 2` AND every ready node declares a NON-EMPTY `files` set AND those \
+`files` sets are pairwise disjoint, dispatch one worker per ready node. Otherwise execute solo in \
+this turn. An empty `files` list means the scope is UNKNOWN, not disjoint — silence is never a \
+proof of independence, so ONE under-declared ready node collapses the whole wave to solo; a node \
+that genuinely touches shared or unenumerable scope must say so explicitly with `files: [\"*\"]`, \
+which collides with every peer and therefore also runs solo. NEVER dispatch a node with an unmet \
 dependency, and never two nodes touching the same file. (The old \"don't over-decompose\" directive \
 existed because unstructured fan-out once produced an 87-call runaway; the dependency graph \
 replaces that discretionary suppression with a structural guard.) If triage collapses the \
@@ -3127,6 +3134,37 @@ mod tests {
             "unmet deps keep b and c out of the ready set"
         );
 
+        // Row 5 — >=2 ready but a node declares NO files => solo. Empty
+        // `files` is UNKNOWN scope, not disjoint scope: the under-declaration
+        // hole, where silence used to buy a node a free parallel dispatch.
+        let under_declared = graph(vec![node("a", &[], &["src/a.rs"]), node("b", &[], &[])]);
+        assert_eq!(
+            under_declared.ready_set(&empty).len(),
+            2,
+            "both nodes ARE ready — the collapse is about declaration, not arity"
+        );
+        assert!(
+            under_declared.fan_out_candidates(&empty).is_none(),
+            "an undeclared file set must collapse to SOLO in CODE, as the prompt states"
+        );
+        assert!(
+            graph(vec![node("a", &[], &[]), node("b", &[], &[])])
+                .fan_out_candidates(&empty)
+                .is_none(),
+            "two undeclared nodes are UNKNOWN-vs-UNKNOWN, never provably disjoint"
+        );
+
+        // Row 6 — the explicit shared-scope escape hatch `files: ["*"]` is
+        // honest and still never parallel-safe.
+        let shared = graph(vec![
+            node("a", &[], &["src/a.rs"]),
+            node("b", &[], &[crate::plan::SHARED_SCOPE]),
+        ]);
+        assert!(
+            shared.fan_out_candidates(&empty).is_none(),
+            "explicit shared scope collides with every peer in CODE, as the prompt states"
+        );
+
         // And the prompt states each row of that table in words, so neither half
         // can be edited into disagreement without a test going red.
         let f = FAN_OUT_DERIVED;
@@ -3135,6 +3173,11 @@ mod tests {
             "pairwise disjoint",
             "Otherwise execute solo",
             "NEVER dispatch a node with an unmet",
+            // Rows 5 + 6: under-declaration is refused, and `["*"]` is the
+            // declared way to say "shared scope".
+            "NON-EMPTY `files`",
+            "UNKNOWN, not disjoint",
+            "files: [\"*\"]",
         ] {
             assert!(
                 f.contains(clause),

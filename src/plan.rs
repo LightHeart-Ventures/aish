@@ -50,6 +50,28 @@ pub struct PlanNode {
     pub est_calls: u32,
 }
 
+/// The sentinel path a node uses to declare SHARED scope — "this node touches
+/// files I cannot enumerate". Declaring `files: ["*"]` is the only supported
+/// way to make that claim, and it makes the node collide with every peer, so a
+/// wave containing it never fans out. Silence (an EMPTY `files`) is NOT the
+/// same claim: it means the scope is UNKNOWN, which is refused too.
+pub const SHARED_SCOPE: &str = "*";
+
+impl PlanNode {
+    /// `true` when this node's declared scope makes parallel dispatch unsafe.
+    ///
+    /// Two cases, deliberately collapsed into one answer:
+    /// - `files` is EMPTY — the scope is **unknown**, not disjoint. An
+    ///   under-declared node contributes no paths to the collision check, so
+    ///   reading silence as "cannot collide" let two nodes that both rewrite
+    ///   `src/main.rs` fan out in parallel. That is the under-declaration hole.
+    /// - `files` contains [`SHARED_SCOPE`] (`"*"`) — the node has explicitly
+    ///   claimed shared scope, which collides with everything by definition.
+    pub fn blocks_parallel_dispatch(&self) -> bool {
+        self.files.is_empty() || self.files.iter().any(|f| f == SHARED_SCOPE)
+    }
+}
+
 /// A graph of [`PlanNode`]s scoped to a single coordinator scope key.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanGraph {
@@ -232,14 +254,27 @@ impl PlanGraph {
         self.nodes.iter().find(|n| n.id == id)
     }
 
-    /// `Some(ready)` when >= 2 nodes are ready AND no two of them share any path
-    /// string in `files`; `None` otherwise (meaning: run solo).
+    /// `Some(ready)` when >= 2 nodes are ready, EVERY one of them declares a
+    /// concrete non-empty `files` set, and no two of them share any path
+    /// string; `None` otherwise (meaning: run solo).
+    ///
+    /// Empty `files` is read as **unknown scope**, never as "disjoint". A node
+    /// that declares nothing contributes nothing to the collision check, so
+    /// treating it as parallel-safe is exactly the under-declaration hole that
+    /// lets two workers rewrite the same file. A node that genuinely touches
+    /// shared or unenumerable scope says so with [`SHARED_SCOPE`]
+    /// (`files: ["*"]`) — also refused, but explicitly rather than by omission.
     ///
     /// This predicate is the code twin of the fan-out prompt rule: fan out only
-    /// when the ready work is genuinely independent.
+    /// when the ready work is genuinely — and *declaredly* — independent.
     pub fn fan_out_candidates(&self, done: &HashSet<NodeId>) -> Option<Vec<&PlanNode>> {
         let ready = self.ready_set(done);
         if ready.len() < 2 {
+            return None;
+        }
+        // Under-declaration check FIRST: unknown or shared scope is refused
+        // before any path comparison, because there is nothing to compare.
+        if ready.iter().any(|n| n.blocks_parallel_dispatch()) {
             return None;
         }
         let mut claimed: HashSet<&str> = HashSet::new();
@@ -552,12 +587,63 @@ mod tests {
     }
 
     #[test]
-    fn fan_out_candidates_some_when_ready_nodes_declare_no_files() {
+    fn fan_out_candidates_none_when_ready_nodes_declare_no_files() {
+        // UNDER-DECLARATION HOLE: an empty `files` is UNKNOWN scope, not
+        // disjoint scope. Two nodes that declare nothing may both rewrite
+        // `src/main.rs`; silence is not a proof of independence, so the wave
+        // collapses to solo instead of racing.
         let g = graph(vec![node("a", &[]), node("b", &[])]);
-        assert_eq!(
-            g.fan_out_candidates(&done(&[])).map(|r| r.len()),
-            Some(2),
-            "no declared files cannot collide"
+        assert!(
+            g.fan_out_candidates(&done(&[])).is_none(),
+            "undeclared files means unknown scope, which must never fan out"
+        );
+    }
+
+    #[test]
+    fn fan_out_candidates_none_when_a_single_ready_node_under_declares() {
+        // One honest node is not enough: the under-declared peer could be
+        // touching the very file the honest node claimed.
+        let g = graph(vec![
+            node_with_files("a", &[], &["src/a.rs"]),
+            node("b", &[]),
+        ]);
+        assert!(
+            g.fan_out_candidates(&done(&[])).is_none(),
+            "one under-declared ready node collapses the whole wave to solo"
+        );
+    }
+
+    #[test]
+    fn fan_out_candidates_none_when_a_ready_node_declares_shared_scope() {
+        // `["*"]` is the EXPLICIT way to say "I touch shared scope" — honest,
+        // and still never parallel-safe.
+        let g = graph(vec![
+            node_with_files("a", &[], &["src/a.rs"]),
+            node_with_files("b", &[], &[SHARED_SCOPE]),
+        ]);
+        assert!(
+            g.fan_out_candidates(&done(&[])).is_none(),
+            "an explicit shared scope collides with every peer"
+        );
+    }
+
+    #[test]
+    fn blocks_parallel_dispatch_distinguishes_declared_scope_from_silence() {
+        assert!(
+            node("a", &[]).blocks_parallel_dispatch(),
+            "empty files == unknown scope"
+        );
+        assert!(
+            node_with_files("a", &[], &[SHARED_SCOPE]).blocks_parallel_dispatch(),
+            "`*` == explicit shared scope"
+        );
+        assert!(
+            node_with_files("a", &[], &["src/a.rs", SHARED_SCOPE]).blocks_parallel_dispatch(),
+            "`*` anywhere in the list still means shared scope"
+        );
+        assert!(
+            !node_with_files("a", &[], &["src/a.rs"]).blocks_parallel_dispatch(),
+            "a concrete path list is a real, comparable declaration"
         );
     }
 

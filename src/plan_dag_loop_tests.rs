@@ -99,6 +99,24 @@ fn shared_file_graph(scope: &str) -> PlanGraph {
     }
 }
 
+/// Same shape, but the two middle nodes declare NO files at all. Silence is
+/// not a disjointness proof — an empty `files` list means "scope unknown", so
+/// fan-out must collapse to solo exactly as it does for a declared overlap.
+/// This is the under-declaration hole: the cheapest way for a planner to buy
+/// parallel dispatch used to be to say nothing.
+fn undeclared_scope_graph(scope: &str) -> PlanGraph {
+    PlanGraph {
+        scope_key: scope.to_string(),
+        nodes: vec![
+            node("a", &[], &["src/a.rs"]),
+            node("b", &["a"], &[]),
+            node("c", &["a"], &[]),
+            node("d", &["b", "c"], &["src/d.rs"]),
+        ],
+        created_at: 1_762_000_000,
+    }
+}
+
 fn ids(nodes: &[&PlanNode]) -> Vec<String> {
     nodes.iter().map(|n| n.id.clone()).collect()
 }
@@ -330,6 +348,64 @@ fn overlapping_file_sets_collapse_to_solo_without_a_runaway() {
     assert!(
         widths.iter().all(|&w| w == 1),
         "every wave is SOLO while files overlap, got {widths:?}"
+    );
+    assert_eq!(dispatched, vec!["a", "b", "c", "d"]);
+    assert!(iterations < 10, "bounded, not an 87-call runaway");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same drive over a plan whose ready pair declares NO files. Before this
+/// gate, an empty `files` list was treated as a disjointness PROOF, so the
+/// least-informative plan in existence — two nodes that say nothing about what
+/// they touch — bought the widest parallel dispatch. That is backwards: silence
+/// is the weakest possible evidence of independence. Here the wave width must
+/// be solo throughout, and the loop must still terminate.
+#[test]
+fn under_declared_file_sets_collapse_to_solo_without_a_runaway() {
+    let path = temp_db("undeclared");
+    let store = CoordinatorStore::open(&path).unwrap();
+    let scope = "goal:spr113";
+    store
+        .save_plan_graph(&undeclared_scope_graph(scope))
+        .unwrap();
+    let graph = store.load_plan_graph(scope).unwrap().unwrap();
+
+    // The ready pair really is a pair — the collapse is about UNKNOWN scope,
+    // not arity, and `b`/`c` share no declared path at all.
+    store.mark_plan_node_done(scope, "a").unwrap();
+    let done = store.plan_nodes_done(scope).unwrap();
+    assert_eq!(ids(&graph.ready_set(&done)), vec!["b", "c"]);
+    assert!(
+        graph.fan_out_candidates(&done).is_none(),
+        "two ready nodes that declare NO files have unknown scope, not disjoint scope"
+    );
+
+    let mut iterations = 0_u32;
+    let mut widths: Vec<usize> = Vec::new();
+    let mut dispatched: Vec<String> = vec!["a".to_string()];
+    loop {
+        iterations += 1;
+        assert!(iterations < 10, "runaway: {iterations} iterations");
+        let done = store.plan_nodes_done(scope).unwrap();
+        let ready = graph.ready_set(&done);
+        if ready.is_empty() {
+            break;
+        }
+        let wave: Vec<NodeId> = match graph.fan_out_candidates(&done) {
+            Some(nodes) => ids(&nodes),
+            None => vec![ready[0].id.clone()],
+        };
+        widths.push(wave.len());
+        for id in wave {
+            store.mark_plan_node_done(scope, &id).unwrap();
+            dispatched.push(id);
+        }
+    }
+
+    assert!(
+        widths.iter().all(|&w| w == 1),
+        "every wave is SOLO while scope is undeclared, got {widths:?}"
     );
     assert_eq!(dispatched, vec!["a", "b", "c", "d"]);
     assert!(iterations < 10, "bounded, not an 87-call runaway");
