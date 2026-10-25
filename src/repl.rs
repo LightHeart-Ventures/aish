@@ -788,10 +788,12 @@ pub async fn run(
                     if cur != last_attached {
                         // Mirror the attach slot into the escalation store so the
                         // tray can band the attached worker's banner in the
-                        // operator-input shade. Done HERE rather than at each of
-                        // the ~9 sites that write the slot: this transition
-                        // watcher already sees every one of them (attach, detach,
-                        // Shift-Tab cycle, goal attach, worker completion).
+                        // operator-input shade. BACKSTOP only: every slot write
+                        // now mirrors synchronously via `set_attach_slot`,
+                        // because this watcher `continue`s while a turn is busy
+                        // (so a mid-turn Shift-Tab went unbanded until the turn
+                        // ended) and otherwise lags up to one 400 ms tick. This
+                        // still catches any write that bypasses the helper.
                         crate::escalation::set_attached(cur.as_deref());
                         last_attached = cur;
                         if let Ok(mut f) = flash.lock() {
@@ -6699,7 +6701,7 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
             Some(g) if g.is_active() => {
                 *session.attached_durable.lock().unwrap() = None;
                 crate::terminal::open_attach_view();
-                *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
+                set_attach_slot(&session.attached, Some(GOAL_ATTACH_ID.to_string()));
                 // The announcement is NOT printed here — it is handed to the
                 // backfill, which renders it AS the pane's top frame. One row for
                 // "you are now attached", instead of a banner plus a frame row
@@ -6765,7 +6767,7 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
             // scrollback rather than being wiped, and the worker's output stays
             // scrollable via the terminal's native scrollback.
             crate::terminal::open_attach_view();
-            *session.attached.lock().unwrap() = Some(run_id.clone());
+            set_attach_slot(&session.attached, Some(run_id.clone()));
             let short = crate::batch::short_id(run_id);
             if *terminal {
                 // Pre-seed the review marker so `announce_attach_review` doesn't
@@ -7413,6 +7415,35 @@ fn forward_durable_rows(
     true
 }
 
+/// Point an attach slot at `next` AND mirror it into the escalation tray in the
+/// SAME breath, returning the slot's previous value.
+///
+/// The tray bands the `:attach`ed worker's banner in the operator-input shade so
+/// "the thing you're talking to" reads identically in the tray and in the
+/// transcript. That mirror used to live ONLY in the presenter's attach-transition
+/// watcher — which `continue`s on every tick while a turn is in flight (`busy`),
+/// and only samples every 400 ms otherwise. So a mid-turn Shift-Tab (the most
+/// common way to attach) left the tray unbanded until the turn ended, and an
+/// attach immediately followed by input banded late or not at all: the reported
+/// "we lost the escalation tray highlight, and it's inconsistent" regression.
+///
+/// Writing both here makes the band land the instant the attach does, on every
+/// path (`:attach`, `:attach goal`, `:detach`, `:close`, Shift-Tab at the prompt
+/// and mid-turn). The presenter watcher stays as a backstop for any slot write
+/// that doesn't come through this helper.
+///
+/// Lock order: the slot guard is a statement temporary, so it is released before
+/// `set_attached` takes the escalation `ATTACHED` mutex — the two are never held
+/// at once.
+fn set_attach_slot(
+    slot: &std::sync::Mutex<Option<String>>,
+    next: Option<String>,
+) -> Option<String> {
+    let prev = std::mem::replace(&mut *slot.lock().unwrap(), next.clone());
+    crate::escalation::set_attached(next.as_deref());
+    prev
+}
+
 /// `:detach` — stop watching the attached coordinator. It keeps running in the
 /// background; its result still auto-delivers and shows in `:workers`.
 fn detach_worker(session: &mut Session) {
@@ -7422,7 +7453,7 @@ fn detach_worker(session: &mut Session) {
     // Stop any durable tail too — otherwise the presenter would keep printing a
     // detached run's rows above the prompt.
     *session.attached_durable.lock().unwrap() = None;
-    match session.attached.lock().unwrap().take() {
+    match set_attach_slot(&session.attached, None) {
         Some(run_id) => {
             // Close the worker view. It rendered inline on the primary buffer, so
             // the interactive output is already in scrollback — just re-anchor and
@@ -8085,7 +8116,7 @@ fn cycle_worker(session: &mut Session) -> bool {
         // interactive output is already in scrollback and the detached line
         // trails it.
         crate::terminal::close_attach_view();
-        *session.attached.lock().unwrap() = None;
+        set_attach_slot(&session.attached, None);
         *session.attach_review_announced.lock().unwrap() = None;
         // No output-field hint here: the detached "back to interactive" state is
         // already reflected on the 2nd statusline (see `coordinator_status_line`),
@@ -8112,7 +8143,7 @@ fn cycle_worker(session: &mut Session) -> bool {
     // turns live and backfill its durable state (mirrors `:attach goal`), then
     // stop before the worker-index dereference (the goal is not in `workers`).
     if ids[next_idx - 1] == GOAL_ATTACH_ID {
-        *session.attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
+        set_attach_slot(&session.attached, Some(GOAL_ATTACH_ID.to_string()));
         *session.attach_review_announced.lock().unwrap() = None;
         let task = session
             .goal
@@ -8134,7 +8165,7 @@ fn cycle_worker(session: &mut Session) -> bool {
         return true;
     }
     let (run_id, terminal, task) = workers[next_idx - 1].clone();
-    *session.attached.lock().unwrap() = Some(run_id.clone());
+    set_attach_slot(&session.attached, Some(run_id.clone()));
     // Same re-surface as `attach_worker` — Shift-Tab is the OTHER attach path,
     // and a question parked by this worker has to reappear on both.
     if let Some(n) = crate::question::attach_notice(&run_id) {
@@ -8248,7 +8279,7 @@ fn cycle_worker_live(
     let next_idx = next_attach_index(&ids, current.as_deref());
     *durable.lock().unwrap() = None;
     if next_idx == 0 {
-        *attached.lock().unwrap() = None;
+        set_attach_slot(attached, None);
         *review.lock().unwrap() = None;
         // Wrap back to the interactive session. Switch the view for real —
         // `close_attach_view` wipes the worker pane off the viewport (scrollback
@@ -8273,7 +8304,7 @@ fn cycle_worker_live(
     // replay the goal's captured activity — same as the post-turn path, since the
     // goal handle needs no db.
     if ids[next_idx - 1] == GOAL_ATTACH_ID {
-        *attached.lock().unwrap() = Some(GOAL_ATTACH_ID.to_string());
+        set_attach_slot(attached, Some(GOAL_ATTACH_ID.to_string()));
         *review.lock().unwrap() = None;
         crate::terminal::open_attach_view();
         // Folded into the replay frame (see `pane_attach_header`) — one row.
@@ -8288,7 +8319,7 @@ fn cycle_worker_live(
         return;
     }
     let (run_id, terminal, task) = workers_v[next_idx - 1].clone();
-    *attached.lock().unwrap() = Some(run_id.clone());
+    set_attach_slot(attached, Some(run_id.clone()));
     let short = crate::batch::short_id(&run_id);
     let task_suffix = attach_task_suffix(&task);
     // Wipe + re-anchor BEFORE the header prints, so the header and the replayed
@@ -8435,7 +8466,7 @@ fn close_worker(id: Option<&str>, session: &mut Session) {
         // Stop any durable tail, or the presenter keeps printing the closed
         // run's rows above the interactive prompt.
         *session.attached_durable.lock().unwrap() = None;
-        *session.attached.lock().unwrap() = None;
+        set_attach_slot(&session.attached, None);
         *session.attach_review_announced.lock().unwrap() = None;
         // Tear the worker view down (re-anchor the primary buffer) and replay a
         // tail of the operator's own conversation, so the interactive screen comes
@@ -15242,6 +15273,46 @@ mod tests {
         });
         assert!(!forward_durable_rows(&durable, &before, before.tail, &rows));
         assert_eq!(durable.lock().unwrap().as_ref().unwrap().tail, newer);
+    }
+
+    #[test]
+    /// REGRESSION: the escalation tray's band on the `:attach`ed worker must
+    /// land the instant the attach does. It used to be mirrored only by the
+    /// presenter's transition watcher, which skips every tick while a turn is
+    /// busy — so a mid-turn Shift-Tab attach left the tray unbanded until the
+    /// turn ended, and the highlight read as "lost/inconsistent". Every slot
+    /// write now goes through `set_attach_slot`, which writes the slot and the
+    /// mirror together and hands back the previous occupant (the value
+    /// `:detach` reports).
+    fn attach_slot_mirrors_into_the_escalation_tray_synchronously() {
+        let _g = crate::escalation::test_lock();
+        crate::escalation::set_attached(None);
+
+        let slot = std::sync::Mutex::new(None);
+
+        // Attach: slot and tray move together, previous occupant handed back.
+        let prev = set_attach_slot(&slot, Some("w_banded00001".to_string()));
+        assert_eq!(prev, None);
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("w_banded00001"));
+        assert_eq!(
+            crate::escalation::attached().as_deref(),
+            Some("w_banded00001"),
+            "tray must band the attached worker without waiting for a tick"
+        );
+
+        // Re-attach elsewhere moves the band rather than leaving a stale one.
+        let prev = set_attach_slot(&slot, Some("w_other000002".to_string()));
+        assert_eq!(prev.as_deref(), Some("w_banded00001"));
+        assert_eq!(
+            crate::escalation::attached().as_deref(),
+            Some("w_other000002")
+        );
+
+        // Detach clears both, and still reports who we were attached to.
+        let prev = set_attach_slot(&slot, None);
+        assert_eq!(prev.as_deref(), Some("w_other000002"));
+        assert!(slot.lock().unwrap().is_none());
+        assert_eq!(crate::escalation::attached(), None);
     }
 
     /// Build an ordered id list the way `cycle_worker` collects live workers.
