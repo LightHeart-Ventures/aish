@@ -637,13 +637,25 @@ pub async fn run(
         });
     }
 
-    // Live statusline (version + model on the left, date/time on the right),
-    // then the help hint. Interactive terminals only — never leak escape/status
-    // noise into piped/redirected output. With the footer active the statusline
-    // lives in the pinned bottom row; otherwise it's refreshed inline directly
-    // above the prompt on each idle pass (see the LoopTick::Idle arm).
+    // Live statusline (version + model on the left, date/time on the right).
+    // Interactive terminals only — never leak escape/status noise into
+    // piped/redirected output. With the footer active the statusline lives in
+    // the pinned bottom row; otherwise it's refreshed inline directly above the
+    // prompt on each idle pass (see the LoopTick::Idle arm).
+    //
+    // The ":help for commands — :workers …" hint used to be printed here as its
+    // own dim line above the first prompt. It is a STATUSLINE message now: in
+    // footer mode it is parked in the SecondStatusLine's recent-message slot
+    // BEFORE the first paint (so the opening frame carries it) and is replaced
+    // by the first real event — `mcp: ready`, a fired `:alert`, an attach
+    // transition — under the usual most-recent-wins rule. A short terminal has
+    // no footer and therefore no SecondStatusLine to carry it, so that path
+    // keeps printing the hint inline.
     if unsafe { libc::isatty(1) } == 1 {
         if footer_active {
+            if let Ok(mut f) = session.flash.lock() {
+                *f = Some(startup_hint_flash(crate::style::colors_enabled()));
+            }
             if let Some(t) = term.as_mut() {
                 let statusline = crate::style::statusline(
                     crate::version_fmt::statusline_version(),
@@ -661,8 +673,8 @@ pub async fn run(
                     &crate::engine::statusline_stats(&session),
                 )
             );
+            println!("{}", startup_hint_flash(crate::style::colors_enabled()));
         }
-        println!("\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m");
     }
 
     // Startup notices (store/init warnings, hook-load failures, etc.) collected
@@ -2481,6 +2493,22 @@ fn reexec_aish() {
         Ok(_) => std::process::exit(0),
         Err(e) => eprintln!("aish: restart failed: {e}"),
     }
+}
+
+/// The startup hint for the SecondStatusLine's recent-message slot: how to
+/// reach `:help` and the `:workers` monitor.
+///
+/// Previously printed as its own dim line above the first prompt, which spent a
+/// scrollback row on something the footer can hold for free. It is a statusline
+/// message now, styled like every other routine notice in that slot via
+/// [`crate::style::notice_flash`] (dim when color is on, bare text otherwise).
+/// Pure, so the text lives in exactly one place and the non-footer fallback
+/// reuses it verbatim.
+fn startup_hint_flash(color_on: bool) -> String {
+    crate::style::notice_flash(
+        ":help for commands — :workers to monitor background tasks",
+        color_on,
+    )
 }
 
 /// Resolve the SecondStatusLine's recent-message slot to the ONE message it may
@@ -15153,6 +15181,40 @@ mod tests {
             "⇄ detached — back to interactive (Shift-Tab to cycle into a coordinator)"
         );
         assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn startup_hint_rides_the_second_statusline_not_a_printed_line() {
+        // The hint is a SecondStatusLine notice now: same dim styling as every
+        // other routine flash (`:new`'s "history cleared", `mcp: ready`), and
+        // carrying NO alert glyph — it is not an attention-grabbing event.
+        let dim = startup_hint_flash(true);
+        assert_eq!(
+            dim,
+            "\x1b[2m:help for commands — :workers to monitor background tasks\x1b[0m"
+        );
+        assert_eq!(dim, crate::style::notice_flash(startup_hint_text(), true));
+        assert!(!dim.contains(crate::style::ALERT_GLYPH));
+
+        // color_on=false → bare text, no ANSI (respects NO_COLOR / non-TTY).
+        let plain = startup_hint_flash(false);
+        assert_eq!(plain, startup_hint_text());
+        assert!(!plain.contains('\x1b'));
+
+        // Parked in the flash slot it REPLACES the baseline hint rather than
+        // stacking on it — that's what makes it a statusline message and not a
+        // second row of chrome.
+        let baseline = "⇄ detached — back to interactive".to_string();
+        assert_eq!(
+            recent_message_row(baseline, Some(plain.clone())),
+            plain,
+            "startup hint must occupy the recent-message slot alone"
+        );
+    }
+
+    /// The hint text without styling — asserted in one place above.
+    fn startup_hint_text() -> &'static str {
+        ":help for commands — :workers to monitor background tasks"
     }
 
     #[test]
