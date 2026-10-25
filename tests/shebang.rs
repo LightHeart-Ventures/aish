@@ -50,21 +50,55 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, perms).expect("chmod +x");
 }
 
+/// `ETXTBSY` — "Text file busy". The kernel refuses to exec a file that any
+/// process currently holds open for writing.
+const ETXTBSY: i32 = 26;
+
+/// How many times to re-attempt an exec that lost the `ETXTBSY` race below.
+const ETXTBSY_ATTEMPTS: u32 = 10;
+
 /// Run an executable file directly (relying on its shebang) inside a hermetic
 /// environment. `extra_path`, when set, is prepended to `PATH` so a
 /// `#!/usr/bin/env aish` line can resolve `aish`.
+///
+/// Retries on `ETXTBSY`, which is a *harness* race, not a product failure.
+/// Both tests in this file write a script and immediately exec it, and the
+/// harness runs them on parallel threads. Setting `current_dir` disqualifies
+/// Rust's `posix_spawn` fast path, so the spawn degrades to `fork` + `exec` —
+/// and a `fork` inherits every fd open in the parent at that instant,
+/// including the *sibling* thread's still-open write handle on its own freshly
+/// written script. Until that forked child reaches `exec` and its `CLOEXEC`
+/// fds are dropped, the sibling's script is "open for writing" by a live
+/// process, so the sibling's own exec fails with `ETXTBSY`. The window is
+/// microseconds wide and closes on its own, so a short bounded retry is the
+/// standard mitigation (cf. rust-lang/rust#57667, golang/go#22315) — and it
+/// keeps the assertion that follows fully intact.
 fn run_executable(file: &Path, home: &Path, extra_path: Option<&Path>) -> std::process::Output {
-    let mut cmd = Command::new(file);
-    cmd.current_dir(home)
-        .env("HOME", home)
-        // Dummy credential: lets the Claude backend construct; the script body
-        // never calls the model, so it's never used on the wire.
-        .env("ANTHROPIC_API_KEY", "sk-ant-shebang-test-not-used");
-    if let Some(dir) = extra_path {
-        let base = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{}", dir.display(), base));
+    for attempt in 0..ETXTBSY_ATTEMPTS {
+        let mut cmd = Command::new(file);
+        cmd.current_dir(home)
+            .env("HOME", home)
+            // Dummy credential: lets the Claude backend construct; the script
+            // body never calls the model, so it's never used on the wire.
+            .env("ANTHROPIC_API_KEY", "sk-ant-shebang-test-not-used");
+        if let Some(dir) = extra_path {
+            let base = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{}:{}", dir.display(), base));
+        }
+        match cmd.output() {
+            Ok(out) => return out,
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    20 * u64::from(attempt + 1),
+                ));
+            }
+            Err(e) => panic!("execute shebang script: {e:?}"),
+        }
     }
-    cmd.output().expect("execute shebang script")
+    panic!(
+        "execute shebang script: still ETXTBSY after {ETXTBSY_ATTEMPTS} attempts ({})",
+        file.display()
+    )
 }
 
 #[test]

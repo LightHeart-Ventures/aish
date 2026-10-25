@@ -808,6 +808,17 @@ async fn run_goal_loop(
     // how turn N+1 learns which work packages turn N still has in flight.
     let mut prior_run_ids: Vec<String> = Vec::new();
     let scope_key = goal_scope_key(&goal.condition);
+    // Carry the plan SCOPE across the process boundary: every turn runs in a
+    // FRESH process, and the dispatch gate in `run_in_background` can only
+    // enforce the plan it can RESOLVE. Stamping the scope here is what makes
+    // `fan_out_candidates` authoritative on the spawn path, not just in tests.
+    let spec = {
+        let mut s = spec;
+        s.env.retain(|(k, _)| k != crate::tools::PLAN_SCOPE_ENV);
+        s.env
+            .push((crate::tools::PLAN_SCOPE_ENV.to_string(), scope_key.clone()));
+        s
+    };
     // ISS-407770 — consecutive-identical-rejection counter driving both the
     // no-progress short-circuit and the exponential backoff between attempts.
     let mut stall = StallTracker::default();

@@ -50,6 +50,28 @@ pub struct PlanNode {
     pub est_calls: u32,
 }
 
+/// The sentinel path a node uses to declare SHARED scope — "this node touches
+/// files I cannot enumerate". Declaring `files: ["*"]` is the only supported
+/// way to make that claim, and it makes the node collide with every peer, so a
+/// wave containing it never fans out. Silence (an EMPTY `files`) is NOT the
+/// same claim: it means the scope is UNKNOWN, which is refused too.
+pub const SHARED_SCOPE: &str = "*";
+
+impl PlanNode {
+    /// `true` when this node's declared scope makes parallel dispatch unsafe.
+    ///
+    /// Two cases, deliberately collapsed into one answer:
+    /// - `files` is EMPTY — the scope is **unknown**, not disjoint. An
+    ///   under-declared node contributes no paths to the collision check, so
+    ///   reading silence as "cannot collide" let two nodes that both rewrite
+    ///   `src/main.rs` fan out in parallel. That is the under-declaration hole.
+    /// - `files` contains [`SHARED_SCOPE`] (`"*"`) — the node has explicitly
+    ///   claimed shared scope, which collides with everything by definition.
+    pub fn blocks_parallel_dispatch(&self) -> bool {
+        self.files.is_empty() || self.files.iter().any(|f| f == SHARED_SCOPE)
+    }
+}
+
 /// A graph of [`PlanNode`]s scoped to a single coordinator scope key.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanGraph {
@@ -232,14 +254,27 @@ impl PlanGraph {
         self.nodes.iter().find(|n| n.id == id)
     }
 
-    /// `Some(ready)` when >= 2 nodes are ready AND no two of them share any path
-    /// string in `files`; `None` otherwise (meaning: run solo).
+    /// `Some(ready)` when >= 2 nodes are ready, EVERY one of them declares a
+    /// concrete non-empty `files` set, and no two of them share any path
+    /// string; `None` otherwise (meaning: run solo).
+    ///
+    /// Empty `files` is read as **unknown scope**, never as "disjoint". A node
+    /// that declares nothing contributes nothing to the collision check, so
+    /// treating it as parallel-safe is exactly the under-declaration hole that
+    /// lets two workers rewrite the same file. A node that genuinely touches
+    /// shared or unenumerable scope says so with [`SHARED_SCOPE`]
+    /// (`files: ["*"]`) — also refused, but explicitly rather than by omission.
     ///
     /// This predicate is the code twin of the fan-out prompt rule: fan out only
-    /// when the ready work is genuinely independent.
+    /// when the ready work is genuinely — and *declaredly* — independent.
     pub fn fan_out_candidates(&self, done: &HashSet<NodeId>) -> Option<Vec<&PlanNode>> {
         let ready = self.ready_set(done);
         if ready.len() < 2 {
+            return None;
+        }
+        // Under-declaration check FIRST: unknown or shared scope is refused
+        // before any path comparison, because there is nothing to compare.
+        if ready.iter().any(|n| n.blocks_parallel_dispatch()) {
             return None;
         }
         let mut claimed: HashSet<&str> = HashSet::new();
@@ -252,7 +287,117 @@ impl PlanGraph {
         }
         Some(ready)
     }
+
+    /// Ids of every ready node, in declaration order — the operator-facing
+    /// answer to "what MAY be dispatched right now".
+    pub fn ready_ids(&self, done: &HashSet<NodeId>) -> Vec<NodeId> {
+        self.ready_set(done).iter().map(|n| n.id.clone()).collect()
+    }
+
+    /// THE DISPATCH GATE. Decide whether `node_id` may be dispatched right now,
+    /// given the done-set and the ids of plan nodes ALREADY in flight.
+    ///
+    /// This is what makes [`PlanGraph::ready_set`] / [`PlanGraph::fan_out_candidates`]
+    /// the single source of truth on the spawn path instead of a test-only
+    /// property: a dispatch that isn't ready-set-derived is refused here, before
+    /// a credential is spent or a host process is forked.
+    ///
+    /// Rules, in order:
+    ///   1. the node must exist in the plan (`UnknownNode`);
+    ///   2. it must not already be complete (`AlreadyDone`);
+    ///   3. every `depends_on` must be in `done` — i.e. it must be in the ready
+    ///      set (`NotReady`, naming the blockers);
+    ///   4. when anything ELSE is already in flight, the dispatch is a FAN-OUT,
+    ///      so `fan_out_candidates` must authorize it: the ready work must be
+    ///      file-disjoint and must include this node (`FanOutNotIndependent`).
+    ///
+    /// Pure → unit-tested.
+    pub fn authorize_dispatch<'g>(
+        &'g self,
+        done: &HashSet<NodeId>,
+        node_id: &str,
+        concurrent: &[NodeId],
+    ) -> Result<&'g PlanNode, DispatchDenial> {
+        let node = self
+            .node(node_id)
+            .ok_or_else(|| DispatchDenial::UnknownNode(node_id.to_string()))?;
+        if done.contains(&node.id) {
+            return Err(DispatchDenial::AlreadyDone(node.id.clone()));
+        }
+        let blocked: Vec<NodeId> = node
+            .depends_on
+            .iter()
+            .filter(|d| !done.contains(*d))
+            .cloned()
+            .collect();
+        if !blocked.is_empty() {
+            return Err(DispatchDenial::NotReady {
+                node: node.id.clone(),
+                blocked_by: blocked,
+            });
+        }
+        let peers: Vec<NodeId> = concurrent
+            .iter()
+            .filter(|p| **p != node.id)
+            .cloned()
+            .collect();
+        if peers.is_empty() {
+            // Solo dispatch of a ready node — nothing to be independent OF.
+            return Ok(node);
+        }
+        match self.fan_out_candidates(done) {
+            Some(cands) if cands.iter().any(|n| n.id == node.id) => Ok(node),
+            _ => Err(DispatchDenial::FanOutNotIndependent {
+                node: node.id.clone(),
+                peers,
+            }),
+        }
+    }
 }
+
+/// Why [`PlanGraph::authorize_dispatch`] refused a dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchDenial {
+    /// No node with this id is in the plan.
+    UnknownNode(NodeId),
+    /// The node is already recorded complete for this scope.
+    AlreadyDone(NodeId),
+    /// Unsatisfied dependencies — the node is not in the ready set.
+    NotReady {
+        node: NodeId,
+        blocked_by: Vec<NodeId>,
+    },
+    /// Other work is in flight and `fan_out_candidates` does not authorize
+    /// running this node alongside it (ready work isn't file-disjoint, or this
+    /// node isn't among the candidates).
+    FanOutNotIndependent { node: NodeId, peers: Vec<NodeId> },
+}
+
+impl std::fmt::Display for DispatchDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DispatchDenial::UnknownNode(id) => {
+                write!(f, "'{id}' is not a node in this plan")
+            }
+            DispatchDenial::AlreadyDone(id) => {
+                write!(f, "plan node '{id}' is already done")
+            }
+            DispatchDenial::NotReady { node, blocked_by } => write!(
+                f,
+                "plan node '{node}' is not ready — still blocked by: {}",
+                blocked_by.join(", ")
+            ),
+            DispatchDenial::FanOutNotIndependent { node, peers } => write!(
+                f,
+                "fanning out '{node}' is not authorized: work already in flight ({}) and the \
+ready set is not file-disjoint (fan_out_candidates declined)",
+                peers.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DispatchDenial {}
 
 #[cfg(test)]
 mod tests {
@@ -552,12 +697,63 @@ mod tests {
     }
 
     #[test]
-    fn fan_out_candidates_some_when_ready_nodes_declare_no_files() {
+    fn fan_out_candidates_none_when_ready_nodes_declare_no_files() {
+        // UNDER-DECLARATION HOLE: an empty `files` is UNKNOWN scope, not
+        // disjoint scope. Two nodes that declare nothing may both rewrite
+        // `src/main.rs`; silence is not a proof of independence, so the wave
+        // collapses to solo instead of racing.
         let g = graph(vec![node("a", &[]), node("b", &[])]);
-        assert_eq!(
-            g.fan_out_candidates(&done(&[])).map(|r| r.len()),
-            Some(2),
-            "no declared files cannot collide"
+        assert!(
+            g.fan_out_candidates(&done(&[])).is_none(),
+            "undeclared files means unknown scope, which must never fan out"
+        );
+    }
+
+    #[test]
+    fn fan_out_candidates_none_when_a_single_ready_node_under_declares() {
+        // One honest node is not enough: the under-declared peer could be
+        // touching the very file the honest node claimed.
+        let g = graph(vec![
+            node_with_files("a", &[], &["src/a.rs"]),
+            node("b", &[]),
+        ]);
+        assert!(
+            g.fan_out_candidates(&done(&[])).is_none(),
+            "one under-declared ready node collapses the whole wave to solo"
+        );
+    }
+
+    #[test]
+    fn fan_out_candidates_none_when_a_ready_node_declares_shared_scope() {
+        // `["*"]` is the EXPLICIT way to say "I touch shared scope" — honest,
+        // and still never parallel-safe.
+        let g = graph(vec![
+            node_with_files("a", &[], &["src/a.rs"]),
+            node_with_files("b", &[], &[SHARED_SCOPE]),
+        ]);
+        assert!(
+            g.fan_out_candidates(&done(&[])).is_none(),
+            "an explicit shared scope collides with every peer"
+        );
+    }
+
+    #[test]
+    fn blocks_parallel_dispatch_distinguishes_declared_scope_from_silence() {
+        assert!(
+            node("a", &[]).blocks_parallel_dispatch(),
+            "empty files == unknown scope"
+        );
+        assert!(
+            node_with_files("a", &[], &[SHARED_SCOPE]).blocks_parallel_dispatch(),
+            "`*` == explicit shared scope"
+        );
+        assert!(
+            node_with_files("a", &[], &["src/a.rs", SHARED_SCOPE]).blocks_parallel_dispatch(),
+            "`*` anywhere in the list still means shared scope"
+        );
+        assert!(
+            !node_with_files("a", &[], &["src/a.rs"]).blocks_parallel_dispatch(),
+            "a concrete path list is a real, comparable declaration"
         );
     }
 
@@ -597,5 +793,114 @@ mod tests {
         let decoded: PlanNode =
             serde_json::from_str(r#"{"id":"a","intent":"do a"}"#).expect("defaults apply");
         assert_eq!(decoded, node("a", &[]));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_gate_tests {
+    use super::*;
+
+    fn n(id: &str, deps: &[&str], files: &[&str]) -> PlanNode {
+        PlanNode {
+            id: id.to_string(),
+            intent: format!("do {id}"),
+            files: files.iter().map(|s| s.to_string()).collect(),
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            acceptance: Vec::new(),
+            est_calls: 0,
+        }
+    }
+
+    fn graph(nodes: Vec<PlanNode>) -> PlanGraph {
+        PlanGraph {
+            scope_key: "goal:test".to_string(),
+            nodes,
+            created_at: 0,
+        }
+    }
+
+    fn done(ids: &[&str]) -> HashSet<NodeId> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn solo_dispatch_of_a_ready_node_is_authorized() {
+        let g = graph(vec![n("a", &[], &["x.rs"]), n("b", &["a"], &["y.rs"])]);
+        let node = g.authorize_dispatch(&done(&[]), "a", &[]).unwrap();
+        assert_eq!(node.id, "a");
+    }
+
+    #[test]
+    fn unknown_node_is_refused() {
+        let g = graph(vec![n("a", &[], &[])]);
+        assert_eq!(
+            g.authorize_dispatch(&done(&[]), "nope", &[]),
+            Err(DispatchDenial::UnknownNode("nope".into()))
+        );
+    }
+
+    #[test]
+    fn completed_node_is_refused() {
+        let g = graph(vec![n("a", &[], &[])]);
+        assert_eq!(
+            g.authorize_dispatch(&done(&["a"]), "a", &[]),
+            Err(DispatchDenial::AlreadyDone("a".into()))
+        );
+    }
+
+    #[test]
+    fn blocked_node_is_refused_and_names_its_blockers() {
+        let g = graph(vec![n("a", &[], &[]), n("b", &["a"], &[])]);
+        assert_eq!(
+            g.authorize_dispatch(&done(&[]), "b", &[]),
+            Err(DispatchDenial::NotReady {
+                node: "b".into(),
+                blocked_by: vec!["a".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn fan_out_onto_disjoint_ready_work_is_authorized() {
+        let g = graph(vec![n("a", &[], &["x.rs"]), n("b", &[], &["y.rs"])]);
+        let node = g
+            .authorize_dispatch(&done(&[]), "b", &["a".to_string()])
+            .unwrap();
+        assert_eq!(node.id, "b");
+    }
+
+    #[test]
+    fn fan_out_onto_overlapping_ready_work_is_refused() {
+        let g = graph(vec![
+            n("a", &[], &["shared.rs"]),
+            n("b", &[], &["shared.rs"]),
+        ]);
+        assert_eq!(
+            g.authorize_dispatch(&done(&[]), "b", &["a".to_string()]),
+            Err(DispatchDenial::FanOutNotIndependent {
+                node: "b".into(),
+                peers: vec!["a".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn concurrency_list_containing_only_self_is_treated_as_solo() {
+        // A re-dispatch/renew of the same node must not be judged as a fan-out.
+        let g = graph(vec![
+            n("a", &[], &["shared.rs"]),
+            n("b", &[], &["shared.rs"]),
+        ]);
+        let node = g
+            .authorize_dispatch(&done(&[]), "a", &["a".to_string()])
+            .unwrap();
+        assert_eq!(node.id, "a");
+    }
+
+    #[test]
+    fn ready_ids_tracks_the_done_set() {
+        let g = graph(vec![n("a", &[], &[]), n("b", &["a"], &[])]);
+        assert_eq!(g.ready_ids(&done(&[])), vec!["a".to_string()]);
+        assert_eq!(g.ready_ids(&done(&["a"])), vec!["b".to_string()]);
     }
 }
