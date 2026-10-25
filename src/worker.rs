@@ -205,6 +205,11 @@ enum ActivityEvent {
     /// `🗨` turn narration. `text` is the cleaned narration (`None` when empty —
     /// the turn pulse still fires, matching the legacy `classify_event`).
     Turn { text: Option<String> },
+    /// `🗪` CONTINUATION line of the narration block whose first line was a
+    /// [`ActivityEvent::Turn`]. Carries the line body with its own indentation
+    /// intact (only the sentinel + one separator space are stripped). Drives NO
+    /// pulse and renders WITHOUT a turn glyph — the block already showed one.
+    TurnCont(String),
     /// `📦` batch fan-out notice. Text is the cleaned notice (never empty).
     Batch(String),
     /// Anything else — a banner, a blank line, unrecognized prose. No event.
@@ -222,6 +227,16 @@ fn lex_activity(raw: &str) -> ActivityEvent {
     if let Some(note) = strip_sentinel(raw, "📣") {
         return ActivityEvent::Console(note);
     }
+    // 🗪 narration CONTINUATION — line 2..n of the block whose first line was a
+    // `🗨` turn. Checked BEFORE the glyph shapes below: a continuation body is
+    // arbitrary rendered markdown and may legitimately CONTAIN a tool glyph (a
+    // table row about `🔧`, a code fence), which would otherwise be swallowed as
+    // a `ToolStart` and DROPPED from the pane. Indentation after the sentinel is
+    // structure (box-drawing rows, fences) and survives verbatim.
+    if let Some(text) = strip_cont_sentinel(raw) {
+        return ActivityEvent::TurnCont(text);
+    }
+
     // Tool lines carry a source glyph (🔧 MCP · 🛠️ local · 🤝 escalate). A ✓/✗
     // alongside it is a RESULT (outcome); a bare glyph is the START line.
     if has_tool_glyph(raw) {
@@ -280,6 +295,10 @@ impl ActivityEvent {
             ActivityEvent::ToolResult { text, .. } => text.clone(),
             ActivityEvent::Thinking(t) => Some(format!("{NARRATION_ALIGN_PAD}💭 {t}")),
             ActivityEvent::Turn { text: Some(t) } => Some(format!("{NARRATION_ALIGN_PAD}🚀 {t}")),
+            // Hang-indent a continuation under the block's single 🚀 (the glyph
+            // is 2 columns + 1 separator space), so a multi-line narration reads
+            // as ONE turn instead of one rocket per line.
+            ActivityEvent::TurnCont(t) => Some(format!("{NARRATION_ALIGN_PAD}   {t}")),
             ActivityEvent::Batch(t) => Some(format!("{NARRATION_ALIGN_PAD}🐌 {t}")),
             _ => None,
         }
@@ -362,6 +381,22 @@ fn strip_sentinel(raw: &str, mark: &str) -> Option<String> {
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
+/// A narration CONTINUATION line (`🗪`, emitted for lines 2..n of one multi-line
+/// narration block). Unlike [`strip_sentinel`] this preserves the body's OWN
+/// indentation — only the sentinel and ONE separator space are removed — because
+/// a continuation is usually structure (a box-drawing table row, a fenced code
+/// block) whose leading spaces are load-bearing. An empty body is legal (a blank
+/// line inside a block), so the result is `Some("")` rather than `None`.
+fn strip_cont_sentinel(raw: &str) -> Option<String> {
+    let head = raw.trim_start();
+    let rest = match head.strip_prefix("🗪") {
+        Some(r) => r,
+        // Not at the head — retry once past the pane gutter a parent added.
+        None => strip_pane_gutter(head)?.strip_prefix("🗪")?,
+    };
+    Some(rest.strip_prefix(' ').unwrap_or(rest).to_string())
+}
+
 /// True when THIS process is itself a background coordinator (i.e. anything it
 /// prints to stderr is read + lexed by a PARENT aish). Cached — the env is fixed
 /// for the process lifetime and this is consulted on a hot stderr-drain loop.
@@ -386,6 +421,7 @@ fn nesting_sentinel(event: &ActivityEvent) -> Option<&'static str> {
         ActivityEvent::Console(_) => Some("📣"),
         ActivityEvent::Thinking(_) => Some("💭"),
         ActivityEvent::Turn { .. } => Some("🗨"),
+        ActivityEvent::TurnCont(_) => Some("🗪"),
         ActivityEvent::Batch(_) => Some("📦"),
         ActivityEvent::ToolResult { .. } | ActivityEvent::ToolStart | ActivityEvent::Noise => None,
     }
@@ -5882,6 +5918,69 @@ for operator after 4 auto-recovery attempt(s)";
             lex_activity(&pane_row("w_child", &tool_text)),
             ActivityEvent::ToolResult { ok: true, .. }
         ));
+    }
+
+    #[test]
+    /// A MULTI-LINE narration block is ONE turn: the first line carries `🗨`
+    /// (pulse + 🚀 glyph), every continuation carries `🗪` (no pulse, no glyph,
+    /// hang-indented under the rocket). The regression this locks: stamping `🗨`
+    /// on every rendered line turned one table into a WALL OF ROCKETS — one per
+    /// line — and fired a turn pulse per row.
+    fn multiline_narration_is_one_turn_not_one_rocket_per_line() {
+        // What `emit_narration` prints for a 3-line block in a nested session.
+        let emitted = [
+            "🗨 Not fixed — root cause:",
+            "🗪 │ Path │ Result │",
+            "🗪 │ a    │ b      │",
+        ];
+        let events: Vec<ActivityEvent> = emitted.iter().map(|l| lex_activity(l)).collect();
+        // Exactly ONE turn pulse for the whole block.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.pulse() == Some(Pulse::Turn))
+                .count(),
+            1,
+            "a multi-line narration must pulse once, not once per line"
+        );
+        // Exactly ONE 🚀 in the forwarded pane rows; the rest hang-indent.
+        let rows: Vec<String> = events.iter().filter_map(|e| e.forward_text()).collect();
+        assert_eq!(rows.len(), 3, "every line still forwards: {rows:?}");
+        assert_eq!(
+            rows.iter().filter(|r| r.contains('🚀')).count(),
+            1,
+            "one rocket per BLOCK, not per line: {rows:?}"
+        );
+        assert!(
+            rows[1].starts_with(&format!("{NARRATION_ALIGN_PAD}   ")),
+            "continuation hangs under the rocket: {:?}",
+            rows[1]
+        );
+        // Table structure survives verbatim after the hang indent.
+        assert!(rows[1].ends_with("│ Path │ Result │"), "{:?}", rows[1]);
+        // A continuation re-frames for a grandparent with 🗪 outermost and lexes
+        // back to a continuation (still no pulse) at depth 2.
+        let cont = &events[1];
+        assert_eq!(nesting_sentinel(cont), Some("🗪"));
+        let nested = format!(
+            "{} {}",
+            nesting_sentinel(cont).unwrap(),
+            pane_row("w_child", &cont.forward_text().unwrap())
+        );
+        assert!(
+            matches!(lex_activity(&nested), ActivityEvent::TurnCont(_)),
+            "depth-2 continuation must stay a continuation: {nested:?}"
+        );
+        assert_eq!(lex_activity(&nested).pulse(), None);
+        // A continuation whose BODY mentions a tool glyph stays a continuation —
+        // the 🗪 check runs before the glyph shapes, so a table row about `🔧`
+        // is not swallowed as a ToolStart (which would drop the row entirely).
+        assert!(matches!(
+            lex_activity("🗪 │ 🔧 git status │ ok │"),
+            ActivityEvent::TurnCont(_)
+        ));
+        // Blank line inside a block is legal and still forwards (as padding).
+        assert!(matches!(lex_activity("🗪"), ActivityEvent::TurnCont(_)));
     }
 
     #[test]
