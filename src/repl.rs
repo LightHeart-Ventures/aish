@@ -1560,8 +1560,11 @@ pub async fn run(
                 // as a real command, and that wasn't forced inline with `?` — that
                 // carries a troubleshooting or coding/work signal ("troubleshoot",
                 // "write", "refactor", "implement", "fix", "migrate", "setup",
-                // "build", …) is open-ended engineering that shouldn't tie up the
-                // prompt or run inline on the light-touch interactive agent. It
+                // "build", "resolve", "conflict", …) is open-ended engineering
+                // that shouldn't tie up the prompt or run inline on the
+                // light-touch interactive agent. "resolve"/"conflict" cover the
+                // merge-conflict and CI-failure asks, which are long, iterative
+                // and skill-driven (fix-conflicts / fix-ci) — worker work. It
                 // goes to a full-tool worker whose result auto-delivers. Real
                 // commands (`cargo build`, `make`, …) were already peeled off by the
                 // dispatch above, so only genuine prose intent reaches here.
@@ -5332,7 +5335,15 @@ fn mentions_troubleshoot(line: &str) -> bool {
 /// coordinator. Matched as a token PREFIX (case-folded) so inflected forms are
 /// caught too: `build` → building/builds, `refactor` → refactoring/refactored,
 /// `migrate` → migrating/migration, `implement` → implementing/implementation,
-/// `fix` → fixing/fixes, `write` → writing/writes, `setup` → setups.
+/// `fix` → fixing/fixes, `write` → writing/writes, `setup` → setups,
+/// `resolve` → resolving/resolved, `conflict` → conflicts/conflicting.
+///
+/// `resolve` + `conflict` are the merge-conflict / CI-failure escalation: asks
+/// like "resolve the merge conflicts" or "resolve the CI failures" are exactly
+/// the long, iterative, skill-driven work (fix-conflicts / fix-ci) that must not
+/// run inline on the light-touch interactive agent — the worker gets the full
+/// toolset and the conflict/CI skills. ("fix ci" already matched via `fix`; the
+/// `resolve` phrasing did not, which is the gap these two stems close.)
 ///
 /// HEURISTIC STOPGAP, like AMBIGUOUS_COMMANDS: a hand-curated stem list, blunt by
 /// nature. It runs only on lines the shell-first dispatch already declined to run
@@ -5347,6 +5358,8 @@ const WORK_SIGNALS: &[&str] = &[
     "migrate",
     "setup",
     "build",
+    "resolve",
+    "conflict",
 ];
 
 /// True when a model-bound line carries a troubleshooting or coding/work signal,
@@ -16025,6 +16038,24 @@ mod tests {
         // troubleshoot is folded in, and matching is case-insensitive.
         assert!(mentions_work_signal("troubleshoot the build"));
         assert!(mentions_work_signal("FIX the bug"));
+    }
+
+    #[test]
+    fn mentions_work_signal_escalates_conflict_and_ci_failure_asks() {
+        // Merge-conflict / CI-failure asks are long, iterative, skill-driven
+        // work (fix-conflicts / fix-ci) — they must escalate to a worker rather
+        // than run inline on the interactive agent.
+        assert!(mentions_work_signal("resolve the merge conflicts"));
+        assert!(mentions_work_signal("resolve ci failures"));
+        assert!(mentions_work_signal("resolve the CI failures on PR 412"));
+        assert!(mentions_work_signal("Resolving the rebase conflicts"));
+        // The conflict stem catches the ask even without "resolve".
+        assert!(mentions_work_signal(
+            "conflicts on that branch need sorting out"
+        ));
+        assert!(mentions_work_signal("this PR is conflicting with main"));
+        // Pre-existing phrasing still routes the same way via `fix`.
+        assert!(mentions_work_signal("fix ci"));
     }
 
     #[test]
