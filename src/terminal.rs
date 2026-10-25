@@ -41,6 +41,21 @@ use std::time::{Duration, Instant};
 /// message + statusline.
 pub const FOOTER_ROWS: u16 = 4;
 
+/// Blank rows the footer keeps between the scrolling body and its TOP
+/// horizontal rule — the "breathing room" row.
+///
+/// The footer's topmost row is a rule (the lid of the statusline block, or the
+/// top bracket of the pinned tray panel). Without this gap the last line of
+/// command output lands flush against that rule, so output and chrome read as
+/// one block and a trailing line is easy to mistake for part of the frame. The
+/// gap is reserved by the solver like any other zone — so region and paint
+/// agree — and it is painted BLANK, never written to.
+///
+/// It sheds just before the rule itself: blank space is the only zone that
+/// carries even less information than pure chrome, so a short window gives it
+/// up first among the always-on zones.
+pub const GAP_ROWS: u16 = 1;
+
 /// Scrolling rows the body keeps no matter how hard the footer is squeezed. The
 /// footer is chrome; command output is the product — footer zones are shed to
 /// protect these rows, never the other way round.
@@ -87,6 +102,7 @@ pub const MIN_FOOTER_ROWS_DEGRADED: u16 = MIN_BODY_ROWS + 1;
 /// |---|---|---|
 /// | `:`-command hint tray | 1 each | regenerated on the NEXT keystroke; trims one row at a time |
 /// | escalation banners | 2 each | notifications; shed WHOLE, oldest-first |
+/// | body gap | 1 | blank breathing room — carries less than chrome does |
 /// | separator rule | 1 | pure chrome — carries no information at all |
 /// | status message | 1 | transient, and the same text also prints inline |
 /// | statusline | 1 | version/model/stats/clock — informational, re-derivable |
@@ -108,6 +124,14 @@ pub struct FooterLayout {
     /// Rows granted to the pinned escalation block — always a whole multiple of
     /// [`crate::escalation::ROWS_PER_BANNER`].
     pub banner_rows: u16,
+    /// The BLANK row the footer keeps between the scrolling body and its
+    /// topmost rule, or `None` when a short window shed it (see [`GAP_ROWS`]).
+    ///
+    /// This is the first row the footer owns whenever it survives, so
+    /// [`Self::top_row`] returns it and teardown clears it like any other footer
+    /// row. The paint erases it and writes nothing else there — it exists so the
+    /// last line of command output never sits flush against the rule.
+    pub gap_row: Option<u16>,
     /// Row separating pinned tray output from the scrolling text above it, and
     /// always present while any tray item is visible. Painted as a horizontal
     /// RULE (the same glyph run as [`Self::sep_row`]) so the pinned block reads
@@ -175,11 +199,16 @@ impl FooterLayout {
         // thing a short window gives up — a row of tray CONTENT always outranks
         // a row that merely divides it.
         let mut tray_sep = true;
+        // One blank row between the body and the footer's topmost rule. Charged
+        // like any other zone so the DECSTBM region, the body-home row and the
+        // paint all agree it belongs to the footer (see [`GAP_ROWS`]).
+        let mut gap = true;
         // Budget = every row except the body rows we refuse to give up.
         let budget = rows.saturating_sub(MIN_BODY_ROWS);
         let height = loop {
             let h = banner_rows
                 + hint_rows
+                + u16::from(gap)
                 + u16::from(sep)
                 + u16::from(msg)
                 + u16::from(bar)
@@ -199,6 +228,10 @@ impl FooterLayout {
                 hint_rows -= 1;
             } else if banner_rows > 0 {
                 banner_rows -= per;
+            } else if gap {
+                // Blank space is worth less than the chrome below it: give up
+                // the breathing room before giving up the rule itself.
+                gap = false;
             } else if sep {
                 sep = false;
             } else if msg {
@@ -230,6 +263,14 @@ impl FooterLayout {
             height > 0,
             "input row must survive exactly as long as the footer does ({rows} rows)"
         );
+        // The gap sheds one rung BELOW the rule in priority, so it survives
+        // exactly one row later than the full footer does. Asserted for the same
+        // reason as the thresholds above: so the doc table can't drift.
+        debug_assert_eq!(
+            gap,
+            rows >= MIN_FOOTER_ROWS + GAP_ROWS,
+            "body-gap threshold drifted from the solver at {rows} rows"
+        );
         // Pack the survivors contiguously upward from the last row, so a shed
         // zone closes the gap instead of leaving a hole the body can't use.
         let mut next = rows;
@@ -252,15 +293,20 @@ impl FooterLayout {
             hint_rows == 0
                 || sep_row.map(|r| r - hint_rows)
                     == Some(
-                        rows.saturating_sub(height.saturating_sub(1)).max(1)
+                        rows.saturating_sub(height)
+                            + 1
+                            + u16::from(gap)
                             + u16::from(banner_rows > 0 || hint_rows > 0)
                             + banner_rows
                             + u16::from(tray_sep && banner_rows > 0 && hint_rows > 0)
                     ),
             "hint tray must pack flush between the banners and the rule ({rows} rows)"
         );
-        let spacer_row =
-            (banner_rows > 0 || hint_rows > 0).then_some(rows.saturating_sub(height) + 1);
+        // The gap is the TOPMOST footer row, so everything below it — the top
+        // rule, the trays, the bottom rule — shifts down by exactly its height.
+        let gap_row = gap.then_some(rows.saturating_sub(height) + 1);
+        let spacer_row = (banner_rows > 0 || hint_rows > 0)
+            .then_some(rows.saturating_sub(height) + 1 + u16::from(gap));
         // The between-trays rule sits directly under the banner block, which
         // itself starts one row below the top rule. Derived from `spacer_row`
         // rather than counted from the bottom so it can only ever land inside
@@ -281,6 +327,7 @@ impl FooterLayout {
         Self {
             rows,
             height,
+            gap_row,
             spacer_row,
             banner_rows,
             hint_rows,
@@ -471,7 +518,7 @@ pub fn hint_tray_capacity() -> Option<usize> {
     // cap. `max(1)` so a tray that exists is never zero rows tall.
     let fits = rows
         .saturating_sub(MIN_BODY_ROWS)
-        .saturating_sub(FOOTER_ROWS + 1);
+        .saturating_sub(FOOTER_ROWS + GAP_ROWS + 1);
     Some(fits.min((rows / HINT_TRAY_MAX_FRACTION).max(1)) as usize)
 }
 
@@ -500,13 +547,14 @@ pub fn tray_capacity_full() -> Option<usize> {
     if !plan.enabled() {
         return None;
     }
-    // `FOOTER_ROWS + 1` is the footer proper plus the top rule the solver puts
-    // above a non-empty banner/tray block; `banner_rows` is the escalation stack
-    // we must not sit on top of; the final row is the divider rule the solver
-    // charges between the two trays, which exists exactly when banners do.
+    // `FOOTER_ROWS + GAP_ROWS + 1` is the footer proper, the blank breathing row
+    // above the top rule, and the top rule the solver puts above a non-empty
+    // banner/tray block; `banner_rows` is the escalation stack we must not sit
+    // on top of; the final row is the divider rule the solver charges between
+    // the two trays, which exists exactly when banners do.
     let fits = rows
         .saturating_sub(MIN_BODY_ROWS)
-        .saturating_sub(FOOTER_ROWS + 1)
+        .saturating_sub(FOOTER_ROWS + GAP_ROWS + 1)
         .saturating_sub(plan.banner_rows)
         .saturating_sub(u16::from(plan.banner_rows > 0));
     Some(fits.max(1) as usize)
@@ -1331,8 +1379,9 @@ fn paint_cached_footer_locked(home_body: bool, _boundary: &MutexGuard<'_, ()>) {
 // Pure escape-sequence builders (unit-tested without a real terminal).
 // ---------------------------------------------------------------------------
 
-/// DECSTBM: set the scroll region to rows `1..=(rows - FOOTER_ROWS)`, reserving
-/// the bottom [`FOOTER_ROWS`] rows for the footer.
+/// DECSTBM: set the scroll region to rows `1..=(rows - FOOTER_ROWS - GAP_ROWS)`,
+/// reserving the bottom [`FOOTER_ROWS`] chrome rows for the footer plus the
+/// [`GAP_ROWS`] blank row it keeps above its topmost rule.
 pub fn scroll_region_seq(rows: u16) -> String {
     let bottom = FooterLayout::for_rows(rows).region_bottom();
     format!("\x1b[1;{bottom}r")
@@ -1739,8 +1788,11 @@ pub fn footer_seq_with(
     // hands us more banners than fit gets the newest ones painted, never a row
     // written outside the reserved region.
     for (i, (escalation, worker)) in banners.iter().take(layout.banner_count()).enumerate() {
-        let esc_row = top_row
-            + u16::from(layout.spacer_row.is_some())
+        // Anchored one row UNDER the top rule rather than counted down from
+        // `top_row`, because the blank body gap now sits above that rule — any
+        // from-the-top arithmetic here would have to re-derive the gap and would
+        // silently drift the instant the shed order changes again.
+        let esc_row = layout.spacer_row.map_or(top_row, |r| r + 1)
             + (i as u16) * crate::escalation::ROWS_PER_BANNER;
         let worker_row = esc_row + 1;
         s.push_str(&format!(
@@ -1751,6 +1803,13 @@ pub fn footer_seq_with(
             "\x1b[{worker_row};1H\x1b[2K{}",
             clip_visible(worker, max)
         ));
+    }
+    // BODY GAP — one blank row so the last line of output never sits flush
+    // against the rule below it. Nothing is written here, but it IS erased: on a
+    // resize (or the first paint after a child program ran) the row can still
+    // hold stale text from when it belonged to the scrolling body.
+    if let Some(row) = layout.gap_row {
+        s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
     }
     // TOP rule — the lid of the pinned block. Same glyph run as the bottom
     // rule, so the trays read as a framed panel between two rules instead of
@@ -2169,11 +2228,12 @@ pub fn resume_region_seq(rows: u16) -> String {
 /// in content-space: the line under the cursor lands on `body_bottom`, so the
 /// last output line ends up at `body_bottom - 1` and nothing is repainted over.
 ///
-/// The result is clamped to `0..=FOOTER_ROWS`. Zero when the cursor is already
+/// The result is clamped to `0..=(FOOTER_ROWS + GAP_ROWS)` — the footer's own
+/// height, blank breathing row included. Zero when the cursor is already
 /// at or above the last body row — which is exactly the alt-screen case (`vim`,
 /// `less` restore the pre-launch cursor on exit), so a full-screen app never
 /// jerks the view. The upper clamp is defensive: `cursor_row <= rows` already
-/// caps the overflow at `FOOTER_ROWS`.
+/// caps the overflow at `FOOTER_ROWS + GAP_ROWS`.
 ///
 /// An UNCONDITIONAL scroll-up would NOT work here — the prompt is
 /// bottom-anchored, so nearly every command leaves the cursor in the footer
@@ -2649,9 +2709,10 @@ pub fn screen_rows() -> Option<u16> {
 
 /// Whether a bottom-anchored footer scroll region is currently installed. True
 /// only while the three-row footer (rule + status + statusline) is live, so a
-/// caller can decide whether the last scrolling body row (`rows - FOOTER_ROWS`)
-/// really sits directly above the horizontal rule. Used by the `:workers` tray
-/// to bottom-anchor itself only when there is a rule to anchor above.
+/// caller can decide whether the last scrolling body row
+/// (`rows - FOOTER_ROWS - GAP_ROWS`) really sits one blank breathing row above
+/// the horizontal rule. Used by the `:workers` tray to bottom-anchor itself only
+/// when there is a rule to anchor above.
 pub fn footer_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
@@ -3145,8 +3206,11 @@ mod tests {
                 let installed = INSTALLED_LAYOUT.lock().unwrap().unwrap();
                 let live = FooterLayout::for_rows(term_size().unwrap().0);
                 assert_eq!(installed, live);
+                // The blank breathing-room row is always the topmost footer row,
+                // so a visible tray's top rule sits TWO rows below the body.
+                assert_eq!(live.gap_row, Some(live.body_bottom + 1));
                 if live.banner_rows > 0 || live.hint_rows > 0 {
-                    assert_eq!(live.spacer_row, Some(live.body_bottom + 1));
+                    assert_eq!(live.spacer_row, Some(live.body_bottom + 2));
                 }
                 assert_eq!(BODY_ROW.load(Ordering::Relaxed), live.body_bottom);
                 assert!(FOOTER_PAINT.try_lock().is_ok());
@@ -3476,9 +3540,11 @@ mod tests {
 
     #[test]
     fn scroll_region_reserves_four_bottom_rows() {
-        // 24-row terminal → region rows 1..=20, footer at 21 (rule), 22 (input),
-        // 23 (status message), 24 (statusline).
-        assert_eq!(scroll_region_seq(24), "\x1b[1;20r");
+        // 24-row terminal → region rows 1..=19, footer at 20 (body gap), 21
+        // (rule), 22 (input), 23 (status message), 24 (statusline). The gap is
+        // charged to the footer, so the region stops one row higher than the
+        // four chrome rows alone would imply.
+        assert_eq!(scroll_region_seq(24), "\x1b[1;19r");
     }
 
     #[test]
@@ -3523,7 +3589,7 @@ mod tests {
         // reads the LIVE escalation stack: banner rows shrink the body, and a
         // sibling test pinning a banner would otherwise flip these numbers.
         let plan = FooterLayout::solve(24, 0);
-        assert_eq!(plan.overflow_rows(20), 0);
+        assert_eq!(plan.overflow_rows(19), 0);
         assert_eq!(plan.overflow_rows(10), 0);
         assert_eq!(plan.overflow_rows(1), 0);
     }
@@ -3534,12 +3600,14 @@ mod tests {
         // row 24 while the region was suspended, so 4 rows of output sat under
         // the footer and got painted over. Lift exactly that many.
         let plan = FooterLayout::solve(24, 0);
-        assert_eq!(plan.overflow_rows(21), 1);
-        assert_eq!(plan.overflow_rows(22), 2);
-        assert_eq!(plan.overflow_rows(23), 3);
-        assert_eq!(plan.overflow_rows(24), 4);
+        assert_eq!(plan.overflow_rows(20), 1);
+        assert_eq!(plan.overflow_rows(21), 2);
+        assert_eq!(plan.overflow_rows(22), 3);
+        assert_eq!(plan.overflow_rows(23), 4);
+        assert_eq!(plan.overflow_rows(24), 5);
         // Never more than the footer's own height — that is all it can hide.
-        assert_eq!(plan.overflow_rows(99), FOOTER_ROWS);
+        // The body gap is part of that height, so it counts too.
+        assert_eq!(plan.overflow_rows(99), FOOTER_ROWS + GAP_ROWS);
         // Tiny terminals read the SAME solved plan as scroll_region_seq, so the
         // two never disagree about where the body ends. A 3-row window runs a
         // DEGRADED 1-row footer (statusline only), so exactly one row can be
@@ -3550,10 +3618,10 @@ mod tests {
 
     #[test]
     fn banner_growth_equals_the_body_rows_the_footer_takes() {
-        // 24-row window: no banner → body ends at 20; one banner → 17.
+        // 24-row window: no banner → body ends at 19; one banner → 16.
         // The banner and spacer claim three body rows.
-        assert_eq!(FooterLayout::solve(24, 0).body_bottom, 20);
-        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 17);
+        assert_eq!(FooterLayout::solve(24, 0).body_bottom, 19);
+        assert_eq!(FooterLayout::solve(24, 2).body_bottom, 16);
         assert_eq!(banner_growth_rows(24, 0, 2), 3);
         // Second banner takes two more; the first→second step is still 2.
         assert_eq!(banner_growth_rows(24, 2, 4), 2);
@@ -3649,13 +3717,13 @@ mod tests {
         // re-assert, while the region is still full-screen, so the whole
         // viewport scrolls and the lifted rows reach native scrollback.
         let seq = resume_region_seq_with_cursor(24, Some(24));
-        assert_eq!(seq, "\x1b[4S\x1b[1;20r\x1b[20;1H");
-        assert!(seq.find("\x1b[4S").unwrap() < seq.find("\x1b[1;20r").unwrap());
+        assert_eq!(seq, "\x1b[5S\x1b[1;19r\x1b[19;1H");
+        assert!(seq.find("\x1b[5S").unwrap() < seq.find("\x1b[1;19r").unwrap());
 
         // One spilled row scrolls one row.
         assert_eq!(
-            resume_region_seq_with_cursor(24, Some(21)),
-            "\x1b[1S\x1b[1;20r\x1b[20;1H"
+            resume_region_seq_with_cursor(24, Some(20)),
+            "\x1b[1S\x1b[1;19r\x1b[19;1H"
         );
     }
 
@@ -3670,11 +3738,11 @@ mod tests {
         );
         assert_eq!(
             resume_region_seq_with_cursor(24, None),
-            "\x1b[1;20r\x1b[20;1H"
+            "\x1b[1;19r\x1b[19;1H"
         );
         // Cursor already clear of the footer zone → also no scroll emitted.
         assert_eq!(
-            resume_region_seq_with_cursor(24, Some(20)),
+            resume_region_seq_with_cursor(24, Some(19)),
             resume_region_seq(24)
         );
     }
@@ -3713,9 +3781,10 @@ mod tests {
 
     #[test]
     fn resume_region_reasserts_then_homes_last_body_row() {
-        // 24-row terminal: re-assert region 1..=20 then home into row 20 (the
-        // last body row) so the next prompt grows up from just above the footer.
-        assert_eq!(resume_region_seq(24), "\x1b[1;20r\x1b[20;1H");
+        // 24-row terminal: re-assert region 1..=19 then home into row 19 (the
+        // last body row) so the next prompt grows up from just above the blank
+        // breathing-room row that tops the footer.
+        assert_eq!(resume_region_seq(24), "\x1b[1;19r\x1b[19;1H");
     }
 
     #[test]
@@ -3758,7 +3827,8 @@ mod tests {
         // first absolute row paint, or DECRC would restore the homed position
         // and strand the next prompt at the top of the screen.
         let decsc = seq.find("\x1b7").unwrap();
-        let region = seq.find("\x1b[1;20r").expect("region re-asserted"); // 24 - 4 = 20
+        // 24 - 5 = 19: the four chrome rows PLUS the blank body gap above them.
+        let region = seq.find("\x1b[1;19r").expect("region re-asserted");
         let first_paint = seq.find("\x1b[21;1H").unwrap();
         assert!(decsc < region && region < first_paint);
         assert!(seq.contains("\x1b[21;1H")); // separator row = H-3
@@ -3810,10 +3880,11 @@ mod tests {
             "row H-5 must carry the escalation message, got {:?}",
             &seq[esc..worker]
         );
-        // The reserved region includes the spacer (24 - 7 = 17), so the
-        // banner can never be scrolled away by body output.
+        // The reserved region includes the spacer AND the blank breathing-room
+        // row (24 - 8 = 16), so the banner can never be scrolled away by body
+        // output.
         assert!(
-            seq.contains("\x1b[1;17r"),
+            seq.contains("\x1b[1;16r"),
             "DECSTBM must reserve the banner rows too"
         );
     }
@@ -4265,14 +4336,18 @@ mod tests {
         // 24 rows: everything fits — rule, input, message, statusline, in that
         // order upward from the bottom.
         let full = FooterLayout::solve(24, 0);
-        assert_eq!(full.height, FOOTER_ROWS);
+        assert_eq!(full.height, FOOTER_ROWS + GAP_ROWS);
         assert_eq!(
             (full.sep_row, full.input_row, full.msg_row, full.bar_row),
             (Some(21), Some(22), Some(23), Some(24))
         );
-        assert_eq!(full.body_bottom, 20);
+        // The blank breathing-room row is the TOPMOST row the footer owns, so
+        // the body stops one row higher than the chrome alone would require.
+        assert_eq!(full.gap_row, Some(20));
+        assert_eq!(full.body_bottom, 19);
 
-        // 5 rows: the separator — pure chrome, zero information — sheds FIRST,
+        // 5 rows: the gap sheds first (blank space carries even less than
+        // chrome), then the separator — pure chrome, zero information —
         // and the survivors pack contiguously upward so no hole is left behind.
         let tight = FooterLayout::solve(5, 0);
         assert_eq!(tight.height, 3);
@@ -4328,7 +4403,7 @@ mod tests {
         let roomy = FooterLayout::solve(60, per * 3);
         assert_eq!(roomy.banner_rows, per * 3);
         assert_eq!(roomy.banner_count(), 3);
-        assert_eq!(roomy.height, FOOTER_ROWS + per * 3 + 1);
+        assert_eq!(roomy.height, FOOTER_ROWS + per * 3 + 1 + GAP_ROWS);
         // top_row must cover the BANNER block, not just the rule — teardown
         // clears from there, and clearing from the rule would strand banners.
         assert_eq!(roomy.top_row(), 60 - roomy.height + 1);
@@ -4337,8 +4412,12 @@ mod tests {
         assert_eq!(FooterLayout::solve(60, per * 2 + 1).banner_rows, per * 2);
 
         // Squeeze: banners shed BEFORE the separator, whole units at a time,
-        // and the full 3-row footer survives intact.
-        let squeezed = FooterLayout::solve(MIN_FOOTER_ROWS + per + 1, per * 4);
+        // and the full 3-row footer survives intact. The window is sized
+        // banner + tray-rule + GAP_ROWS above the full footer, because a
+        // visible tray now also charges for the blank breathing-room row —
+        // the gap outranks a banner (it sheds one rung LOWER), so a window
+        // one row tighter sheds the BANNER and keeps the gap.
+        let squeezed = FooterLayout::solve(MIN_FOOTER_ROWS + per + 1 + GAP_ROWS, per * 4);
         assert_eq!(squeezed.banner_rows, per);
         assert!(squeezed.sep_row.is_some());
         assert!(squeezed.banner_rows.is_multiple_of(per));
@@ -4412,8 +4491,8 @@ mod tests {
             ("🚀 middle".to_string(), "   ⠙ middle status".to_string()),
             ("🚀 oldest".to_string(), "   ⠹ oldest status".to_string()),
         ];
-        // 24-row window, 3 banners → 10-row footer: rows 15..20 banners, 21
-        // rule, 22 input, 23 msg, 24 bar.
+        // 24-row window, 3 banners → 12-row footer: row 13 blank gap, 14 top
+        // rule, 15..20 banners, 21 rule, 22 input, 23 msg, 24 bar.
         let seq = footer_seq_with(24, 80, "----------", "msg", "bar", banners, Some("❯ "), &[]);
         let newest = seq.find("\x1b[15;1H").expect("newest escalation row");
         let newest_status = seq.find("\x1b[16;1H").expect("newest status row");
@@ -4425,9 +4504,10 @@ mod tests {
         assert!(seq[newest..newest_status].contains("newest"));
         assert!(seq[newest_status..middle].contains("newest status"));
         assert!(seq[rule..].contains("----------"));
-        // DECSTBM must reserve eleven footer rows including the spacer.
+        // DECSTBM must reserve all twelve footer rows — spacer and blank gap
+        // included.
         assert!(
-            seq.contains("\x1b[1;13r"),
+            seq.contains("\x1b[1;12r"),
             "region must cover every banner row"
         );
     }
@@ -4472,8 +4552,10 @@ mod tests {
     fn tray_spacer_separates_body_and_pinned_output_even_in_short_windows() {
         for (banners, hints) in [(2, 0), (0, 2), (2, 2)] {
             let layout = FooterLayout::solve_with(24, banners, hints);
-            assert_eq!(layout.spacer_row, Some(layout.body_bottom + 1));
-            assert_eq!(layout.top_row(), layout.spacer_row.unwrap());
+            // Blank breathing-room row first, THEN the pinned block's top rule.
+            assert_eq!(layout.gap_row, Some(layout.body_bottom + 1));
+            assert_eq!(layout.spacer_row, Some(layout.body_bottom + 2));
+            assert_eq!(layout.top_row(), layout.gap_row.unwrap());
             assert_eq!(layout.input_row, Some(22));
             let seq = footer_seq_with(
                 24,
@@ -4490,13 +4572,14 @@ mod tests {
                 &vec!["hint".into(); hints as usize],
             );
             assert!(seq.contains(&format!("\x1b[{};1H\x1b[2K", layout.spacer_row.unwrap())));
-            let first_output = layout.top_row() + 1;
+            assert!(seq.contains(&format!("\x1b[{};1H\x1b[2K", layout.gap_row.unwrap())));
+            let first_output = layout.spacer_row.unwrap() + 1;
             assert!(seq.contains(&format!(
                 "\x1b[{first_output};1H\x1b[2K{}",
                 if banners > 0 { "escalation" } else { "hint" }
             )));
             let tight = FooterLayout::solve_with(
-                MIN_BODY_ROWS + FOOTER_ROWS + banners + hints + 1,
+                MIN_BODY_ROWS + FOOTER_ROWS + banners + hints + 1 + GAP_ROWS,
                 banners,
                 hints,
             );
@@ -4509,14 +4592,15 @@ mod tests {
 
     #[test]
     fn hint_tray_packs_flush_between_banners_and_rule() {
-        // 24 rows, no banners, 2-row tray → 7-row footer: 18 spacer, 19-20 tray, 21 rule,
-        // 22 input, 23 msg, 24 bar. The tray must END one row above the rule.
+        // 24 rows, no banners, 2-row tray → 8-row footer: 17 blank gap, 18 top
+        // rule, 19-20 tray, 21 rule, 22 input, 23 msg, 24 bar. The tray must END
+        // one row above the rule.
         let l = FooterLayout::solve_with(24, 0, 2);
         assert_eq!(l.hint_rows, 2);
         assert_eq!(l.sep_row, Some(21));
         assert_eq!(l.hint_top_row(), Some(19));
         assert_eq!(l.input_row, Some(22), "input row must NOT move for a tray");
-        assert_eq!(l.height, 7);
+        assert_eq!(l.height, 8);
 
         // With a banner pinned, the tray slides down under it — still flush
         // against the rule, still leaving the input row alone.
@@ -4525,8 +4609,11 @@ mod tests {
         assert_eq!(b.hint_top_row(), Some(b.sep_row.unwrap() - 3));
         assert_eq!(b.input_row, Some(22));
         // Two visible trays → a rule between them, charged inside the block:
-        // 14 spacer, 15-16 banners, 17 RULE, 18-20 tray, 21 rule.
-        assert_eq!(b.tray_sep_row, Some(b.top_row() + 1 + b.banner_rows));
+        // 13 blank gap, 14 top rule, 15-16 banners, 17 RULE, 18-20 tray, 21 rule.
+        assert_eq!(
+            b.tray_sep_row,
+            Some(b.spacer_row.unwrap() + b.banner_rows + 1)
+        );
         assert_eq!(
             b.hint_top_row(),
             b.tray_sep_row.map(|r| r + 1),
@@ -4565,7 +4652,10 @@ mod tests {
             );
             // ...and the tray fills precisely the gap that opened up, ending on
             // the rule, which itself has not moved.
-            assert_eq!(l.tray_sep_row, Some(l.top_row() + 1 + l.banner_rows));
+            assert_eq!(
+                l.tray_sep_row,
+                Some(l.spacer_row.unwrap() + l.banner_rows + 1)
+            );
             assert_eq!(l.hint_top_row(), l.tray_sep_row.map(|r| r + 1));
             assert_eq!(l.sep_row, base.sep_row, "the rule is the fixed anchor");
             assert_eq!(l.input_row, base.input_row);
@@ -4596,11 +4686,12 @@ mod tests {
                 }
             }
         }
-        // Concretely: a 10-row window keeps a banner (6-row footer) and trims a
-        // 12-row ask down to one row while retaining the mandatory spacer.
+        // Concretely: a 10-row window keeps a banner (8-row footer) and trims a
+        // 12-row ask to nothing — the mandatory spacer and the blank gap above
+        // it both outrank the tray.
         let tight = FooterLayout::solve_with(10, per, 12);
         assert_eq!(tight.banner_rows, per);
-        assert_eq!(tight.hint_rows, 1);
+        assert_eq!(tight.hint_rows, 0);
         assert_eq!(tight.input_row, Some(8));
     }
 
@@ -4740,12 +4831,15 @@ mod tests {
         }
         for (editing, cursor_offset) in [(false, 0usize), (false, 4), (true, 0)] {
             let mut before = FooterLayout::solve(24, 0);
+            // Start the cursor on the LAST body row of the bare layout — read
+            // off the plan so the blank gap row can't silently shift it.
+            let home = before.body_bottom;
             let mut screen = Screen {
                 cells: vec![vec![b' '; 40]; 24],
-                row: 20,
+                row: home as usize,
                 col: 1,
-                saved: (20, 1),
-                bottom: 20,
+                saved: (home as usize, 1),
+                bottom: home as usize,
             };
             screen.apply("TEXT");
             screen.row -= cursor_offset;
@@ -4781,6 +4875,12 @@ mod tests {
                 if let Some(row) = after.spacer_row {
                     assert_eq!(screen.line(row).trim(), "----");
                 }
+                // …and the row above it is the blank breathing-room buffer: the
+                // whole point of the feature, so assert it stays EMPTY through
+                // every grow/shrink transition.
+                if let Some(row) = after.gap_row {
+                    assert_eq!(screen.line(row).trim(), "");
+                }
                 assert_eq!(
                     screen.row,
                     if editing {
@@ -4802,18 +4902,21 @@ mod tests {
                 for hints in 0..12 {
                     let layout = FooterLayout::solve_with(rows, banners, hints);
                     if layout.banner_rows > 0 || layout.hint_rows > 0 {
-                        assert_eq!(layout.spacer_row, Some(layout.body_bottom + 1));
+                        // A visible tray implies enough rows for the blank
+                        // breathing-room row, which always tops the footer.
+                        assert_eq!(layout.gap_row, Some(layout.body_bottom + 1));
+                        assert_eq!(layout.spacer_row, Some(layout.body_bottom + 2));
                         // The tray rule, when charged, is part of the pinned
                         // block and so shifts the first tray row down by one.
                         let first = layout.sep_row.unwrap()
                             - layout.hint_rows
                             - layout.banner_rows
                             - u16::from(layout.tray_sep_row.is_some());
-                        assert_eq!(first, layout.body_bottom + 2);
+                        assert_eq!(first, layout.body_bottom + 3);
                         if let Some(rule) = layout.tray_sep_row {
                             // Strictly between the trays: last banner row, rule,
                             // first hint row.
-                            assert_eq!(rule, layout.body_bottom + 2 + layout.banner_rows);
+                            assert_eq!(rule, layout.body_bottom + 3 + layout.banner_rows);
                             assert!(layout.banner_rows > 0 && layout.hint_rows > 0);
                         }
                     } else {
@@ -4896,9 +4999,9 @@ mod tests {
         assert!(seq[first..second].contains(":quit"));
         assert!(seq[second..rule].contains(":jobs"));
         assert!(rule < input, "the rule still sits above the input row");
-        // The region must reserve the tray and spacer (24 - 7 = 17).
+        // The region must reserve the tray, both rules and the gap (24 - 8 = 16).
         assert!(
-            seq.contains("\x1b[1;17r"),
+            seq.contains("\x1b[1;16r"),
             "region must cover every tray row"
         );
     }

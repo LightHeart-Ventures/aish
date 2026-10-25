@@ -3361,7 +3361,7 @@ fn palette_max_rows() -> usize {
     const MARGIN: u16 = 2; // keep the prompt row + one line of breathing room
     match crate::terminal::screen_rows() {
         Some(rows) => rows
-            .saturating_sub(crate::terminal::FOOTER_ROWS)
+            .saturating_sub(crate::terminal::FOOTER_ROWS + crate::terminal::GAP_ROWS)
             .saturating_sub(MARGIN)
             .max(1) as usize,
         None => FALLBACK,
