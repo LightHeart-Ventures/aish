@@ -831,7 +831,13 @@ async fn main() -> Result<()> {
             // exits, but the pipes still break, and the next `println!` would
             // PANIC on EPIPE and kill this coordinator mid-work. Relay through
             // a pipe we own so writes never fail, then drain last.
-            let shield = fd_shield::engage();
+            // ...and the same relay is where this coordinator SELF-RECORDS its
+            // durable activity log: the tap sees every activity row this process
+            // writes to stderr, so the log survives our parent exiting while we
+            // are still working (it used to be the parent that wrote our log,
+            // which froze it the moment the parent finished). No-op when stderr
+            // isn't a pipe or we have no `AISH_RUN_ID`.
+            let shield = fd_shield::engage_with_stderr_tap(activity_log::self_tap());
             let out = engine::run_coordinator(
                 &backend,
                 &mut session,
