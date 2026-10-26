@@ -7993,8 +7993,8 @@ them by review age\nthen file a report";
     /// section is chosen, and `profile_prefix_semantics` pins that half.
     #[test]
     fn section_siblings_never_materialise() {
-        let p = std::env::temp_dir()
-            .join(format!("aish_env_creds_siblings_{}", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("aish_env_creds_siblings_{}", std::process::id()));
         std::fs::write(
             &p,
             "[sweep]\nWANTED_KEY = wanted_value\nSIBLING_KEY = sibling_value\n\
@@ -8015,7 +8015,12 @@ THIRD_KEY = third_value\n",
         let declared = [("WANTED".to_string(), "${sweep:WANTED_KEY}".to_string())];
         let materialised: Vec<(String, String)> = declared
             .iter()
-            .map(|(k, raw)| (k.clone(), resolve_env_value(raw, &[], &creds, &ctx).unwrap()))
+            .map(|(k, raw)| {
+                (
+                    k.clone(),
+                    resolve_env_value(raw, &[], &creds, &ctx).unwrap(),
+                )
+            })
             .collect();
 
         assert_eq!(materialised.len(), 1, "one declared key → one child var");

@@ -4151,9 +4151,7 @@ fn preregister_child_row(run_id: &str, task: &str, spec: &WorkerSpec) {
         spec.launch_session_name.as_deref(),
         parent.as_deref(),
     ) {
-        eprintln!(
-            "\x1b[2maish: failed to pre-register coordinator row {run_id}: {e}\x1b[0m"
-        );
+        eprintln!("\x1b[2maish: failed to pre-register coordinator row {run_id}: {e}\x1b[0m");
     }
 }
 
