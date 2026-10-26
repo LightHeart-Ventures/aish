@@ -4105,6 +4105,48 @@ fn build_container_command(
     Some(ContainerLaunch { cmd, env_file })
 }
 
+/// Pre-register the child's durable `coordinator_runs` row — in the PARENT,
+/// SYNCHRONOUSLY, before the child process exists.
+///
+/// The parent's terminal-phase gate asks the store "do I still have live
+/// children?" and holds itself in `waiting` when the answer is yes. That gate
+/// is correct but it LOST A RACE: the child inserts its own row only once it is
+/// up (re-exec + worktree add + fan-out stagger — seconds), while the parent can
+/// reach its terminal write within milliseconds of the dispatch tool call
+/// returning. With no row yet, the live-child count was 0 and the parent wrote
+/// `done` — the reported bug: two workers reported `done` whose answer was only
+/// "Dispatched w_…", with the real children still coordinating and no PR open.
+///
+/// Writing the row here makes the child's existence durable the instant
+/// `spawn`/`resume_in_place` returns, so the gate can never observe the gap. The
+/// child's own `insert_with_parent` is `ON CONFLICT DO NOTHING`, so it is a
+/// harmless no-op afterwards and the child remains the owner of every later
+/// phase transition. Best-effort: a store write failure must not block the
+/// spawn (it only re-opens the pre-existing race).
+fn preregister_child_row(run_id: &str, task: &str, spec: &WorkerSpec) {
+    let Some(store) = spec.coordinator_store.as_ref() else {
+        return;
+    };
+    // Same parent link the child env stamp uses (see `coordinator_command`), read
+    // from OUR process env: unset only in odd test paths, where the child is
+    // simply treated as a root run.
+    let parent = std::env::var("AISH_RUN_ID")
+        .ok()
+        .filter(|rid| !rid.is_empty());
+    if let Err(e) = store.insert_with_parent(
+        run_id,
+        task,
+        &spec.launch_session_id,
+        spec.launch_session_name.as_deref(),
+        parent.as_deref(),
+    ) {
+        eprintln!(
+            "\x1b[2maish: failed to pre-register coordinator row {run_id}: {e}\x1b[0m"
+        );
+    }
+}
+
+/// Register a new background worker and start its run task. Returns the
 /// Register a new background worker and start its run task. Returns the
 /// session-local job id. The spec is captured up front so the spawned task is
 /// self-contained.
@@ -4149,6 +4191,11 @@ pub fn spawn(jobs: &WorkerJobs, task: String, spec: WorkerSpec) -> String {
     // in-place resume passes a FRESH run id here (a new thread) while reusing this
     // same `WorkerJob`, so the durable side gets a distinct row per thread without
     // the worker changing its visible identity. See `resume_in_place`.
+    // Close the live-child race BEFORE the child exists (see
+    // `preregister_child_row`): our caller's dispatch tool call returns right
+    // after this, and the parent's terminal gate must already be able to see
+    // this child.
+    preregister_child_row(&id, &task, &spec);
     tokio::spawn(run_worker(jobs.clone(), job, id.clone(), task, spec));
     id
 }
@@ -4193,6 +4240,9 @@ pub fn resume_in_place(
     // resuming a worker whose banner is still inside its dwell window updates
     // that row instead of stacking a duplicate.
     crate::escalation::pin(&id, &job.task);
+    // A resume is a FRESH thread with its own durable row — pre-register it for
+    // the same reason as the initial spawn (see `preregister_child_row`).
+    preregister_child_row(&run_id, &task, &spec);
     tokio::spawn(run_worker(jobs.clone(), job, run_id, task, spec));
     (id, thread)
 }
