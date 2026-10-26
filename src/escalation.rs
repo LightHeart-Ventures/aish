@@ -55,8 +55,8 @@
 //! durable `coordinator_runs` table (walking `parent_run_id` transitively from
 //! the pinned ids) and pins each with [`pin_sub`], which files the child UNDER
 //! its parent. The forest walk in [`ordered_rows`] then paints a child directly
-//! beneath its parent — FLUSH with it, not indented, so every row keeps the same
-//! left edge and the same column grid — led by a bent arrow INSTEAD of the
+//! beneath its parent, with both child lines aligned to the parent's heart
+//! column. The child is led by a bent arrow INSTEAD of the
 //! parent's rocket, with the same summary-and-heartbeat status row every root
 //! gets, minus the id, which a nested row deliberately drops (see
 //! [`render_sub`]): the arrow and the row's PLACE already say whose work it is,
@@ -66,7 +66,7 @@
 //! ```text
 //!   🚀 w_a7k3m2 · ship the sprint
 //!      ♥ 4m02s · running · fanning out the card work
-//!   ↳ wire the tray rows                        <- sub-WORKER: arrow, not 🚀
+//!      ↳ wire the tray rows                        <- sub-WORKER: arrow, not 🚀
 //!      ♥ 1m12s · running · 🔧 read_file src/escalation.rs
 //! ```
 //!
@@ -88,9 +88,9 @@
 //! ```text
 //!   🚀 w_a7k3m2 · ship the sprint
 //!      ♥ 4m02s · running · fanning out the card work
-//!   ↳ ✅ read the board                         <- sub-WORK ledger item
+//!      ↳ ✅ read the board                         <- sub-WORK ledger item
 //!      · 2m41s · done · 7 cards, 3 blocked
-//!   ↳ 🧩 write the specs
+//!      ↳ 🧩 write the specs
 //!      · 1m09s · running · drafting card 2 of 3
 //! ```
 //!
@@ -202,8 +202,8 @@ pub const IDLE_PREFIX: &str = "↳";
 /// The bent arrow that marks a SUB-WORKER's banner — a coordinator spawned BY
 /// another pinned coordinator (see the SUB-WORKERS note in the module docs). It
 /// stands IN PLACE OF the parent's [`LIVE_GLYPH`] rocket (a child is not its own
-/// launch) and leads the child's head row, which sits FLUSH with its parent's so
-/// the tray keeps one left edge: `  ↳ reviewing the diff`. The child's own `w_…`
+/// launch) and leads the child's head row at the parent's heart column:
+/// `   ↳ reviewing the diff`. The child's own `w_…`
 /// is NOT painted — the arrow attributes the work, so see [`render_sub`].
 pub const SUB_ARROW: &str = "↳";
 
@@ -1930,19 +1930,9 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Mark one already-rendered banner pair as a CHILD: the bent arrow takes the
-/// glyph cell the parent spends on its rocket, and nothing is indented.
-///
-/// Indent was the wrong lever. It bought nesting at the cost of the tray's one
-/// straight left edge and of real columns off the SUMMARY — the only cell a
-/// nested row is read for — and at depth 2 the rows drifted far enough that the
-/// eye stopped scanning them as one block. Depth is already legible from the
-/// arrow in the glyph column, so children now sit FLUSH with their parent and
-/// every status row keeps the same grid: `🚀 w_a1b2 · parent` over
-/// `↳ child work`.
-///
-/// Depth 0 is returned untouched — a root keeps the tray's established shape,
-/// byte for byte.
+/// Mark a child at the parent's heart column. Both child lines have the same
+/// three-column indent; deeper descendants keep this same alignment rather
+/// than accumulating indentation. Root rows are returned unchanged.
 fn mark_child(pair: (String, String), depth: usize, color_on: bool) -> (String, String) {
     use crate::style::{Color, paint_with};
     if depth == 0 {
@@ -1953,7 +1943,7 @@ fn mark_child(pair: (String, String), depth: usize, color_on: bool) -> (String, 
     // with the summary for the eye. The status row is untouched — it already
     // carries the shared 3-column indent every other row in the tray uses.
     let arrow = paint_with(SUB_ARROW, Color::Dim, color_on);
-    (format!("{arrow} {top}"), bottom)
+    (format!("   {arrow} {top}"), bottom)
 }
 
 /// Serializes every test in the crate that mutates this module's
@@ -3132,7 +3122,7 @@ mod tests {
     /// instead of surfacing as another unexplained top-level escalation at the
     /// top of the tray. Siblings keep the tray's newest-first order.
     #[test]
-    fn sub_workers_paint_flush_under_their_parent() {
+    fn sub_workers_align_both_lines_with_parent_hearts() {
         let _g = lock();
         clear();
         pin("w_parent", "the fan-out");
@@ -3153,11 +3143,9 @@ mod tests {
         assert!(!heads[1].contains("w_kid_b"), "{heads:#?}");
         assert!(!heads[2].contains("w_kid_a"), "{heads:#?}");
 
-        // ONE left edge: a child sits FLUSH with its parent and is marked by the
-        // arrow in the glyph column instead of by indent, so the whole tray
-        // stays scannable as a single block.
+        // The child arrow aligns with its own heart and the parent's heart.
         assert!(!heads[0].starts_with(' '), "{:?}", heads[0]);
-        let want = format!("{SUB_ARROW} ");
+        let want = format!("   {SUB_ARROW} ");
         assert!(heads[1].starts_with(&want), "{:?}", heads[1]);
         assert!(heads[2].starts_with(&want), "{:?}", heads[2]);
         // The arrow REPLACES the rocket rather than doubling up on it: a child
@@ -3169,15 +3157,28 @@ mod tests {
         let root_prefix: String = painted[0].1.chars().take_while(|c| *c == ' ').collect();
         let kid_prefix: String = painted[1].1.chars().take_while(|c| *c == ' ').collect();
         assert_eq!(root_prefix, kid_prefix, "{painted:#?}");
+        for (head, bottom) in painted.iter().skip(1) {
+            let head_indent = head.len() - head.trim_start().len();
+            let bottom_indent = bottom.len() - bottom.trim_start().len();
+            assert_eq!(head_indent, 3, "{painted:#?}");
+            assert_eq!(head_indent, bottom_indent, "{painted:#?}");
+        }
+        // Styling must not move the visible arrow or heart columns.
+        for (head, bottom) in rows(true, MAX_VISIBLE).iter().skip(1) {
+            let head = strip_ansi(head);
+            let bottom = strip_ansi(bottom);
+            assert_eq!(head.len() - head.trim_start().len(), 3);
+            assert_eq!(bottom.len() - bottom.trim_start().len(), 3);
+        }
         clear();
     }
 
     /// Sub-workers fan out too, so the walk is transitive — and because depth no
-    /// longer buys indent, EVERY descendant paints the same shape: flush with the
-    /// tray's one left edge, marked by the bent arrow. Depth is still clamped at
+    /// longer buys extra indent, EVERY descendant aligns with the parent's heart
+    /// column, marked by the bent arrow. Depth is still clamped at
     /// [`MAX_SUB_DEPTH`] for the walk, so a runaway chain can't crowd the tray.
     #[test]
-    fn every_depth_paints_flush_and_orphans_fall_back_to_roots() {
+    fn every_depth_aligns_with_hearts_and_orphans_fall_back_to_roots() {
         let _g = lock();
         clear();
         pin("w_g0", "root row");
@@ -3193,9 +3194,9 @@ mod tests {
                 .map(|(h, _)| h.clone())
                 .unwrap_or_else(|| panic!("{needle} missing from {painted:#?}"))
         };
-        let want = format!("{SUB_ARROW} ");
+        let want = format!("   {SUB_ARROW} ");
         // The root keeps the rocket; both descendants swap it for the arrow and
-        // start at column 0 — a grandchild is NOT pushed further right.
+        // start at the heart column; a grandchild is not pushed further right.
         assert!(head_of("root row").starts_with(LIVE_GLYPH));
         assert!(head_of("kid row").starts_with(&want), "{painted:#?}");
         assert!(head_of("deep leaf").starts_with(&want), "{painted:#?}");
