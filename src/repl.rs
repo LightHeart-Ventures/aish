@@ -7892,7 +7892,6 @@ fn backend_credential_missing(session: &Session) -> bool {
 /// The shared "no credential, cannot resume" notice for both resume paths.
 const NO_CREDENTIAL_RESUME: &str = "no credential for the active backend — can't resume (Claude: CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY · Grok: ~/.grok/auth.json or XAI_API_KEY · OpenAI: OPENAI_API_KEY · OpenRouter: OPENROUTER_API_KEY)";
 
-
 /// Resume a TERMINAL coordinator this session does NOT own — the sub-worker
 /// case. `resume_coordinator` can relaunch only a run tracked in
 /// `session.worker_jobs`; a sub-worker (spawned by another coordinator via
