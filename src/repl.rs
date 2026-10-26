@@ -773,6 +773,9 @@ pub async fn run(
             // rows, not just this session's), so the presenter re-sweeps
             // periodically for sessions that stay up for days.
             let mut last_reap = std::time::Instant::now();
+            // Separate clock from `last_reap`: the orphan (liveness) sweep runs
+            // every 60s, the age sweep hourly.
+            let mut last_orphan_reap = std::time::Instant::now();
             loop {
                 tick.tick().await;
                 if busy.load(Ordering::SeqCst) {
@@ -817,6 +820,14 @@ pub async fn run(
                     if last_reap.elapsed() >= Duration::from_secs(3600) {
                         last_reap = std::time::Instant::now();
                         let _ = store.expire_stale_alerts(crate::db::AlertStore::STALE_ALERT_SECS);
+                    }
+                    // Liveness sweep, on a much tighter cadence than the age
+                    // horizon: a semantic alert can only fire by its delegated
+                    // coordinator calling `set_alert`, so the moment that run
+                    // goes terminal the row is dead weight holding ⏰ on.
+                    if last_orphan_reap.elapsed() >= Duration::from_secs(60) {
+                        last_orphan_reap = std::time::Instant::now();
+                        let _ = store.expire_orphaned_alerts();
                     }
                     if let Ok(armed) = store.armed_alerts() {
                         for a in armed {
@@ -9763,7 +9774,14 @@ instead of firing.\n\nCondition: {description}"
         attached: session.attached.clone(),
         coordinator_store: session.coordinator_store.clone(),
     };
-    let _ = crate::worker::spawn(&session.worker_jobs, task, spec);
+    // Bind the monitor to its watcher. A semantic alert fires ONLY by pull —
+    // this coordinator calling `set_alert` — so the run id is what later lets
+    // the liveness sweep retire the row the instant that run goes terminal,
+    // instead of leaving ⏰ lit until the 7-day age horizon.
+    let run_id = crate::worker::spawn(&session.worker_jobs, task, spec);
+    if let Some(store) = &session.alert_store {
+        let _ = store.set_watcher_run_id(id, &run_id);
+    }
     true
 }
 

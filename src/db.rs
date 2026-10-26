@@ -135,7 +135,12 @@ impl Db {
                  last_checked INTEGER NOT NULL DEFAULT 0,
                  session_id   TEXT,
                  created_at   INTEGER NOT NULL DEFAULT 0,
-                 fired_at     INTEGER
+                 fired_at     INTEGER,
+                 -- Run id of the background coordinator delegated to watch a
+                 -- SEMANTIC alert: the only link from an armed row back to the
+                 -- process that can fire it. NULL for native (locally polled)
+                 -- kinds, which the presenter resolves itself.
+                 watcher_run_id TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state);
              -- Worktree lifecycle tracking for background coordinators (Fix #3).
@@ -1298,11 +1303,21 @@ impl AlertStore {
                  last_checked INTEGER NOT NULL DEFAULT 0,
                  session_id   TEXT,
                  created_at   INTEGER NOT NULL DEFAULT 0,
-                 fired_at     INTEGER
+                 fired_at     INTEGER,
+                 -- Run id of the background coordinator delegated to watch a
+                 -- SEMANTIC alert: the only link from an armed row back to the
+                 -- process that can fire it. NULL for native (locally polled)
+                 -- kinds, which the presenter resolves itself.
+                 watcher_run_id TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts (state);",
         )
         .context("alert schema init failed")?;
+        // Migration for stores created before `watcher_run_id` existed: the
+        // CREATE above is a no-op once the table is there, so an existing
+        // alerts table never gains the column on its own. ADD COLUMN errors
+        // when it is already present — the steady state — so ignore the result.
+        let _ = conn.execute("ALTER TABLE alerts ADD COLUMN watcher_run_id TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -1490,6 +1505,64 @@ impl AlertStore {
                 [cutoff],
             )
             .context("expire stale alerts failed")?;
+        Ok(n)
+    }
+
+    /// Record which background coordinator was delegated to watch a semantic
+    /// alert. Called immediately after the monitor is spawned — this is the only
+    /// link from an armed row back to the process that can fire it.
+    pub fn set_watcher_run_id(&self, id: i64, run_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE alerts SET watcher_run_id = ?2 WHERE id = ?1",
+            rusqlite::params![id, run_id],
+        )
+        .context("recording alert watcher failed")?;
+        Ok(())
+    }
+
+    /// Sweep monitors whose WATCHER IS DEAD: every row still `armed` whose
+    /// `watcher_run_id` names a coordinator run that has already reached a
+    /// terminal phase flips to `cancelled`. Returns how many were swept.
+    ///
+    /// This is the liveness-based counterpart to [`Self::expire_stale_alerts`],
+    /// which can only act on age. A semantic alert fires exclusively by PULL —
+    /// its delegated coordinator calling `set_alert` — so once that run is
+    /// terminal the row can never resolve, yet the age sweep would leave the ⏰
+    /// badge lit for a full 7 days. This detects it in seconds instead.
+    ///
+    /// Deliberately conservative in two ways. A row whose watcher has no
+    /// `coordinator_runs` entry yet is LEFT ALONE: the run writes its row a
+    /// moment after spawn, so "missing" means starting, not dead. And when the
+    /// coordinator table doesn't exist at all — an alerts-only store, as the
+    /// unit tests open — the sweep is a no-op rather than an error.
+    pub fn expire_orphaned_alerts(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let has_runs = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='coordinator_runs'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_runs {
+            return Ok(0);
+        }
+        let n = conn
+            .execute(
+                "UPDATE alerts SET state='cancelled'
+                 WHERE state='armed' AND watcher_run_id IS NOT NULL
+                   AND watcher_run_id IN (
+                       SELECT run_id FROM coordinator_runs
+                       -- The only two terminal phases in the
+                       -- `coordinator_runs` CHECK constraint. `checkpoint` and
+                       -- `waiting` are deliberately excluded: those runs are
+                       -- paused-but-resumable and may still fire.
+                       WHERE phase IN ('done','failed')
+                   )",
+                [],
+            )
+            .context("expire orphaned alerts failed")?;
         Ok(n)
     }
 
@@ -2141,6 +2214,100 @@ mod tests {
                 .unwrap(),
             0
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The liveness fix: an armed monitor whose watcher coordinator has gone
+    /// terminal can never fire — a semantic alert resolves ONLY by that run
+    /// calling `set_alert` — so it must be swept in seconds rather than waiting
+    /// out the 7-day age horizon. Rows whose watcher is still running, whose
+    /// watcher hasn't written its row yet, or that have no watcher at all are
+    /// left strictly alone.
+    #[test]
+    fn alerts_whose_watcher_run_is_terminal_are_swept() {
+        use crate::alert::AlertKind;
+        let path =
+            std::env::temp_dir().join(format!("aish_test_alert_orphan_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = AlertStore::open(&path).unwrap();
+
+        let kind = AlertKind::Semantic {
+            description: "when the build finishes".into(),
+        };
+        let dead = store
+            .insert_alert("dead watcher", &kind, true, None)
+            .unwrap();
+        let live = store
+            .insert_alert("live watcher", &kind, true, None)
+            .unwrap();
+        let starting = store
+            .insert_alert("watcher not yet persisted", &kind, true, None)
+            .unwrap();
+        let unwatched = store.insert_alert("no watcher", &kind, true, None).unwrap();
+        store.set_watcher_run_id(dead, "w_dead").unwrap();
+        store.set_watcher_run_id(live, "w_live").unwrap();
+        store.set_watcher_run_id(starting, "w_missing").unwrap();
+        assert_eq!(store.armed_alerts().unwrap().len(), 4);
+
+        // No `coordinator_runs` table yet (an alerts-only store): the sweep must
+        // be a silent no-op, not an error.
+        assert_eq!(store.expire_orphaned_alerts().unwrap(), 0);
+        assert_eq!(store.armed_alerts().unwrap().len(), 4);
+
+        // Stand up the minimum shape the sweep joins against.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE coordinator_runs (run_id TEXT PRIMARY KEY, phase TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO coordinator_runs (run_id, phase) VALUES ('w_dead','failed')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO coordinator_runs (run_id, phase) VALUES ('w_live','coordinating')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let swept = store.expire_orphaned_alerts().unwrap();
+        assert_eq!(
+            swept, 1,
+            "only the terminal watcher's row should be cancelled"
+        );
+
+        let armed = store.armed_alerts().unwrap();
+        let ids: Vec<i64> = armed.iter().map(|a| a.id).collect();
+        assert_eq!(armed.len(), 3);
+        assert!(!ids.contains(&dead));
+        assert!(
+            ids.contains(&live),
+            "a running watcher's monitor must survive"
+        );
+        assert!(
+            ids.contains(&starting),
+            "a watcher that hasn't written its row yet is starting, not dead"
+        );
+        assert!(
+            ids.contains(&unwatched),
+            "native monitors have no watcher to check"
+        );
+
+        // Idempotent, and `done` is terminal too.
+        assert_eq!(store.expire_orphaned_alerts().unwrap(), 0);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE coordinator_runs SET phase='done' WHERE run_id='w_live'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.expire_orphaned_alerts().unwrap(), 1);
+        assert_eq!(store.armed_alerts().unwrap().len(), 2);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -747,6 +747,18 @@ async fn main() -> Result<()> {
                 Err(e) => startup_notices
                     .push(format!("\x1b[33maish:\x1b[0m alert sweep failed: {e:#}")),
             }
+            // Liveness pass. The horizon above is age-only (7d), but a semantic
+            // alert whose watcher coordinator went terminal five seconds ago is
+            // just as unfireable — detect that directly instead of waiting out
+            // the week.
+            match store.expire_orphaned_alerts() {
+                Ok(0) => {}
+                Ok(n) => startup_notices.push(format!(
+                    "\x1b[2maish: retired {n} alert monitor(s) whose watcher coordinator is gone (`:alert list all`)\x1b[0m"
+                )),
+                Err(e) => startup_notices
+                    .push(format!("\x1b[33maish:\x1b[0m alert liveness sweep failed: {e:#}")),
+            }
             session.alert_store = Some(store);
         }
         Err(e) => startup_notices.push(format!(
