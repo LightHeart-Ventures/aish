@@ -19,12 +19,34 @@
 //! durable `task` + `result`, and since a live run has no result yet, the pane
 //! stayed BLANK forever (the reported bug).
 //!
-//! This module is the durable mirror of the ring: the pipe-owning process
-//! appends every FORWARDABLE row — the exact `event.forward_text()` bytes, so
-//! the durable log and the live pane can never drift — to an append-only JSONL
-//! file keyed by `run_id`. Any other process (another session's REPL, the same
-//! REPL after the parent coordinator exited) can backfill and then TAIL that
-//! file to watch a run it does not own.
+//! This module is the durable mirror of the ring: every FORWARDABLE row — the
+//! exact `event.forward_text()` bytes, so the durable log and the live pane can
+//! never drift — is appended to an append-only JSONL file keyed by `run_id`. Any
+//! other process (another session's REPL, the same REPL after the parent
+//! coordinator exited) can backfill and then TAIL that file to watch a run it
+//! does not own.
+//!
+//! # Who writes the file: the RUN ITSELF
+//!
+//! The first cut had the pipe-OWNING process write it, at the same seam that
+//! feeds the ring. That made a run's durability a function of its PARENT's
+//! lifetime, which is exactly the thing nesting breaks: a coordinator that
+//! finished while its own subworkers were still running stopped draining their
+//! pipes, and those children's logs froze mid-run — `:attach` on a child that
+//! was demonstrably still working showed the replayed task and not one row
+//! after that instant (observed: a parent done at 19:31:10, children that ran
+//! on until 19:46 and 19:54 with ~10 rows / <1 KB each; a child whose parent
+//! exited ~1s after spawn with a 0-byte log; top-level workers, whose parent is
+//! the long-lived REPL, with full 20–50 KB logs).
+//!
+//! So the coordinator process now records its OWN log, via [`self_tap`] on the
+//! [`crate::fd_shield`] stderr relay — the single seam every activity row it
+//! prints passes through. A run is alive for precisely as long as it has
+//! activity to record, so nothing upstream can truncate it. The pipe-owning
+//! parent keeps the LIVE half only (ring, `:worker-output` gating, attach-pane
+//! rendering, pulse) and writes the durable log for exactly one vehicle: a
+//! CONTAINERIZED child, whose self-written file would land inside the container
+//! instead of the host `~/.aish/activity` an `:attach` reads.
 //!
 //! # Why JSONL and not a SQLite table
 //!
@@ -61,6 +83,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 /// Byte budget for ONE run's activity log. When the file grows past this the
@@ -306,6 +329,57 @@ impl Drop for ActivityLogWriter {
         // NOT joined here: a drop on a tokio worker thread must not block on IO.
         self.tx.take();
     }
+}
+
+/// This process's OWN log, opened at most once per process.
+///
+/// `None` means "not a coordinator run" (no `AISH_RUN_ID`) or the file wouldn't
+/// open; either way the tap is simply never installed.
+static SELF_WRITER: OnceLock<Option<Arc<ActivityLogWriter>>> = OnceLock::new();
+
+/// The stderr [`crate::fd_shield::LineTap`] with which a coordinator SELF-RECORDS
+/// its durable activity log — `None` when this process has no run identity.
+///
+/// # Why the child and not the parent
+///
+/// The durable log used to be written exclusively by whoever owned the child's
+/// stderr pipe (the spawning process, in [`crate::worker::stream_stderr`]).
+/// That made a child's durability a function of its PARENT's lifetime: a
+/// coordinator that finished while its own subworkers were still running
+/// stopped draining, and the children's logs froze mid-run — `:attach` on a
+/// still-working child then showed the replayed task and nothing else. A child
+/// spawned by a parent that exited a second later got a 0-byte log.
+///
+/// The child, by contrast, is alive for exactly as long as there is activity to
+/// record, and it already knows its durable identity from `AISH_RUN_ID` (set on
+/// the spawned command in [`crate::worker`] and re-stamped by
+/// `coordinator::run`). Tapping its own stderr relay — the ONE seam every
+/// activity row funnels through, whatever printed it — makes the log
+/// self-sufficient.
+///
+/// Rows go through [`crate::worker::activity_row`], the same projection the
+/// parent-side drain uses, so a self-written row is byte-identical to a
+/// parent-written one and `:attach` cannot tell them apart.
+pub fn self_tap() -> Option<crate::fd_shield::LineTap> {
+    let run_id = std::env::var("AISH_RUN_ID").ok()?;
+    if run_id.trim().is_empty() {
+        return None;
+    }
+    let writer = SELF_WRITER
+        .get_or_init(|| ActivityLogWriter::open(&run_id).map(Arc::new))
+        .clone()?;
+    Some(tap_into(writer))
+}
+
+/// Build the tap that mirrors forwardable stderr lines into `writer`. Split out
+/// from [`self_tap`] so tests can drive the exact production projection against
+/// a writer in a temp dir instead of the process-global one.
+pub fn tap_into(writer: Arc<ActivityLogWriter>) -> crate::fd_shield::LineTap {
+    Arc::new(move |line: &str| {
+        if let Some(row) = crate::worker::activity_row(line) {
+            writer.record(&row);
+        }
+    })
 }
 
 /// The writer thread: block on the channel, batch everything already queued into
@@ -594,5 +668,103 @@ mod tests {
         remove_in(&dir, "w_rm");
         assert!(!log_path_in(&dir, "w_rm").exists());
         remove_in(&dir, "w_rm"); // no panic on a missing file
+    }
+
+    /// The raw stderr lines a coordinator emits in one round: two narration
+    /// sentinels, a tool RESULT, and three things that must NOT be persisted —
+    /// a bare tool START (the old duplicate-tool-row bug), a 📣 console note
+    /// (surfaced out-of-band, never an activity row), and plain prose.
+    const RAW_ROUND: &[&str] = &[
+        "  🚀 banner prose that is not an activity line",
+        "🗨 round 2: reading the worker",
+        "🔧 read_file src/worker.rs",
+        "✓ 🔧 read_file src/worker.rs",
+        "💭 thinking…",
+        "📣 console note for the operator",
+    ];
+
+    /// Drop a tap and its writer, then WAIT for the flush. Production shares one
+    /// writer between the tap and whoever opened it, so `close()` — which
+    /// consumes the writer to join its thread — is only reachable once every
+    /// other handle is gone. Tests need the join to read deterministically.
+    fn settle(tap: crate::fd_shield::LineTap, writer: Arc<ActivityLogWriter>) {
+        drop(tap);
+        match Arc::try_unwrap(writer) {
+            Ok(w) => w.close(),
+            Err(_) => panic!("a handle to the writer outlived the tap"),
+        }
+    }
+
+    #[test]
+    fn self_tap_records_forwardable_rows_and_skips_noise() {
+        let dir = tmpdir("selftap");
+        let w = Arc::new(ActivityLogWriter::open_in(&dir, "w_self", MAX_BYTES).unwrap());
+        let tap = tap_into(w.clone());
+        for raw in RAW_ROUND {
+            tap(raw);
+        }
+        settle(tap, w);
+        // Exactly the three forwardable shapes, in emit order: turn narration
+        // and 💭 get the alignment-padded glyph, the tool RESULT is verbatim.
+        // The START line, the 📣 note, and the prose line are all dropped.
+        assert_eq!(
+            backfill_in(&dir, "w_self"),
+            vec![
+                "  🚀 round 2: reading the worker".to_string(),
+                "✓ 🔧 read_file src/worker.rs".to_string(),
+                "  💭 thinking…".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parent_streaming_the_same_lines_adds_no_duplicate_rows() {
+        // The child SELF-records `w_kid`; its parent still sees and renders the
+        // very same stderr lines live (nesting, `:worker-output`, attach pane)
+        // but — since the fix — writes them into no log of the child's. So the
+        // child's log must hold ONE copy of each row, not two.
+        let dir = tmpdir("nodupe");
+        let child = Arc::new(ActivityLogWriter::open_in(&dir, "w_kid", MAX_BYTES).unwrap());
+        let child_tap = tap_into(child.clone());
+        for raw in RAW_ROUND {
+            child_tap(raw);
+            // Parent-side drain: same projection, applied for rendering only.
+            let _rendered = crate::worker::activity_row(raw);
+        }
+        settle(child_tap, child);
+        let rows = backfill_in(&dir, "w_kid");
+        assert_eq!(rows.len(), 3, "one row per forwardable line: {rows:?}");
+        let mut uniq = rows.clone();
+        uniq.dedup();
+        assert_eq!(uniq, rows, "no row repeated back-to-back");
+    }
+
+    #[test]
+    fn rows_keep_accumulating_after_the_parent_writer_is_dropped() {
+        // The regression this fix exists for: the parent used to own the only
+        // writer, so when a coordinator finished while its subworker was still
+        // working, the subworker's log froze at that instant (or stayed 0 bytes
+        // when the parent exited right after spawning). With the child tapping
+        // its own stderr, dropping the parent's writer changes nothing.
+        let dir = tmpdir("parentgone");
+        let parent = ActivityLogWriter::open_in(&dir, "w_orphan", MAX_BYTES).unwrap();
+        parent.record("  🚀 round 1: parent-written");
+        parent.close(); // parent coordinator exits here — writer gone for good
+
+        let own = Arc::new(ActivityLogWriter::open_in(&dir, "w_orphan", MAX_BYTES).unwrap());
+        let tap = tap_into(own.clone());
+        tap("✓ 🔧 read_file src/coordinator.rs");
+        tap("💭 still working after the parent is gone");
+        settle(tap, own);
+
+        assert_eq!(
+            backfill_in(&dir, "w_orphan"),
+            vec![
+                "  🚀 round 1: parent-written".to_string(),
+                "✓ 🔧 read_file src/coordinator.rs".to_string(),
+                "  💭 still working after the parent is gone".to_string(),
+            ],
+            "the log grows past the parent's lifetime"
+        );
     }
 }

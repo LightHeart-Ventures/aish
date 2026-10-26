@@ -67,16 +67,41 @@ struct Relay {
     done: Receiver<()>,
 }
 
-/// Interpose a relay on stdout and stderr, if they are pipes.
+/// A per-line observer on a hijacked fd's byte stream. Called on the relay
+/// thread with ONE complete line (newline and any trailing `\r` stripped, ANSI
+/// left intact) in the order the process wrote it, BEFORE the bytes are copied
+/// downstream.
+///
+/// Used by the coordinator to SELF-RECORD its own durable activity log: the
+/// relay already sees every byte this process writes to stderr, which is the one
+/// seam every activity row (`🔧` tool rows, `💭` thinking, `🗨`/`🚀` narration)
+/// funnels through — so the run's log no longer depends on a parent process
+/// staying alive to drain the pipe (see [`crate::activity_log`]).
+///
+/// A tap MUST NOT write to stdout/stderr (it would feed its own relay) and must
+/// not block: it runs inline on the copy loop.
+pub type LineTap = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Interpose a relay on stdout and stderr, if they are pipes, plus an optional
+/// [`LineTap`] on the STDERR relay.
 ///
 /// A tty or a regular file can't break under us the way a parent-owned pipe
 /// can, so those are left completely untouched — the shield costs nothing on an
 /// interactive or file-redirected run.
-pub fn engage() -> FdShield {
-    let relays = [libc::STDOUT_FILENO, libc::STDERR_FILENO]
-        .into_iter()
-        .filter_map(hijack)
-        .collect();
+///
+/// stderr is where every activity row goes (stdout carries only the final
+/// answer), so the tap is the single seam a coordinator needs to mirror its own
+/// activity into a durable log. When stderr isn't a pipe there is no relay and
+/// hence no tap — that's the interactive/file-redirected case, which has no
+/// parent-owned pipe to lose in the first place.
+pub fn engage_with_stderr_tap(stderr_tap: Option<LineTap>) -> FdShield {
+    let relays = [
+        hijack(libc::STDOUT_FILENO, None),
+        hijack(libc::STDERR_FILENO, stderr_tap),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     FdShield { relays }
 }
 
@@ -106,7 +131,7 @@ impl FdShield {
 /// Replace `fd` with the write end of a fresh pipe and start the relay thread.
 /// Returns `None` (leaving `fd` exactly as it was) if `fd` isn't a pipe or any
 /// step fails — the shield is an enhancement, never a prerequisite.
-fn hijack(fd: libc::c_int) -> Option<Relay> {
+fn hijack(fd: libc::c_int, tap: Option<LineTap>) -> Option<Relay> {
     if !is_pipe(fd) {
         return None;
     }
@@ -146,7 +171,7 @@ fn hijack(fd: libc::c_int) -> Option<Relay> {
     let spawned = std::thread::Builder::new()
         .name(format!("fd-shield-{fd}"))
         .spawn(move || {
-            relay(rd, thread_dst);
+            relay(rd, thread_dst, tap);
             let _ = tx.send(());
         });
     if spawned.is_err() {
@@ -165,6 +190,13 @@ fn hijack(fd: libc::c_int) -> Option<Relay> {
     Some(Relay { fd, dst, done })
 }
 
+/// Hard ceiling on the un-terminated tail the line-splitter will buffer for a
+/// [`LineTap`]. A pathological writer (a binary blob, a progress bar that never
+/// emits `\n`) must not grow this unbounded; past the cap we drop the pending
+/// bytes and resync at the next newline. Copying downstream is unaffected —
+/// every byte is still relayed verbatim.
+const MAX_TAP_LINE: usize = 64 * 1024;
+
 /// Copy `rd` -> the shared destination until EOF, tolerating a dead downstream.
 ///
 /// The first failed write means the parent is gone. We do **not** stop: the
@@ -175,13 +207,22 @@ fn hijack(fd: libc::c_int) -> Option<Relay> {
 /// `drain` may take the destination out from under us at shutdown; a `None`
 /// slot means exactly the same thing as a dead downstream — discard and
 /// continue until the fd closes.
-fn relay(rd: libc::c_int, dst: Arc<Mutex<Option<std::fs::File>>>) {
+///
+/// When a [`LineTap`] is installed we ALSO split the stream into lines and hand
+/// each complete line to the tap. Note the ordering: the tap runs BEFORE the
+/// downstream write, so a row is durably recorded even if the copy fails.
+fn relay(rd: libc::c_int, dst: Arc<Mutex<Option<std::fs::File>>>, tap: Option<LineTap>) {
     let mut src = unsafe { std::fs::File::from_raw_fd(rd) };
     let mut buf = [0u8; 16 * 1024];
+    // Un-terminated tail of the last chunk, carried into the next read.
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         match src.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                if let Some(tap) = &tap {
+                    split_lines(&mut pending, &buf[..n], tap.as_ref());
+                }
                 if let Ok(mut slot) = dst.lock() {
                     let dead = match slot.as_mut() {
                         Some(f) => f.write_all(&buf[..n]).is_err(),
@@ -196,6 +237,10 @@ fn relay(rd: libc::c_int, dst: Arc<Mutex<Option<std::fs::File>>>) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+    }
+    // EOF: a final line written without a trailing newline is still a line.
+    if let Some(tap) = &tap {
+        emit_line(&pending, tap.as_ref());
     }
     if let Ok(mut slot) = dst.lock() {
         if let Some(f) = slot.as_mut() {
@@ -258,6 +303,34 @@ fn is_cloexec(fd: libc::c_int) -> bool {
     flags >= 0 && (flags & libc::FD_CLOEXEC) != 0
 }
 
+/// Append `chunk` to `pending` and hand every NEWLINE-TERMINATED line to `tap`,
+/// leaving the un-terminated remainder in `pending`. Pure (given the tap) →
+/// unit-tested.
+///
+/// `pending` is allowed to reach `MAX_TAP_LINE + 1` bytes; that length IS the
+/// over-budget sentinel — pushing stops there and [`emit_line`] drops the line
+/// rather than recording a truncated row. The next newline resyncs.
+fn split_lines(pending: &mut Vec<u8>, chunk: &[u8], tap: &dyn Fn(&str)) {
+    for &b in chunk {
+        if b == b'\n' {
+            emit_line(pending, tap);
+            pending.clear();
+        } else if pending.len() <= MAX_TAP_LINE {
+            pending.push(b);
+        }
+    }
+}
+
+/// Hand one line's bytes to `tap`, minus a trailing `\r` (CRLF writers).
+/// Blank and over-budget lines are dropped.
+fn emit_line(line: &[u8], tap: &dyn Fn(&str)) {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() || line.len() > MAX_TAP_LINE {
+        return;
+    }
+    tap(&String::from_utf8_lossy(line));
+}
+
 /// True when `fd` is a pipe/FIFO — the only case that can break under us.
 fn is_pipe(fd: libc::c_int) -> bool {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -312,7 +385,7 @@ mod tests {
         // Downstream: stands in for the parent-owned pipe.
         let (down_rd, down_wr) = pipe_pair();
 
-        let t = std::thread::spawn(move || relay(up_rd, dest(down_wr)));
+        let t = std::thread::spawn(move || relay(up_rd, dest(down_wr), None));
 
         let mut writer = unsafe { std::fs::File::from_raw_fd(up_wr) };
         writer
@@ -372,7 +445,7 @@ mod tests {
         assert!(victim >= 0, "dup the downstream onto a scratch fd");
         unsafe { libc::close(down_wr) };
 
-        let relay = hijack(victim).expect("a pipe fd must be shielded");
+        let relay = hijack(victim, None).expect("a pipe fd must be shielded");
 
         // Something long-lived, spawned *after* the shield is up.
         let mut grandchild = std::process::Command::new("sleep")
@@ -417,7 +490,7 @@ mod tests {
         let (up_rd, up_wr) = pipe_pair();
         let (down_rd, down_wr) = pipe_pair();
 
-        let t = std::thread::spawn(move || relay(up_rd, dest(down_wr)));
+        let t = std::thread::spawn(move || relay(up_rd, dest(down_wr), None));
 
         let mut writer = unsafe { std::fs::File::from_raw_fd(up_wr) };
         writer.write_all(b"hello coordinator\n").expect("write");
@@ -429,5 +502,77 @@ mod tests {
         assert_eq!(got, "hello coordinator\n");
 
         t.join().expect("relay thread");
+    }
+
+    /// The self-recording seam: a tap sees each complete line exactly once,
+    /// in order, regardless of how the writer chunked it — and the bytes still
+    /// reach the downstream verbatim.
+    #[test]
+    fn stderr_tap_sees_each_line_once_across_chunk_boundaries() {
+        let (up_rd, up_wr) = pipe_pair();
+        let (down_rd, down_wr) = pipe_pair();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let tap: LineTap = std::sync::Arc::new(move |line: &str| {
+            sink.lock().expect("tap lock").push(line.to_string());
+        });
+
+        let t = std::thread::spawn(move || relay(up_rd, dest(down_wr), Some(tap)));
+
+        let mut writer = unsafe { std::fs::File::from_raw_fd(up_wr) };
+        // A row split mid-line across two writes, a CRLF row, a blank line,
+        // and a final row with NO trailing newline.
+        writer
+            .write_all(b"\x1b[2m 12:00:00 \x1b[0m\xf0\x9f\x94\xa7 read_fi")
+            .unwrap();
+        writer
+            .write_all(b"le\nwith crlf\r\n\n\xf0\x9f\x92\xad thinking")
+            .unwrap();
+        drop(writer);
+
+        let mut reader = unsafe { std::fs::File::from_raw_fd(down_rd) };
+        let mut got = String::new();
+        reader.read_to_string(&mut got).expect("read downstream");
+        t.join().expect("relay thread");
+
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(
+            *seen,
+            vec![
+                "\x1b[2m 12:00:00 \x1b[0m🔧 read_file".to_string(),
+                "with crlf".to_string(),
+                "💭 thinking".to_string(),
+            ],
+            "one callback per complete line, CR stripped, blanks dropped"
+        );
+        assert!(
+            got.contains("🔧 read_file") && got.ends_with("💭 thinking"),
+            "tapping must not disturb the bytes going downstream: {got:?}"
+        );
+    }
+
+    /// A writer that never emits a newline must not grow the tap buffer without
+    /// bound, and must not record a truncated row — but must resync afterwards.
+    #[test]
+    fn tap_drops_over_budget_lines_and_resyncs() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let tap = move |line: &str| sink.lock().expect("tap lock").push(line.to_string());
+
+        let mut pending = Vec::new();
+        split_lines(&mut pending, &vec![b'x'; MAX_TAP_LINE * 2], &tap);
+        assert_eq!(
+            pending.len(),
+            MAX_TAP_LINE + 1,
+            "pending must be capped, not grow with the input"
+        );
+        split_lines(&mut pending, b"\nshort row\n", &tap);
+
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            vec!["short row".to_string()],
+            "the over-budget line is dropped; the next line is recorded"
+        );
     }
 }

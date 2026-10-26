@@ -305,6 +305,17 @@ impl ActivityEvent {
     }
 }
 
+/// The durable-log projection of ONE raw stderr line: `Some(row)` when the line
+/// is a forwardable activity row, `None` for noise/START/empty. Both writers go
+/// through THIS function — the parent-side drain in [`stream_stderr`] and a
+/// coordinator SELF-recording its own log via [`crate::activity_log::self_tap`]
+/// — so a self-written row is byte-identical to a parent-written one and
+/// `:attach` can't tell which process persisted it. Classification lives in
+/// [`lex_activity`] alone; this is the shared projection, not a second lexer.
+pub fn activity_row(raw: &str) -> Option<String> {
+    lex_activity(raw).forward_text()
+}
+
 /// Classify ONE raw coordinator-stderr line into a prompt-badge pulse event, or
 /// `None` when it carries no event. Pure, so it's unit-testable without a pipe.
 ///
@@ -4445,6 +4456,12 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
         crate::container::runtime_on_path(crate::container::Runtime::Podman),
         crate::container::runtime_on_path(crate::container::Runtime::Docker),
     );
+    // Does the child run in a CONTAINER? It then self-records into the
+    // container's own filesystem, which is not the host `~/.aish/activity` an
+    // `:attach` reads — so for that vehicle (and only that one) this parent
+    // stays the child's durable writer. See the `activity` binding below.
+    let containerized = matches!(selection, crate::container::Selection::Container(_));
+
     // The STABLE job id this run belongs to. On a RESUME, `run_id` is a fresh
     // per-thread id while the operator (and `:tell` / `send_to_attached`) still
     // address the worker by `job.id` — so hand the child that id as its steer
@@ -4503,16 +4520,33 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
     let show_output = spec.show_output.clone();
     let attached = spec.attached.clone();
     let pulse_job = job.clone();
-    // Durable per-run activity log. The process that owns this child's stderr
-    // pipe is the ONLY one that can see its activity; persisting the forwardable
-    // rows here is what lets ANY session `:attach` a live SUBWORKER (whose pipe
-    // belongs to a parent coordinator, possibly already exited). Best-effort:
-    // `None` when the file can't be opened — never fails a launch.
+    // Durable per-run activity log — written by the CHILD ITSELF, not here.
+    //
+    // This parent owns the child's stderr pipe, so it was once the only process
+    // that could see the child's activity, and it did the durable write. That
+    // tied the child's log to THIS process's lifetime: when a coordinator
+    // finished while its own subworkers were still running, it stopped draining
+    // and the children's logs froze mid-run (observed: a parent done at 19:31:10
+    // leaving two children that ran until 19:46/19:54 with ~10 rows each, and a
+    // child whose parent exited ~1s after spawn with a 0-byte log). An `:attach`
+    // to such a child then showed only the replayed task input.
+    //
+    // So the child now self-records at its own stderr-emit seam
+    // (`fd_shield::engage_with_stderr_tap` + `activity_log::self_tap`, wired in
+    // main.rs's `--coordinator` path), which is independent of whoever happens
+    // to hold its pipe. This parent keeps the LIVE path only — forwarding,
+    // rendering, pulse — and writes the durable log for exactly one vehicle:
+    // a CONTAINER child, whose self-written log lands inside the container
+    // rather than in the host `~/.aish/activity` that `:attach` reads.
+    //
     // Keyed by the durable `run_id` (the THREAD identity recorded in
     // `coordinator_runs`), not the worker's visible id — an in-place resume
     // mints a fresh run_id for the same WorkerJob, and a cross-session
-    // `:attach` resolves runs by exactly that durable id.
-    let activity = crate::activity_log::ActivityLogWriter::open(&run_id).map(Arc::new);
+    // `:attach` resolves runs by exactly that durable id. Best-effort: `None`
+    // when the file can't be opened — never fails a launch.
+    let activity = containerized
+        .then(|| crate::activity_log::ActivityLogWriter::open(&run_id).map(Arc::new))
+        .flatten();
     let activity_stream = activity.clone();
     let collect = tokio::spawn(async move {
         tokio::join!(
