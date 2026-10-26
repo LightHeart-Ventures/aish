@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.75.1] - 2026-10-26
+
+### Fixed
+- **An armed semantic alert is retired when its watcher coordinator dies, instead of burning for a week.** A semantic `:alert` resolves only by *pull* — the background coordinator delegated to watch it calls `set_alert(<id>)` — so when that coordinator goes terminal first the armed row can **never** fire, and the only sweep was age-based (`STALE_ALERT_SECS = 7d`), leaving the ⏰ badge lit for a full week on a monitor that was dead on arrival (observed live: alert #79 watching an already-`failed` worker whose watcher had no `coordinator_runs` row left). Orphan detection is now **liveness-based**: a new `alerts.watcher_run_id` column records which coordinator was spawned for a semantic monitor — `worker::spawn` already returned the run id and it was being thrown away with `let _ =` — behind an `ADD COLUMN` migration for pre-existing stores, and `AlertStore::expire_orphaned_alerts()` cancels armed rows whose watcher sits in a terminal phase (`done` / `failed`) in one `UPDATE … IN (SELECT …)` against the same `aish.db`. It is wired into both existing age-sweep sites — once at startup with its own notice, and in the presenter loop every **60s**, tighter than the hourly age pass because liveness flips in seconds. Conservative by construction, with four ways a row survives: a watcher row not yet persisted is a *starting* worker rather than a dead one, phases `checkpoint` / `waiting` are resumable, a `NULL` `watcher_run_id` means a native (locally polled) file/command/PR monitor and is never touched, and a missing `coordinator_runs` table is a silent no-op rather than an error. The deliberate trade-off: resuming an alert-watcher worker in place mints a new run row and leaves the original terminal, so the sweep cancels that monitor — it shows as `cancelled` in `:alert list all` and can be re-armed, far cheaper than a week of false ⏰ (#1126).
+
 ## [0.75.0] - 2026-10-26
 
 ### Added
