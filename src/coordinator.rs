@@ -1440,6 +1440,38 @@ final status plus your best partial result. After this turn you are terminated."
             }
         }
 
+        // ── Parked operator question (FR-431). A coordinator that emits a
+        // `choice` block is asking the OPERATOR to decide, and there is no tty
+        // here to pop the selector over — so the ask would otherwise exist only
+        // as prose in a stream that `:worker-output` hides by default. PARK it:
+        // the durable store outlives this round, the detach, and the whole
+        // session, which is what makes it show up in `:questions`, in the
+        // `:attach` notice, and in the next session's startup notice.
+        //
+        // This mirrors the no-tty branch of repl.rs's post-turn park. The
+        // coordinator path (`--coordinator` → `engine::run_coordinator` →
+        // `drive`) never passes through that code at all, which is exactly why a
+        // background worker's choice block rendered as text and populated
+        // nothing. `question::park` dedupes on the question text, so a model
+        // that re-asks the same thing every round yields ONE row with ONE id
+        // instead of a tray full of near-identical ids for one decision.
+        if let Some(spec) = crate::choice::first_choice(&answer)
+            && let Some(q) = crate::question::park(run_id, &spec)
+        {
+            let note = q.console_note();
+            // Same channel discipline as the sub-work ledger above: `📣` when a
+            // parent shell is framing our stderr, a plain line when nobody is
+            // there to decode the sentinel.
+            if session.nested {
+                crate::worker::emit_console_note(&note);
+            } else {
+                eprintln!("{note}");
+            }
+            if let Some(w) = session.worker_transcript.as_mut() {
+                w.record_message("assistant", "question-parked", &note);
+            }
+        }
+
         // ── Worker-exit evaluation: did this round's turn end abnormally? The
         // engine tags a loop-detected / forced-summarize / budget-exhausted stop
         // with a parseable banner on the first line of the answer. Decide a
