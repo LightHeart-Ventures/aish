@@ -863,6 +863,76 @@ mod tests {
         assert!(render_notice(&[], "scope").is_none());
     }
 
+    /// (b) THE BUG, end to end: the EXACT choice block a background
+    /// coordinator emitted (reported as "workers are properly outputting
+    /// options ... but it's not populating the options tray") must parse and
+    /// park. Before the coordinator-side park, this text reached the operator
+    /// as prose only and the store stayed empty — so this test pins the
+    /// parse → park → `pending()` contract on real worker output rather than a
+    /// hand-built spec.
+    #[test]
+    fn real_coordinator_choice_block_parses_and_parks() {
+        let _g = HOME_LOCK.lock().unwrap();
+        let _home = TempHome::new("coordinator");
+
+        let answer = "\
+Here's where it stands.
+
+```choice
+mode: one
+question: w_UhYhNOj9's commit is done but unshipped. How do you want it finished?
+options:
+  - id: finish-inline
+    label: I finish it now inline (run pytest, update the spec doc, push, open draft PR)
+    summary: Fastest; you get a PR URL this turn.
+  - id: dispatch-finisher
+    label: Dispatch a fresh agent to finish + ship it
+    summary: New worker resumes that worktree, validates, opens the draft PR.
+  - id: review-first
+    label: Show me the diff first
+    summary: I print migrations/034 for your review before anything is pushed.
+  - id: leave-it
+    label: Leave it alone for now
+    summary: Branch stays local; nothing pushed.
+```
+";
+
+        let parsed = crate::choice::first_choice(answer).expect("block parses");
+        let parked = park("w_QLe7sEWJ", &parsed).expect("parks");
+
+        let rows = pending();
+        assert_eq!(
+            rows.len(),
+            1,
+            "coordinator question never reached the store"
+        );
+        assert_eq!(rows[0].id, parked.id);
+        assert_eq!(rows[0].worker, "w_QLe7sEWJ");
+        assert_eq!(rows[0].mode, "one");
+        let ids: Vec<&str> = rows[0].options.iter().map(|(i, _)| i.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "finish-inline",
+                "dispatch-finisher",
+                "review-first",
+                "leave-it"
+            ],
+            "every option must survive into the tray row"
+        );
+        // The note is what an operator actually sees; it has to carry the id
+        // they are expected to type back into `:answer`.
+        let note = parked.console_note();
+        assert!(note.contains(&parked.id), "note must name the question id");
+
+        // Re-asking the same thing next round must re-surface the SAME id
+        // rather than stacking a second tray row the operator cannot tell
+        // apart.
+        let again = park("w_QLe7sEWJ", &parsed).expect("re-ask returns the live row");
+        assert_eq!(again.id, parked.id, "re-ask must reuse the parked id");
+        assert_eq!(pending().len(), 1, "re-ask stacked a duplicate tray row");
+    }
+
     #[test]
     fn pending_is_ordered_oldest_first() {
         let _g = HOME_LOCK.lock().unwrap();
