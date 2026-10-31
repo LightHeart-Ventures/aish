@@ -1853,7 +1853,20 @@ pub fn rows(color_on: bool, max_banners: usize) -> Vec<(String, String)> {
             } else {
                 String::new()
             };
-            let elapsed_ms = b.pinned_at.elapsed().as_millis() as u64;
+            // FROZEN ON A VERDICT: once `terminal_at` is stamped, the runtime
+            // cell is the worker's FINAL duration, not a clock that keeps
+            // counting. `terminal_at` already freezes the spinner glyph and
+            // re-ranks the row's [`Phase`]; leaving the timer live made a
+            // finished row keep ticking for its whole dwell, so a `done` worker
+            // read as still working and its reported runtime drifted further
+            // from the truth with every paint. `saturating_duration_since` keeps
+            // a backdated verdict (or a sub-worker pinned with a backdated
+            // clock) from underflowing to a bogus duration.
+            let elapsed_ms = b
+                .terminal_at
+                .unwrap_or_else(Instant::now)
+                .saturating_duration_since(b.pinned_at)
+                .as_millis() as u64;
             if b.kind == Kind::Queued {
                 return render_queued(
                     elapsed_ms,
@@ -2950,6 +2963,52 @@ mod tests {
         assert!(a.contains("0s       coordi…"), "{a}");
         assert!(b.contains("1m12s    coordi…"), "{b}");
         assert!(c.contains("1h05m    coordi…"), "{c}");
+    }
+
+    /// A VERDICT STOPS THE CLOCK. A finished worker's runtime cell is its final
+    /// duration, not a number that keeps climbing for the whole dwell — a tray
+    /// row whose timer still ticks reads as work that is still running.
+    #[test]
+    fn a_verdict_stops_the_runtime_clock() {
+        let _g = lock();
+        clear();
+        pin("w_frozen0000001", "done");
+        // Give the row a real runtime to freeze, then stamp the verdict.
+        shift_clocks("w_frozen0000001", Duration::from_secs(72));
+        note_terminal("w_frozen0000001", false);
+        let at_verdict = only_status_row();
+        assert!(at_verdict.contains("1m12s"), "{at_verdict}");
+        // Five more minutes of wall clock: shifting the start AND the verdict
+        // back together is what the passage of time looks like to a frozen pair
+        // of `Instant`s.
+        shift_clocks("w_frozen0000001", Duration::from_secs(300));
+        assert_eq!(
+            at_verdict,
+            only_status_row(),
+            "the runtime froze at the verdict instead of ticking through dwell"
+        );
+        clear();
+    }
+
+    /// Backdate a banner's WHOLE clock — start and verdict together — by `by`.
+    fn shift_clocks(id: &str, by: Duration) {
+        if let Ok(mut banners) = BANNERS.lock()
+            && let Some(b) = banners.iter_mut().find(|b| b.id == id)
+        {
+            b.pinned_at -= by;
+            if let Some(t) = b.terminal_at {
+                b.terminal_at = Some(t - by);
+            }
+        }
+    }
+
+    /// The painted status row (the half carrying the runtime) of a one-row tray.
+    fn only_status_row() -> String {
+        rows(false, MAX_VISIBLE)
+            .into_iter()
+            .next()
+            .expect("one painted row")
+            .1
     }
 
     #[test]
