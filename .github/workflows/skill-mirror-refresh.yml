@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: |
@@ -64,7 +64,7 @@ jobs:
           rustup default stable
 
       - name: Cache cargo + target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -80,7 +80,7 @@ jobs:
       # it to cache eviction costs one expensive run, then self-heals — hence a
       # date-keyed entry with a prefix restore-key rather than anything clever.
       - name: Restore ingest state
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: work/ingest-state.json
           key: skill-mirror-state-${{ github.run_id }}
@@ -220,7 +220,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: skill-mirror-${{ github.run_id }}
           path: |
