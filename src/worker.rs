@@ -1699,6 +1699,15 @@ impl ThinkingSpinner {
     }
 }
 
+/// A caller-owned sink for the forwardable activity lines drained out of a
+/// coordinator's stderr. The background-worker path records into a
+/// [`WorkerJob`]'s transcript ring; the GOAL path has no `WorkerJob` (each turn
+/// is a bare `run_once` subprocess), so it passes a sink that appends into the
+/// owning goal's replay transcript instead. Without it, a goal's `:attach` /
+/// Shift-Tab backfill showed only the coarse per-turn notes and NONE of the
+/// turns' actual output history.
+pub type ActivitySink = Arc<dyn Fn(&str) + Send + Sync>;
+
 async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     r: R,
     label: &str,
@@ -1710,6 +1719,11 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
     // stream, which has no durable run row to tail. Writing happens at the SAME
     // single seam that records into the ring, so the two can never drift.
     activity: Option<Arc<crate::activity_log::ActivityLogWriter>>,
+    // Caller-owned transcript sink — the GOAL path, which has no `WorkerJob`
+    // ring to record into (`None` for background workers, which use `pulse`).
+    // Fed from the SAME seam and the SAME `text` bytes as the ring and the
+    // durable mirror, so the three can never drift.
+    sink: Option<ActivitySink>,
 ) -> String {
     let mut lines = BufReader::new(r).lines();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
@@ -1820,6 +1834,10 @@ async fn stream_stderr<R: tokio::io::AsyncRead + Unpin>(
             // back-pressure this stderr drain.
             if let Some(log) = &activity {
                 log.record(&text);
+            }
+            // Caller-owned sink (the goal path): same seam, same bytes.
+            if let Some(push) = &sink {
+                push(&text);
             }
             let live_rows: Vec<(String, String)> = if let Some(job) = &pulse {
                 job.record_activity("", &text);
@@ -4556,6 +4574,7 @@ other's files and commit onto the wrong branch, so this run is failed instead. R
                 attached,
                 Some(pulse_job),
                 activity_stream,
+                None,
             )
         )
     });
@@ -4755,7 +4774,16 @@ pub fn run_kind(run_id: &str) -> &'static str {
 /// final answer). Unlike `spawn`, it doesn't register a tracked job or
 /// auto-deliver — the caller consumes the output. Used by the goal loop for each
 /// work step.
-pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<String, String> {
+pub async fn run_once(
+    spec: &WorkerSpec,
+    task: &str,
+    run_id: &str,
+    // Where this turn's forwarded activity is retained for replay. The goal loop
+    // passes a sink that appends into its own bounded transcript so `:attach
+    // goal` / Shift-Tab backfills the turns' OUTPUT HISTORY, not just the coarse
+    // per-turn notes. `None` keeps the old fire-and-forget behaviour.
+    sink: Option<ActivitySink>,
+) -> Result<String, String> {
     // The goal loop never isolates (it iterates in the user's live cwd), so we
     // run in `spec.cwd` directly.
     let mut cmd = worker_command(spec, task, run_id, &spec.cwd, None);
@@ -4772,7 +4800,15 @@ pub async fn run_once(spec: &WorkerSpec, task: &str, run_id: &str) -> Result<Str
     let collect = tokio::spawn(async move {
         tokio::join!(
             read_capped(stdout, CAPTURE_CAP),
-            stream_stderr(stderr, GOAL_STREAM_LABEL, show_output, attached, None, None,)
+            stream_stderr(
+                stderr,
+                GOAL_STREAM_LABEL,
+                show_output,
+                attached,
+                None,
+                None,
+                sink,
+            )
         )
     });
     let status = match tokio::time::timeout(WORKER_TIMEOUT, child.wait()).await {
@@ -5338,6 +5374,7 @@ for operator after 4 auto-recovery attempt(s)";
             Arc::new(Mutex::new(None)),
             None,
             Some(writer.clone()),
+            None,
         )
         .await;
         // The drain dropped its clone on return, so we hold the sole handle and can

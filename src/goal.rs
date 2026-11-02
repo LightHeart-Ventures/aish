@@ -898,7 +898,19 @@ async fn run_goal_loop(
         // visible to the NEXT turn's in-flight sweep even if this turn dies
         // abnormally (the children outlive it).
         prior_run_ids.push(run_id.clone());
-        let output = match crate::worker::run_once(&spec, &directive, &run_id).await {
+        // Retain this turn's forwarded activity into the goal's bounded replay
+        // transcript so `:attach goal` / Shift-Tab shows the goal's OUTPUT
+        // HISTORY — the worker rows themselves — and not just the coarse
+        // `turn N: working…` notes. A background worker gets this for free via
+        // its `WorkerJob` ring; a goal turn is a bare `run_once` subprocess with
+        // no job row, so the goal hands `run_once` a sink pointed at its own
+        // transcript (fed from the same seam as the worker ring, so live stream
+        // and replay can't drift).
+        let sink: crate::worker::ActivitySink = {
+            let g = goal.clone();
+            Arc::new(move |line: &str| g.record(line))
+        };
+        let output = match crate::worker::run_once(&spec, &directive, &run_id, Some(sink)).await {
             Ok(o) => {
                 // Productive turn — clear the failure streak so intermittent,
                 // spread-out worker hiccups don't accumulate toward the cap.
@@ -2467,6 +2479,39 @@ mod tests {
 
     // The transcript is bounded — old rows drop off so a long-running goal's
     // replay stays ~1 screen, mirroring the worker replay budget.
+    // The bug: Shift-Tab / `:attach goal` showed only the coarse per-turn notes
+    // ("turn 1: working…") and NONE of the turn's actual output history, because
+    // a goal turn is a bare `run_once` subprocess with no `WorkerJob` ring to
+    // record the forwarded worker rows into. The fix hands `run_once` an
+    // `ActivitySink` pointed at the goal's own transcript; this pins that seam:
+    // rows pushed through the sink are replayed by the backfill, interleaved in
+    // capture order with the goal's own notes.
+    #[test]
+    fn test_attach_goal_replays_forwarded_worker_activity() {
+        let g = Arc::new(goal_with(Status::Active, Step::Working, true));
+        // Exactly the sink the goal loop hands to `worker::run_once`.
+        let sink: crate::worker::ActivitySink = {
+            let g = g.clone();
+            Arc::new(move |line: &str| g.record(line))
+        };
+        g.note("turn 1: working…");
+        sink("⏺ read_file(src/goal.rs)");
+        sink("⏺ edited src/goal.rs");
+        g.note("turn 1: checking…");
+
+        let lines = g.attach_backfill();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("⏺ read_file(src/goal.rs)") && joined.contains("⏺ edited src/goal.rs"),
+            "forwarded worker activity is replayed, not just the turn notes: {joined}"
+        );
+        // …and it lands in capture order, between the two turn notes.
+        assert_eq!(lines[0], "turn 1: working…");
+        assert_eq!(lines[1], "⏺ read_file(src/goal.rs)");
+        assert_eq!(lines[2], "⏺ edited src/goal.rs");
+        assert_eq!(lines[3], "turn 1: checking…");
+    }
+
     #[test]
     fn goal_transcript_is_bounded() {
         let g = goal_with(Status::Active, Step::Working, true);
