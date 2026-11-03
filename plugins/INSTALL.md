@@ -23,6 +23,7 @@ For each plugin, read its **`INSTALL.md`** file. All guides follow the same stru
 | **aish** | Local Skills | None | Reading SRE playbooks, config guides, alert patterns |
 | **ccquota** | Local (MCP) | Anthropic API | Monitoring Claude API spend and quota |
 | **codebase-memory** | MCP Server | DeusData/codebase-memory-mcp binary | Graph-based code search instead of grep |
+| **cua-repl** | Local (Shell) | Python ≥3.11 + `cua-agent[cli]`, Cua sandbox (cloud/lume/winsandbox/docker) | Driving a computer-use agent REPL (GUI automation in a sandbox VM) |
 | **github** | Webhook Handlers | GitHub webhooks, (optional) gh CLI | Ingesting GitHub PR/workflow/release events |
 | **gstack** | Local (Shell) | curl, jq | Searching/importing skills from garrytan/gstack |
 | **hello-world** | Local (Reference) | None | Testing plugin discovery, reference implementation |
@@ -43,6 +44,9 @@ For each plugin, read its **`INSTALL.md`** file. All guides follow the same stru
 
 #### Code Intelligence
 - **[codebase-memory/INSTALL.md](./codebase-memory/INSTALL.md)** — Graph-based code search and analysis
+
+#### Computer Use
+- **[cua-repl/INSTALL.md](./cua-repl/INSTALL.md)** — trycua/cua computer-use agent REPL (sandboxed GUI automation)
 
 #### GitHub Integration
 - **[github/INSTALL.md](./github/INSTALL.md)** — Webhook handlers for GitHub events
@@ -97,7 +101,12 @@ These plugins run **shell scripts** with no binary dependencies:
    - Needs: Node.js / npx (install from https://nodejs.org/)
    - [npx-skillfish guide](./npx-skillfish/INSTALL.md)
 
-5. **hello-world**
+5. **cua-repl**
+   - Wraps `python -m cua_agent.cli` (computer-use REPL) + a preflight doctor
+   - Needs: Python ≥3.11 with `cua-agent[cli]`, a Cua sandbox provider
+   - [Install guide](./cua-repl/INSTALL.md)
+
+6. **hello-world**
    - Reference plugin (bundled, no installation)
    - [Install guide](./hello-world/INSTALL.md)
 
@@ -135,6 +144,12 @@ Prerequisites: SigNoz instance (cloud or self-hosted), API key
 **→ Install [codebase-memory](./codebase-memory/INSTALL.md)**
 
 Prerequisites: `codebase-memory-mcp` binary (Homebrew or manual download)
+
+### I want an agent to drive a GUI (click, type, screenshot) in a sandbox
+
+**→ Install [cua-repl](./cua-repl/INSTALL.md)**
+
+Prerequisites: Python ≥3.11 with `cua-agent[cli]`, a Cua sandbox (cloud API key, or local lume/winsandbox/docker)
 
 ### I want to ingest GitHub webhooks
 
