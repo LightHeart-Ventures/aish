@@ -4,6 +4,15 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-10-26
+
+### Fixed
+- **A parent coordinator no longer reports `done` while its dispatched child is still live.** The child's durable row is now written by the parent synchronously, before the child process spawns, so the live-child gate can't race a not-yet-registered child. Previously parents could finish with a bare dispatch confirmation as their "result" while `background_status` showed the child still coordinating (#1128).
+- **Background coordinators' choice blocks reach the options tray.** The coordinator round loop parks the parsed question in the durable store, so `:questions`, `:attach`, and the next session's startup notice see it. A re-asked question dedupes to one row with one stable id (#1130).
+- **Worker activity logs are written by the worker that owns the run.** A coordinator self-records its own `~/.aish/activity/<run>.jsonl`, so `:attach` to a grandchild no longer shows "no activity recorded yet" and logs survive the parent exiting. Exactly one writer per log, so no duplicate rows (#1129).
+- **The escalation tray's runtime clock freezes on a terminal verdict**, so a finished worker shows its final runtime instead of drifting with each repaint (#1139).
+- **Sub-worker banners align with the parent's heart column** in the escalation tray. Live children use a dim `↳`; finished children keep their outcome glyph (#1131).
+
 ## [0.75.1] - 2026-10-26
 
 ### Fixed
