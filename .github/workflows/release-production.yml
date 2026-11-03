@@ -186,7 +186,12 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Build release binary
-        run: cargo build --release --features local --target ${{ matrix.target }}
+        run: |
+          # --features local (llama.cpp) only on Linux: macOS CMake fails to
+          # resolve OpenSSL::SSL for vendor/cpp-httplib. macOS ships without it.
+          FEATURES=""
+          if [ "${{ runner.os }}" = "Linux" ]; then FEATURES="--features local"; fi
+          cargo build --release $FEATURES --target ${{ matrix.target }}
         shell: bash
 
       - name: Package binary + checksum
