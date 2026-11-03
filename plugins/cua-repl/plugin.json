@@ -1,0 +1,82 @@
+{
+  "id": "cua-repl",
+  "name": "Cua Computer-Use REPL",
+  "version": "0.1.0",
+  "description": "Drives the trycua/cua computer-use agent REPL (`python -m cua_agent.cli`) from aish — interactive TTY sessions, one-shot prompts, click prediction, and a preflight doctor for the cloud/lume/winsandbox/docker sandbox providers.",
+  "enabled": true,
+  "webhook_command": "printf '🖥️  Cua REPL plugin loaded: %s\\n' \"$AISH_EVENT_TYPE\"",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "python": {
+        "type": "string",
+        "description": "Python interpreter (>=3.11,<3.14) that has cua-agent installed. Exported to scripts as CUA_PYTHON.",
+        "default": "python3"
+      },
+      "model": {
+        "type": "string",
+        "description": "Default model string passed to the REPL, e.g. anthropic/claude-sonnet-4-5-20250929, openai/computer-use-preview, omniparser+anthropic/claude-sonnet-4-5-20250929.",
+        "default": "anthropic/claude-sonnet-4-5-20250929"
+      },
+      "provider": {
+        "type": "string",
+        "description": "cua-sandbox computer provider. cloud attaches to a named Cua container; the rest are local VMs/containers.",
+        "enum": ["cloud", "lume", "winsandbox", "docker"],
+        "default": "cloud"
+      },
+      "container_name": {
+        "type": "string",
+        "description": "Sandbox name. Exported as CUA_CONTAINER_NAME so the REPL never has to prompt for it interactively.",
+        "default": "cli-sandbox"
+      },
+      "credential_profile": {
+        "type": "string",
+        "description": "Name of the ~/.aish/credentials [profile:*] section holding CUA_API_KEY (and optionally ANTHROPIC_API_KEY / OPENAI_API_KEY). Secrets are referenced as ${profile:KEY} and NEVER inlined.",
+        "default": "cua"
+      },
+      "budget_usd": {
+        "type": "number",
+        "description": "Hard per-session spend cap handed to --budget. The REPL raises once the trajectory exceeds it.",
+        "default": 5
+      },
+      "images": {
+        "type": "integer",
+        "description": "Number of recent screenshots kept in model context (--images). Lower = cheaper.",
+        "default": 3
+      },
+      "show_usage": {
+        "type": "boolean",
+        "description": "Pass -u/--usage so each turn prints running cost.",
+        "default": true
+      },
+      "trajectory": {
+        "type": "boolean",
+        "description": "Pass --trajectory to persist a replayable trajectory under ./trajectories.",
+        "default": false
+      },
+      "extra_args": {
+        "type": "string",
+        "description": "Raw extra flags appended to every invocation (e.g. \"--cache --max-retries 5\"). Exported as CUA_REPL_ARGS.",
+        "default": ""
+      }
+    },
+    "required": ["python", "model", "provider"]
+  },
+  "provides": {
+    "tools": [
+      {
+        "name": "cua_repl",
+        "command": "bin/cua-repl.sh",
+        "description": "Start the Cua computer-use REPL, or run a single prompt headlessly with -p \"…\".",
+        "interactive": true,
+        "timeout_ms": 0
+      },
+      {
+        "name": "cua_doctor",
+        "command": "bin/cua-doctor.sh",
+        "description": "Preflight the Cua REPL: interpreter, cua-agent/cua-sandbox imports, CLI extra, env vars, provider prerequisites.",
+        "timeout_ms": 20000
+      }
+    ]
+  }
+}
