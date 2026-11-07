@@ -83,6 +83,7 @@ mod session;
 mod skill_contract;
 mod skill_match;
 mod skill_provider;
+mod skill_select;
 mod skill_sources;
 mod skills;
 mod spawn_broker;

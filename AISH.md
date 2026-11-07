@@ -20,7 +20,24 @@ system prompt, so the prompt-cache prefix stays byte-stable.
 It's a **hint, not a command** — the model still decides whether to read and
 follow the playbook.
 
-### How a skill is ranked
+### How a skill is chosen (LLM router, keyword fallback)
+
+The primary selector is a **lightweight model**, not keyword search. On a turn
+whose input looks substantial, aish makes one tool-less Haiku-class call that
+sees the installed catalog (`name: description`) plus the operator input and
+answers in exactly one line — `NONE` or `SKILL: <name>` — judging *intent*
+rather than vocabulary overlap. The reply is hard-validated against the real
+catalog, so a hallucinated name can never be surfaced.
+
+It is **best-effort and additive**: no credential, a trivial input, an error, or
+an abstention all fall through to the keyword matcher below, so a selector
+hiccup never costs the operator a hint.
+
+- `AISH_SKILL_LLM=0` (`off`/`false`/`no`) — disable the router; keyword scoring
+  alone decides (pre-router behaviour).
+- `AISH_SKILL_LLM_DEBUG=1` — log the router's prompt and raw reply to stderr.
+
+### How a skill is ranked (keyword fallback)
 
 Skills are scored by combining lexical relevance with the semantic frontmatter
 (`categories`, `applies-to`, `unwanted-for` — see SKILL-FORMAT.md). Per skill,

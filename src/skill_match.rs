@@ -141,6 +141,22 @@ pub fn rank<'a>(task: &str, skills: &'a [Skill]) -> Vec<Match<'a>> {
     matches
 }
 
+/// The skill-awareness note for ONE chosen skill. Extracted so the LLM-gated
+/// selector (`skill_select`) renders byte-identical guidance to the keyword
+/// path — the nudge wording is a single source of truth regardless of which
+/// mechanism picked the skill. Pure.
+pub fn hint_for(skill: &Skill) -> String {
+    format!(
+        "[aish skill-awareness] Your installed `{}` skill fits this task. USING a skill just \
+means reading its SKILL.md and carrying out its steps yourself with your normal tools — there is \
+no separate command to \"invoke\" it. Read it FIRST with read_file(\"{}\") and follow it, BEFORE \
+attempting the task manually ({}).",
+        skill.name,
+        skill.path.display(),
+        skill.description.trim_end_matches('.'),
+    )
+}
+
 /// The per-turn skill-awareness note for `task`, or `None` when no installed
 /// skill clears the bar. Names up to [`MAX_HINTS`] top matches and points the
 /// model at each one's SKILL.md. Pure + unit-tested; the engine does the prepend.
@@ -163,16 +179,7 @@ pub fn hint(task: &str, skills: &[Skill]) -> Option<String> {
         return None;
     }
     if top.len() == 1 {
-        let m = top[0];
-        Some(format!(
-            "[aish skill-awareness] Your installed `{}` skill fits this task. USING a skill just \
-means reading its SKILL.md and carrying out its steps yourself with your normal tools — there is \
-no separate command to \"invoke\" it. Read it FIRST with read_file(\"{}\") and follow it, BEFORE \
-attempting the task manually ({}).",
-            m.skill.name,
-            m.skill.path.display(),
-            m.skill.description.trim_end_matches('.'),
-        ))
+        Some(hint_for(top[0].skill))
     } else {
         let mut s = String::from(
             "[aish skill-awareness] These installed skills look relevant to this task — \
