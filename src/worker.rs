@@ -3522,6 +3522,88 @@ fn phase_needs_reconcile(phase: &str) -> bool {
     !matches!(phase, "done" | "failed" | "checkpoint" | "waiting")
 }
 
+/// What to do with an in-memory [`WorkerJob`] parked at `waiting` (ISS-W1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitingVerdict {
+    /// Descendants still live — stay parked (tray row stays live, result stays
+    /// undelivered).
+    Hold,
+    /// Settle the job; `failed` is the terminal verdict to stamp.
+    Settle { failed: bool },
+}
+
+/// Decide whether a job parked at `waiting` may settle, from the two cheap
+/// pieces of evidence a parent can observe: the DURABLE phase of the child's own
+/// `coordinator_runs` row, and — when the caller has it to hand (the tray walk
+/// does) — how many live descendants it can still see.
+///
+/// The durable row is authoritative: `CoordinatorStore::settle_waiting_runs`
+/// flips `waiting → done`/`failed` when the LAST live child writes its terminal
+/// phase, so reading it is how the in-memory job INHERITS the already-correct
+/// ISS-W1 answer instead of re-deriving it (and why this fix needs no new
+/// durable state).
+///
+/// Never stranding is the other half of the contract — a job parked forever
+/// would never deliver its result:
+/// * row GONE (`None`): nothing will ever settle it, so settle now.
+/// * `live_descendants == Some(0)`: the parentage walk sees no live descendant,
+///   so a durable `waiting` is a fossil (a child killed before finalizing).
+/// * any other non-terminal phase HOLDS: only a live writer can advance it.
+pub(crate) fn waiting_verdict(
+    durable_phase: Option<&str>,
+    live_descendants: Option<usize>,
+) -> WaitingVerdict {
+    match durable_phase {
+        Some("done") => WaitingVerdict::Settle { failed: false },
+        Some("failed") => WaitingVerdict::Settle { failed: true },
+        None => WaitingVerdict::Settle { failed: false },
+        Some(_) if live_descendants == Some(0) => WaitingVerdict::Settle { failed: false },
+        Some(_) => WaitingVerdict::Hold,
+    }
+}
+
+/// Is the row this child left behind its own ISS-W1 "my sub-workers are still
+/// live" verdict? Kept tiny and separate so the park decision in `run_worker` is
+/// one readable predicate.
+fn child_parked_waiting(store: Option<&crate::db::CoordinatorStore>, run_id: &str) -> bool {
+    store
+        .and_then(|s| s.result_for_run(run_id).ok().flatten())
+        .is_some_and(|r| r.phase == "waiting")
+}
+
+/// How often a parked worker re-reads its durable row, and the hard cap on how
+/// long it may stay parked before settling anyway (belt-and-braces against a
+/// durable row that nobody ever settles).
+const WAITING_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+const WAITING_MAX: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Hold a `waiting`-parked job parked until its durable row settles, then stamp
+/// the terminal verdict on the in-memory job.
+///
+/// This is NOT a new polling thread: it runs inside the worker's OWN
+/// already-spawned task, which simply does not return the instant the child is
+/// reaped. That placement is what makes every consumer truthful with no extra
+/// wiring — result delivery (`drain_pending`/`notify_pending`, both gated on
+/// `is_terminal()`), `schedule.rs`'s `status() == "done"` gate, `:workers`,
+/// `background_status`, and the escalation tray all read the same job.
+async fn await_waiting_settle(
+    job: &Arc<WorkerJob>,
+    store: &crate::db::CoordinatorStore,
+    run_id: &str,
+) {
+    let start = std::time::Instant::now();
+    loop {
+        let phase = store.result_for_run(run_id).ok().flatten().map(|r| r.phase);
+        match waiting_verdict(phase.as_deref(), None) {
+            WaitingVerdict::Settle { failed } => return job.settle_from_waiting(failed),
+            WaitingVerdict::Hold if start.elapsed() >= WAITING_MAX => {
+                return job.settle_from_waiting(false);
+            }
+            WaitingVerdict::Hold => tokio::time::sleep(WAITING_POLL).await,
+        }
+    }
+}
+
 impl WorkerJob {
     fn set_done(&self, result: String) {
         let mut i = self.inner.lock().unwrap();
@@ -3533,6 +3615,56 @@ impl WorkerJob {
         // dwell clock starts here), not whenever the footer next repaints.
         crate::escalation::note_terminal(&self.id, false);
     }
+    /// Park this worker at `waiting`: its own turns are over, but the
+    /// sub-workers IT dispatched are still live (ISS-W1).
+    ///
+    /// WHY this exists — the tray bug it fixes. The DURABLE layer already knows
+    /// the rule: [`crate::coordinator`]'s `terminal_phase_with_children`
+    /// persists `Phase::Waiting` instead of `Phase::Done` when a finishing
+    /// coordinator still has live direct children, and
+    /// `CoordinatorStore::settle_waiting_runs` settles that row to
+    /// `done`/`failed` once the last child finishes. The IN-MEMORY job did not:
+    /// the moment the coordinator subprocess exited successfully, `run_worker`
+    /// called [`WorkerJob::set_done`], which flipped `status` to `done` AND
+    /// froze the pinned tray row's glyph via `escalation::note_terminal`. The
+    /// operator saw a FROZEN, `done` parent with live sub-workers under it:
+    ///
+    /// ```text
+    ///  aish pending questions tray UI   ↳ 5m49s done · wiring serial question-drain…
+    ///    ↳ aish feat/pending-question-tray  ♥ 2m38s coordi… · reading src/question.rs
+    /// ```
+    ///
+    /// (`↳` = frozen/terminal, `♥` = live heart.) A parent cannot be done while
+    /// its children run. So: store the result (it IS final — the child really
+    /// did finish its own work), mark the job `waiting`, and deliberately do NOT
+    /// stamp `finished` or call `note_terminal`. All three consequences are
+    /// intended:
+    /// * `is_terminal()` stays false, so [`drain_pending`]/[`notify_pending`] do
+    ///   not deliver the result yet — delivery is DEFERRED, not lost, and still
+    ///   happens exactly once (`mark_displayed`) after
+    ///   [`Self::settle_from_waiting`].
+    /// * the tray row keeps its live heart instead of freezing mid-fan-out.
+    /// * `escalation::sweep` dwells on `terminal_at`, so an unstamped row is not
+    ///   retired early; it retires normally once settled.
+    fn set_waiting(&self, result: String) {
+        let mut i = self.inner.lock().unwrap();
+        i.status = "waiting".into();
+        i.result = Some(result);
+    }
+
+    /// Settle a job parked by [`Self::set_waiting`]: its descendants are gone,
+    /// so it is terminal NOW. Does the work `set_waiting` deliberately skipped —
+    /// stamps `finished` and freezes the tray glyph — which also re-arms result
+    /// delivery. Idempotent: `get_or_insert_with` keeps the first finish instant
+    /// and the result was stored at park time.
+    fn settle_from_waiting(&self, failed: bool) {
+        let mut i = self.inner.lock().unwrap();
+        i.status = if failed { "failed" } else { "done" }.into();
+        i.finished.get_or_insert_with(SystemTime::now);
+        drop(i);
+        crate::escalation::note_terminal(&self.id, failed);
+    }
+
     /// Record the branch an isolated worker left its changes on (kept worktree).
     fn set_branch(&self, branch: String) {
         self.inner.lock().unwrap().branch = Some(branch);
@@ -4624,7 +4756,17 @@ from the parent repo; not auto-merged.)",
                     wt.path.display(),
                 ));
             }
-            job.set_done(result);
+            // ISS-W1 (in-memory half): the child exiting 0 does not mean this
+            // worker is DONE — only that its own turns are over. If it left its
+            // durable row at `waiting`, the sub-workers IT dispatched are still
+            // running, and marking the job done here is exactly what froze a
+            // live parent's tray row above its beating children. Park instead;
+            // `await_waiting_settle` below stamps the real verdict.
+            if child_parked_waiting(spec.coordinator_store.as_ref(), &run_id) {
+                job.set_waiting(result);
+            } else {
+                job.set_done(result);
+            }
         }
         Some(s) => job.set_failed(describe_failure(s, "worker", &err)),
         None => job.set_failed(format!(
@@ -4700,6 +4842,15 @@ from the parent repo; not auto-merged.)",
                 ),
             }
         }
+    }
+
+    // Parked at `waiting` (ISS-W1)? Stay in this task until the durable row the
+    // child left settles — `on_complete` (and therefore result delivery) must
+    // not run while this worker's own sub-workers are still live.
+    if job.status() == "waiting"
+        && let Some(store) = spec.coordinator_store.as_ref()
+    {
+        await_waiting_settle(&job, store, &run_id).await;
     }
     on_complete(&jobs, &job);
 }
@@ -7391,6 +7542,158 @@ for operator after 4 auto-recovery attempt(s)";
             sleeps,
             vec![10, 20, 40, 80],
             "one backoff between each pair of attempts, none after the last"
+        );
+    }
+
+    // ── ISS-W1 follow-up: a parent with live sub-workers is WAITING, not done ──
+    //
+    // The durable layer already knew this (`terminal_phase_with_children`
+    // persists `waiting`; `settle_waiting_runs` settles it). The IN-MEMORY job
+    // did not: `run_worker` called `set_done` the instant the child exited 0,
+    // which froze the pinned tray row's glyph above still-beating children.
+    // These tests pin the three pure pieces of the fix: the settle DECISION, the
+    // park/settle state machine, and — the delicate one — that deferring
+    // terminality defers result delivery WITHOUT losing or duplicating it.
+
+    #[test]
+    fn waiting_verdict_settles_on_a_terminal_durable_row() {
+        // The durable row is authoritative: `settle_waiting_runs` flips it the
+        // moment the last live child writes its terminal phase, so the in-memory
+        // job just INHERITS the already-correct answer.
+        assert_eq!(
+            waiting_verdict(Some("done"), None),
+            WaitingVerdict::Settle { failed: false },
+            "a settled durable row settles the in-memory job"
+        );
+        assert_eq!(
+            waiting_verdict(Some("failed"), None),
+            WaitingVerdict::Settle { failed: true },
+            "a failed durable row must settle FAILED, not silently succeed"
+        );
+    }
+
+    #[test]
+    fn waiting_verdict_holds_while_the_row_is_still_waiting() {
+        assert_eq!(
+            waiting_verdict(Some("waiting"), None),
+            WaitingVerdict::Hold,
+            "children still live → stay parked"
+        );
+        assert_eq!(
+            waiting_verdict(Some("running"), Some(2)),
+            WaitingVerdict::Hold,
+            "a non-terminal phase with live descendants holds"
+        );
+    }
+
+    #[test]
+    fn waiting_verdict_never_strands_a_parked_job() {
+        // The other half of the contract: a job parked forever would never
+        // deliver its result, so every "nobody will ever settle me" shape must
+        // settle itself.
+        assert_eq!(
+            waiting_verdict(None, None),
+            WaitingVerdict::Settle { failed: false },
+            "no durable row → nothing will ever settle it, so settle now"
+        );
+        assert_eq!(
+            waiting_verdict(Some("waiting"), Some(0)),
+            WaitingVerdict::Settle { failed: false },
+            "a durable `waiting` with zero live descendants is a fossil"
+        );
+    }
+
+    #[test]
+    fn parking_at_waiting_keeps_the_job_live_and_undelivered() {
+        let job = barrier_test_job("w_park", Some(11));
+        job.set_waiting("the child's final answer".into());
+
+        assert_eq!(
+            job.status(),
+            "waiting",
+            "status reads `waiting`, not `done`"
+        );
+        assert!(
+            !job.is_terminal(),
+            "is_terminal() stays false → tray row keeps its live heart and \
+             result delivery is deferred"
+        );
+        assert_ne!(
+            job.status(),
+            "done",
+            "schedule.rs gates on status() == \"done\" — a parked job must not \
+             report success while its sub-workers run"
+        );
+        assert_eq!(
+            job.inner.lock().unwrap().result.as_deref(),
+            Some("the child's final answer"),
+            "the result is STORED at park time (deferred, not lost)"
+        );
+        assert!(
+            job.fetch().contains("still running"),
+            "delivery is DEFERRED while parked: fetch() must not hand the \
+             result out yet, or the operator would be told the worker is done \
+             while its sub-workers are still live"
+        );
+        assert!(
+            job.inner.lock().unwrap().finished.is_none(),
+            "`finished` is deliberately unstamped: escalation::sweep dwells on \
+             terminal_at, so a parked row must not be retired early"
+        );
+    }
+
+    #[test]
+    fn settling_from_waiting_stamps_the_terminal_verdict() {
+        let job = barrier_test_job("w_settle", Some(12));
+        job.set_waiting("done at last".into());
+        job.settle_from_waiting(false);
+
+        assert_eq!(job.status(), "done", "settles to the real terminal verdict");
+        assert!(job.is_terminal(), "terminal again → delivery is re-armed");
+        assert!(
+            job.inner.lock().unwrap().finished.is_some(),
+            "settling stamps `finished` (the dwell clock starts here)"
+        );
+
+        let failed = barrier_test_job("w_settle_failed", Some(13));
+        failed.set_waiting("partial".into());
+        failed.settle_from_waiting(true);
+        assert_eq!(
+            failed.status(),
+            "failed",
+            "a failed durable row settles the job FAILED"
+        );
+    }
+
+    #[test]
+    fn a_parked_then_settled_worker_delivers_its_result_exactly_once() {
+        // The regression this fix could plausibly have caused: delivery is gated
+        // on `is_terminal() && !is_displayed()`, and parking makes a job
+        // non-terminal. Prove the result is DEFERRED, then delivered once.
+        let job = barrier_test_job("w_deliver", Some(14));
+        let jobs: WorkerJobs = Arc::new(Mutex::new(vec![job.clone()]));
+
+        job.set_waiting("FINAL-RESULT-TEXT".into());
+        assert!(
+            drain_pending(&jobs).is_empty(),
+            "parked → nothing delivered yet (and nothing marked displayed)"
+        );
+        assert!(
+            !job.is_displayed(),
+            "a parked job must not be consumed as displayed"
+        );
+
+        job.settle_from_waiting(false);
+        let first = drain_pending(&jobs);
+        assert_eq!(first.len(), 1, "settled → delivered exactly once");
+        assert!(
+            first[0].contains("FINAL-RESULT-TEXT"),
+            "the delivered block carries the result the child produced: {:?}",
+            first[0]
+        );
+        assert!(
+            drain_pending(&jobs).is_empty(),
+            "already displayed → never delivered twice"
         );
     }
 }
