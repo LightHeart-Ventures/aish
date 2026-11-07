@@ -27,10 +27,13 @@ pub fn router(config: BrokerConfig) -> Router {
         .route("/stats", get(stats))
         .route("/ws", get(ws::ws_handler))
         .route("/clients/register", post(register_client))
-        .route("/webhooks/:tenant_id/:plugin_id", post(receive_webhook))
-        .route("/webhooks/:tenant_id/:plugin_id/pending", get(poll_pending))
+        .route("/webhooks/{tenant_id}/{plugin_id}", post(receive_webhook))
         .route(
-            "/webhooks/:tenant_id/:plugin_id/messages/:webhook_id",
+            "/webhooks/{tenant_id}/{plugin_id}/pending",
+            get(poll_pending),
+        )
+        .route(
+            "/webhooks/{tenant_id}/{plugin_id}/messages/{webhook_id}",
             delete(ack_webhook),
         )
         .with_state(config)

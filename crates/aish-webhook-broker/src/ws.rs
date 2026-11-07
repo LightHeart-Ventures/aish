@@ -8,6 +8,7 @@
 //!   either direction:              ping / pong (WebSocket control frames)
 
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
@@ -38,7 +39,9 @@ async fn handle_socket(socket: WebSocket, config: BrokerConfig) {
         None => {
             let _ = sender
                 .send(Message::Text(
-                    json!({"type":"auth_error","error":"authentication failed"}).to_string(),
+                    json!({"type":"auth_error","error":"authentication failed"})
+                        .to_string()
+                        .into(),
                 ))
                 .await;
             let _ = sender.send(Message::Close(None)).await;
@@ -48,7 +51,9 @@ async fn handle_socket(socket: WebSocket, config: BrokerConfig) {
 
     let _ = sender
         .send(Message::Text(
-            json!({"type":"auth_ok","client_id": client.client_id}).to_string(),
+            json!({"type":"auth_ok","client_id": client.client_id})
+                .to_string()
+                .into(),
         ))
         .await;
 
@@ -75,7 +80,7 @@ async fn handle_socket(socket: WebSocket, config: BrokerConfig) {
         let mut send_failed = false;
         for wh in pending {
             if sender
-                .send(Message::Text(wh.to_envelope().to_string()))
+                .send(Message::Text(wh.to_envelope().to_string().into()))
                 .await
                 .is_err()
             {
@@ -106,7 +111,7 @@ async fn handle_socket(socket: WebSocket, config: BrokerConfig) {
             maybe_msg = rx.recv() => {
                 match maybe_msg {
                     Some(text) => {
-                        if sender.send(Message::Text(text)).await.is_err() {
+                        if sender.send(Message::Text(text.into())).await.is_err() {
                             break;
                         }
                     }
@@ -118,7 +123,7 @@ async fn handle_socket(socket: WebSocket, config: BrokerConfig) {
             maybe_frame = receiver.next() => {
                 match maybe_frame {
                     Some(Ok(Message::Text(text))) => {
-                        handle_client_frame(&text, &config, &client).await;
+                        handle_client_frame(text.as_str(), &config, &client).await;
                     }
                     Some(Ok(Message::Ping(p))) => {
                         let _ = sender.send(Message::Pong(p)).await;
@@ -134,7 +139,7 @@ async fn handle_socket(socket: WebSocket, config: BrokerConfig) {
 
             // Server-initiated heartbeat.
             _ = heartbeat.tick() => {
-                if sender.send(Message::Ping(Vec::new())).await.is_err() {
+                if sender.send(Message::Ping(Bytes::new())).await.is_err() {
                     break;
                 }
             }
@@ -158,7 +163,7 @@ async fn authenticate(
         Message::Text(t) => t,
         _ => return None,
     };
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let v: serde_json::Value = serde_json::from_str(text.as_str()).ok()?;
     if v.get("type").and_then(|t| t.as_str()) != Some("auth") {
         return None;
     }
