@@ -111,22 +111,58 @@ fn gate_path(
     // operation or CI run is not an ordinary in-workspace write — see
     // `executes_on_next_op`. Checked FIRST and ahead of every grant, so no 'a'
     // tool allow, no 'd' directory grant and no in-workspace exemption can wave
-    // it through. Unattended runs refuse; interactive runs must confirm, and
-    // `clamp_decision` denies that prompt the persistable 'a'/'d' answers.
+    // it through. Interactive runs must confirm, and `clamp_decision` denies
+    // that prompt the persistable 'a'/'d' answers; unattended runs escalate to
+    // the operator and refuse unless explicitly approved.
     if let Some(reason) = executes_on_next_op(path).filter(|_| matches!(perm, Perm::Write)) {
-        let class = if unattended {
-            crate::tool_telemetry::CLASS_GATE_REFUSE
-        } else {
-            crate::tool_telemetry::CLASS_GATE_CONFIRM
-        };
-        crate::tool_telemetry::record_gate(session, class, "write-executes-on-next-op", tool_key);
         if unattended {
+            // SEC-2.4: an unattended run has no PROMPT, but it may still have
+            // an OPERATOR — a coordinator's console is one `📣` away. A worker
+            // that legitimately needs to touch a workflow file or a git hook
+            // (fixing CI is routine work) parks the write and ASKS rather than
+            // dying on it, exactly as the sensitive-path gate below does.
+            // Fail-closed in every direction (`approval::escalate` returns
+            // `Unavailable` when no console is reachable, `TimedOut` when
+            // nobody answers), so the only path to `true` is an explicit
+            // `:approve`. The approval is one-shot — consumed on read, never
+            // persisted as an 'a'/'d' grant — so the NEXT such write asks
+            // again, exactly like the interactive prompt it stands in for.
+            let outcome = crate::approval::escalate(
+                session.nested,
+                perm.as_str(),
+                &path.display().to_string(),
+                reason,
+            );
+            if outcome.approved() {
+                crate::tool_telemetry::record_gate(
+                    session,
+                    crate::tool_telemetry::CLASS_GATE_CONFIRM,
+                    "write-executes-on-next-op-operator-approved",
+                    tool_key,
+                );
+                return true;
+            }
+            crate::tool_telemetry::record_gate(
+                session,
+                crate::tool_telemetry::CLASS_GATE_REFUSE,
+                "write-executes-on-next-op",
+                tool_key,
+            );
             eprintln!(
-                "\x1b[31mrefused:\x1b[0m {reason} — {} (unattended run)",
-                path.display()
+                "\x1b[31mrefused:\x1b[0m {reason} — {} ({})",
+                path.display(),
+                outcome
+                    .refusal_tail()
+                    .unwrap_or_else(|| "unattended run".to_string())
             );
             return false;
         }
+        crate::tool_telemetry::record_gate(
+            session,
+            crate::tool_telemetry::CLASS_GATE_CONFIRM,
+            "write-executes-on-next-op",
+            tool_key,
+        );
         let prompt = crate::sensitive::sensitive_prompt(reason, prompt);
         return crate::sensitive::clamp_decision(true, confirm(&prompt)) != Decision::Deny;
     }
