@@ -783,7 +783,7 @@ async fn main() -> Result<()> {
     // parked and nobody answered yet. This is the half of the fix that survives
     // a full RESTART — the worker that asked may have exited hours ago, so the
     // ask would otherwise be unreachable by any attach.
-    if interactive && let Some(n) = crate::question::startup_notice() {
+    if interactive && let Some(n) = crate::question::startup_notice(&session.session_id) {
         startup_notices.push(n);
     }
 

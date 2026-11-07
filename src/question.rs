@@ -83,6 +83,24 @@ pub struct PendingQuestion {
     pub id: String,
     /// Worker label (`w_xxxxxxxx`) or `local` for a non-coordinator caller.
     pub worker: String,
+    /// Session that OWNS this question — the id of the interactive session
+    /// whose operator asked for the work (a coordinator adopts its launching
+    /// session's id, see `docs/session-scoped-jobs.md`).
+    ///
+    /// Load-bearing because the tray is on the filesystem and every aish on
+    /// the box reads the same directory: without an owner, one worker's ask
+    /// pops over EVERY open session — including panes working on an unrelated
+    /// repo — and the first operator to hit Esc leaves it pending for everyone
+    /// else to be nagged by again. Auto-surfacing is therefore filtered to the
+    /// owning session ([`pending_for_session`]); explicit operator commands
+    /// (`:questions --all`, `:answer <id>`) stay global, because typing an id
+    /// is intent and should never be refused on a technicality.
+    ///
+    /// Empty on records written before session binding, and on asks parked
+    /// with no session in scope. An empty owner is UNOWNED and surfaces
+    /// everywhere — the pre-existing behaviour, which is the safe default for
+    /// a row whose origin we cannot establish.
+    pub session: String,
     /// The question text from the block's `question:` key.
     pub question: String,
     /// The block's `summary:` context, if the asking agent wrote one. Carried
@@ -174,9 +192,10 @@ impl PendingQuestion {
     /// that does not know about options simply ignores them.
     fn encode(&self) -> String {
         let mut out = format!(
-            "id\t{}\nworker\t{}\nmode\t{}\nquestion\t{}\nsummary\t{}\ncreated\t{}\n",
+            "id\t{}\nworker\t{}\nsession\t{}\nmode\t{}\nquestion\t{}\nsummary\t{}\ncreated\t{}\n",
             esc(&self.id),
             esc(&self.worker),
+            esc(&self.session),
             esc(&self.mode),
             esc(&self.question),
             esc(&self.summary),
@@ -195,6 +214,7 @@ impl PendingQuestion {
         let mut q = PendingQuestion {
             id: String::new(),
             worker: String::new(),
+            session: String::new(),
             question: String::new(),
             summary: String::new(),
             mode: "one".to_string(),
@@ -208,6 +228,9 @@ impl PendingQuestion {
             match k {
                 "id" => q.id = unesc(v),
                 "worker" => q.worker = unesc(v),
+                // Absent on pre-session-binding records; an empty owner means
+                // UNOWNED, which surfaces in every session (see the field doc).
+                "session" => q.session = unesc(v),
                 "question" => q.question = unesc(v),
                 // Absent in records written before the tray carried context;
                 // an empty summary is handled by `spec`, not rejected here.
@@ -331,11 +354,18 @@ fn answer_path(dir: &Path, id: &str) -> PathBuf {
 
 /// Park a worker-proposed question so it outlives the turn that asked it.
 ///
+/// `session` is the OWNING session id — the interactive session whose operator
+/// is on the hook for this decision. It is stamped onto the record so the
+/// auto-surfacing popup can be filtered to that session
+/// ([`pending_for_session`]) instead of interrupting every aish sharing this
+/// `$HOME`. Pass `""` only when no session is in scope; such a row is unowned
+/// and surfaces everywhere, which is the pre-session-binding behaviour.
+///
 /// Returns the stored record (whose `id` is what the operator types) or `None`
 /// when the spec is unusable or the store cannot be written. A failure here is
 /// deliberately non-fatal: the caller falls back to printing the raw block,
 /// which is exactly the pre-existing behaviour.
-pub fn park(worker: &str, spec: &ChoiceSpec) -> Option<PendingQuestion> {
+pub fn park(worker: &str, session: &str, spec: &ChoiceSpec) -> Option<PendingQuestion> {
     // An option-less block is not a decision the operator can make, and a
     // question-less one gives them nothing to decide about. Either way there is
     // nothing worth persisting — let the raw text print instead.
@@ -363,6 +393,7 @@ pub fn park(worker: &str, spec: &ChoiceSpec) -> Option<PendingQuestion> {
         } else {
             worker.to_string()
         },
+        session: session.trim().to_string(),
         question: spec.question.trim().to_string(),
         summary: spec.summary.trim().to_string(),
         mode: mode_str(spec.mode).to_string(),
@@ -429,6 +460,51 @@ fn worker_matches(worker: &str, run_id: &str) -> bool {
     worker == run_id || worker.starts_with(run_id) || run_id.starts_with(worker)
 }
 
+/// The pending questions OWNED BY one interactive session, oldest first — the
+/// set that session is entitled to surface on its own.
+///
+/// This is the session-scoping half of the tray. The store is a directory
+/// under `$HOME`, so every aish on the box sees every row; without this filter
+/// a question parked by one session's coordinator pops up in all of them, and
+/// whichever operator dismisses it first leaves the rest to be re-nagged. Only
+/// the owning session auto-surfaces an ask.
+///
+/// Rows with an EMPTY owner are included for every session: they predate
+/// session binding (or were parked with no session in scope) and their origin
+/// cannot be established, so the safe reading is the old one — show them
+/// rather than strand them where nobody is ever asked.
+///
+/// Note this gates only AUTO-surfacing. `:questions --all`, `:answer <id>` and
+/// `:dismiss <id>` stay global by design: typing an id is explicit intent, and
+/// refusing it because the row belongs to another pane would be a technicality
+/// the operator cannot act on.
+pub fn pending_for_session(session_id: &str) -> Vec<PendingQuestion> {
+    pending()
+        .into_iter()
+        .filter(|q| session_matches(&q.session, session_id))
+        .collect()
+}
+
+/// Does a recorded owner `session` belong to the asking `session_id`?
+///
+/// An empty owner matches EVERY session (unowned/legacy — see
+/// [`pending_for_session`]). Otherwise the comparison is prefix-tolerant in
+/// both directions, matching [`worker_matches`], so a short id displayed in
+/// one place and a full id stored in another still resolve to each other.
+fn session_matches(session: &str, session_id: &str) -> bool {
+    let session = session.trim();
+    if session.is_empty() {
+        return true;
+    }
+    let session_id = session_id.trim();
+    // A caller with no session of its own gets only the unowned rows: it has
+    // no claim on another session's decision.
+    if session_id.is_empty() {
+        return false;
+    }
+    session == session_id || session.starts_with(session_id) || session_id.starts_with(session)
+}
+
 /// The block re-printed when the operator ATTACHES to a coordinator that has a
 /// parked question — `None` when it has none.
 ///
@@ -445,14 +521,20 @@ pub fn attach_notice(run_id: &str) -> Option<String> {
 }
 
 /// The block printed once at interactive session start, covering questions
-/// parked by ANY worker — including ones whose process has long since exited.
+/// this session OWNS — parked by any of its workers, including ones whose
+/// process has long since exited.
 ///
 /// This is the half that survives a restart: without it, a question parked
 /// while the operator was away would only reappear if they happened to attach
 /// to the right worker, and a question from a finished worker would never
 /// reappear at all.
-pub fn startup_notice() -> Option<String> {
-    render_notice(&pending(), "waiting on your decision")
+///
+/// Scoped to `session_id` ([`pending_for_session`]) so a fresh pane does not
+/// inherit the decisions of every other aish sharing this `$HOME`. Unowned
+/// legacy rows still show up here — that is the only place they would ever be
+/// seen.
+pub fn startup_notice(session_id: &str) -> Option<String> {
+    render_notice(&pending_for_session(session_id), "waiting on your decision")
 }
 
 /// Pure renderer shared by [`attach_notice`] and [`startup_notice`] — `None`
@@ -645,6 +727,7 @@ mod tests {
         let q = PendingQuestion {
             id: "q0a1b2".into(),
             worker: "w_5RN6BgsW".into(),
+            session: "s_test".into(),
             question: "ship it?".into(),
             mode: "many".into(),
             options: vec![
@@ -665,6 +748,7 @@ mod tests {
         let q = PendingQuestion {
             id: "q0a1b2".into(),
             worker: "local".into(),
+            session: String::new(),
             question: "line1\nline2\twith tab \\ and backslash".into(),
             mode: "one".into(),
             options: vec![("a\\b".into(), "C:\\n\tot a newline".into())],
@@ -689,6 +773,7 @@ mod tests {
         let q = PendingQuestion {
             id: "q1".into(),
             worker: "w_1".into(),
+            session: "s_test".into(),
             question: "pick".into(),
             mode: "compare".into(),
             options: vec![("a".into(), "Alpha".into()), ("b".into(), String::new())],
@@ -725,6 +810,7 @@ mod tests {
 
         let parked = park(
             "w_5RN6BgsW",
+            "s_test",
             &spec("ship it?", ChoiceMode::One, &[("y", "Yes")]),
         )
         .expect("parks");
@@ -737,7 +823,7 @@ mod tests {
 
         // And it is re-surfaceable on BOTH re-entry paths.
         assert!(
-            startup_notice().is_some(),
+            startup_notice("s_test").is_some(),
             "startup must re-surface the ask"
         );
         let note = attach_notice("w_5RN6BgsW").expect("attach must re-surface the ask");
@@ -757,8 +843,18 @@ mod tests {
         let _g = HOME_LOCK.lock().unwrap();
         let _home = TempHome::new("scope");
 
-        park("w_aaaaaaaa", &spec("a?", ChoiceMode::One, &[("x", "X")])).expect("parks");
-        park("w_bbbbbbbb", &spec("b?", ChoiceMode::One, &[("y", "Y")])).expect("parks");
+        park(
+            "w_aaaaaaaa",
+            "s_test",
+            &spec("a?", ChoiceMode::One, &[("x", "X")]),
+        )
+        .expect("parks");
+        park(
+            "w_bbbbbbbb",
+            "s_test",
+            &spec("b?", ChoiceMode::One, &[("y", "Y")]),
+        )
+        .expect("parks");
 
         assert_eq!(pending_for("w_aaaaaaaa").len(), 1);
         assert_eq!(pending_for("w_aaaaaaaa")[0].question, "a?");
@@ -767,7 +863,12 @@ mod tests {
         assert_eq!(pending_for("w_bbbbbbbb_extra").len(), 1);
         assert!(pending_for("w_cccccccc").is_empty());
         // A `local` ask belongs to no coordinator.
-        park("", &spec("local?", ChoiceMode::One, &[("z", "Z")])).expect("parks");
+        park(
+            "",
+            "s_test",
+            &spec("local?", ChoiceMode::One, &[("z", "Z")]),
+        )
+        .expect("parks");
         assert!(pending_for("local").is_empty());
         // …but it is still in the operator's global tray.
         assert_eq!(pending().len(), 3);
@@ -782,6 +883,7 @@ mod tests {
 
         let q = park(
             "w_1234abcd",
+            "s_test",
             &spec("ship?", ChoiceMode::One, &[("y", "Yes")]),
         )
         .expect("parks");
@@ -793,7 +895,7 @@ mod tests {
         // Gone from every surface, including after a reload.
         assert!(pending().is_empty(), "answered question still pending");
         assert!(attach_notice("w_1234abcd").is_none());
-        assert!(startup_notice().is_none());
+        assert!(startup_notice("s_test").is_none());
 
         // And the decision is durably recorded next to the (now removed)
         // question, so nothing downstream has to trust in-process state.
@@ -819,6 +921,7 @@ mod tests {
 
         let q = park(
             "w_9999zzzz",
+            "s_test",
             &spec("ship?", ChoiceMode::Many, &[("y", "Yes")]),
         )
         .expect("parks");
@@ -847,6 +950,7 @@ mod tests {
 
         let q = park(
             "w_esc00000",
+            "s_test",
             &spec("ship?", ChoiceMode::One, &[("y", "Yes")]),
         )
         .expect("parks");
@@ -861,7 +965,12 @@ mod tests {
         let _g = HOME_LOCK.lock().unwrap();
         let _home = TempHome::new("resolve");
 
-        let q = park("w_1", &spec("one?", ChoiceMode::One, &[("y", "Yes")])).expect("parks");
+        let q = park(
+            "w_1",
+            "s_test",
+            &spec("one?", ChoiceMode::One, &[("y", "Yes")]),
+        )
+        .expect("parks");
         assert_eq!(resolve(&q.id).expect("exact").id, q.id);
         assert_eq!(resolve(&q.id[..3]).expect("prefix").id, q.id);
         assert!(resolve("nope").is_err());
@@ -872,6 +981,7 @@ mod tests {
         let twin = PendingQuestion {
             id: format!("{}zz", &q.id[..3]),
             worker: "w_2".into(),
+            session: "s_test".into(),
             question: "two?".into(),
             mode: "one".into(),
             options: vec![("y".into(), "Yes".into())],
@@ -890,8 +1000,15 @@ mod tests {
         let _g = HOME_LOCK.lock().unwrap();
         let _home = TempHome::new("refuse");
 
-        assert!(park("w_1", &spec("no options?", ChoiceMode::One, &[])).is_none());
-        assert!(park("w_1", &spec("   ", ChoiceMode::One, &[("y", "Yes")])).is_none());
+        assert!(park("w_1", "s_test", &spec("no options?", ChoiceMode::One, &[])).is_none());
+        assert!(
+            park(
+                "w_1",
+                "s_test",
+                &spec("   ", ChoiceMode::One, &[("y", "Yes")])
+            )
+            .is_none()
+        );
         assert!(pending().is_empty());
     }
 
@@ -935,7 +1052,7 @@ options:
 ";
 
         let parsed = crate::choice::first_choice(answer).expect("block parses");
-        let parked = park("w_QLe7sEWJ", &parsed).expect("parks");
+        let parked = park("w_QLe7sEWJ", "s_test", &parsed).expect("parks");
 
         let rows = pending();
         assert_eq!(
@@ -965,7 +1082,7 @@ options:
         // Re-asking the same thing next round must re-surface the SAME id
         // rather than stacking a second tray row the operator cannot tell
         // apart.
-        let again = park("w_QLe7sEWJ", &parsed).expect("re-ask returns the live row");
+        let again = park("w_QLe7sEWJ", "s_test", &parsed).expect("re-ask returns the live row");
         assert_eq!(again.id, parked.id, "re-ask must reuse the parked id");
         assert_eq!(pending().len(), 1, "re-ask stacked a duplicate tray row");
     }
@@ -980,6 +1097,7 @@ options:
             let q = PendingQuestion {
                 id: id.into(),
                 worker: "w_1".into(),
+                session: "s_test".into(),
                 question: format!("q{created}"),
                 summary: String::new(),
                 mode: "one".into(),
@@ -990,5 +1108,71 @@ options:
         }
         let ids: Vec<String> = pending().into_iter().map(|q| q.id).collect();
         assert_eq!(ids, vec!["qaaa002", "qmmm003", "qzzz001"]);
+    }
+
+    /// Auto-surfacing is per-session: the store is one directory under `$HOME`,
+    /// so without the owner filter a question parked by one session's worker
+    /// pops up in every other open aish and the same decision gets offered
+    /// several times over. Unowned (legacy) rows stay visible everywhere so
+    /// they are never stranded where nobody is asked.
+    #[test]
+    fn pending_is_scoped_to_the_owning_session() {
+        let _g = HOME_LOCK.lock().unwrap();
+        let _home = TempHome::new("scope");
+
+        let dir = questions_dir();
+        for (id, session) in [
+            ("qmine001", "s_mine"),
+            ("qtheirs1", "s_theirs"),
+            ("qlegacy1", ""),
+        ] {
+            let q = PendingQuestion {
+                id: id.into(),
+                worker: "w_1".into(),
+                session: session.into(),
+                question: format!("owned by {session:?}"),
+                summary: String::new(),
+                mode: "one".into(),
+                options: vec![("y".into(), "Yes".into())],
+                created: 100,
+            };
+            std::fs::write(question_path(&dir, id), q.encode()).expect("write");
+        }
+
+        // All three are in the store...
+        assert_eq!(pending().len(), 3, "global tray sees every row");
+
+        // ...but a session only auto-surfaces its own plus the unowned one.
+        let mut mine: Vec<String> = pending_for_session("s_mine")
+            .into_iter()
+            .map(|q| q.id)
+            .collect();
+        mine.sort();
+        assert_eq!(
+            mine,
+            vec!["qlegacy1", "qmine001"],
+            "another session's ask must not surface here"
+        );
+
+        let mut theirs: Vec<String> = pending_for_session("s_theirs")
+            .into_iter()
+            .map(|q| q.id)
+            .collect();
+        theirs.sort();
+        assert_eq!(theirs, vec!["qlegacy1", "qtheirs1"]);
+
+        // Prefix tolerance in both directions: a short id shown in one place
+        // and a full id stored in another still resolve to each other.
+        assert!(
+            pending_for_session("s_mine_long_suffix")
+                .iter()
+                .any(|q| q.id == "qmine001"),
+            "stored id is a prefix of the caller's id"
+        );
+
+        // A caller with no session of its own gets only the unowned rows —
+        // never somebody else's decision.
+        let unowned: Vec<String> = pending_for_session("").into_iter().map(|q| q.id).collect();
+        assert_eq!(unowned, vec!["qlegacy1"]);
     }
 }
