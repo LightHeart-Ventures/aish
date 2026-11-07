@@ -2770,9 +2770,21 @@ fn refresh_escalation_status_from(
         }
         let summary = store.and_then(|s| crate::activity_summary::cached_summary(s, &run_id));
         let activity = summary.or(last);
-        let text = match activity {
-            Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
-            _ => status.clone(),
+        // ISS-W1: a root parked at `waiting` has NO activity of its own — its
+        // own turns are over and only the sub-workers it dispatched are still
+        // running. Replaying its last activity line under a `waiting` state
+        // ("waiting · wiring serial question-drain into prompt loop") reads as a
+        // live claim about work that already stopped — the same confusion the
+        // frozen-`done` row created. Say what it is actually waiting ON.
+        // `split_status` peels the leading state word into `STATE_COL`, and
+        // "waiting" is 7 chars, so it fits without clipping the detail cell.
+        let text = if status == "waiting" {
+            waiting_status_text(live_descendant_count(&id))
+        } else {
+            match activity {
+                Some(a) if !a.trim().is_empty() => format!("{status} · {}", a.trim()),
+                _ => status.clone(),
+            }
         };
         crate::escalation::set_status(&id, &text);
         if matches!(status.as_str(), "done" | "failed") {
@@ -2954,6 +2966,42 @@ fn refresh_escalation_alerts(store: Option<&crate::db::AlertStore>) {
     crate::escalation::sync_alerts(&rows);
 }
 
+/// How many LIVE descendants the last fan-out walk attributed to each pinned
+/// ROOT row, keyed by the root's visible id.
+///
+/// Published by [`refresh_escalation_subworkers`] (which already walks the whole
+/// `coordinator_runs` parentage tree on a 2s throttle) and read by
+/// [`refresh_escalation_status_from`] one paint later. A CACHE rather than a
+/// return value on purpose: the status pass runs on every footer repaint while
+/// the walk is throttled, and the status pass must not be reordered after it —
+/// a root must never be marked terminal in a pass where descendants still live
+/// (ISS-W1). Worst case a brand-new parked row reads `waiting` with no count
+/// for one 2s window, then gains the detail.
+static LIVE_DESCENDANTS: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Live descendants currently attributed to tray root `id` (0 when unknown).
+fn live_descendant_count(id: &str) -> usize {
+    LIVE_DESCENDANTS
+        .lock()
+        .ok()
+        .and_then(|g| g.iter().find(|(k, _)| k == id).map(|(_, n)| *n))
+        .unwrap_or(0)
+}
+
+/// Status text for a root row parked at `waiting` (ISS-W1) — the honest reason
+/// the row is neither advancing nor finished.
+///
+/// `0` means the walk has not attributed a descendant yet (first paint inside
+/// the throttle window, or a durable `waiting` that is about to self-heal via
+/// [`crate::worker::waiting_verdict`]), so it claims nothing beyond the state.
+fn waiting_status_text(live: usize) -> String {
+    match live {
+        0 => "waiting".to_string(),
+        1 => "waiting · 1 sub-worker live".to_string(),
+        n => format!("waiting · {n} sub-workers live"),
+    }
+}
+
 fn refresh_escalation_subworkers(
     store: Option<&crate::db::CoordinatorStore>,
     aliases: &[(String, Vec<String>)],
@@ -3027,6 +3075,15 @@ fn refresh_escalation_subworkers(
         }
     }
 
+    // ISS-W1 bookkeeping: attribute every descendant back to the ROOT tray row
+    // it hangs under, so a parent parked at `waiting` can say how many
+    // sub-workers it is waiting ON. `subs` is in breadth-first discovery order,
+    // so a child's parent has always been recorded already: a DIRECT child's
+    // resolved parent IS the root visible id (absent from `root_of`), while a
+    // grandchild's parent is a sub `run_id` that is present.
+    let mut root_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut live_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for r in subs {
         let Some(parent) = r.parent_run_id.as_deref() else {
             continue;
@@ -3035,6 +3092,14 @@ fn refresh_escalation_subworkers(
         // tray files rows under. Unmapped parents (sub-workers, un-resumed
         // workers) are already their own visible id and pass through unchanged.
         let parent = alias_to_visible.get(parent).copied().unwrap_or(parent);
+        let root = root_of
+            .get(parent)
+            .cloned()
+            .unwrap_or_else(|| parent.to_string());
+        root_of.insert(r.run_id.clone(), root.clone());
+        if subworker_is_live(r, now_epoch, SUB_STALE_SECS) {
+            *live_counts.entry(root).or_default() += 1;
+        }
         let label = [r.title.as_deref(), r.activity_summary.as_deref()]
             .into_iter()
             .flatten()
@@ -3068,6 +3133,13 @@ fn refresh_escalation_subworkers(
         if matches!(r.phase.as_str(), "done" | "failed") {
             crate::escalation::note_terminal(&r.run_id, r.phase == "failed" || r.error.is_some());
         }
+    }
+    // Publish the ISS-W1 counts for the NEXT status pass to read. Only a walk
+    // that actually completed gets here, so a throttled or failed read leaves
+    // the previous counts standing — same "rows keep their last values" rule the
+    // early returns above follow.
+    if let Ok(mut g) = LIVE_DESCENDANTS.lock() {
+        *g = live_counts.into_iter().collect();
     }
 
     // ── Second pass: SUB-WORK LEDGER rows.
@@ -13856,6 +13928,56 @@ mod tests {
         for (i, id) in pinned.iter().enumerate() {
             assert_eq!(&targets[i].0, id, "order and coverage must be preserved");
         }
+    }
+
+    // ---- ISS-W1: a root parked at `waiting` says what it waits ON ---------
+    //
+    // The bug this guards: the tray painted a parent `done` (frozen glyph)
+    // while its own sub-workers still beat underneath it, replaying the
+    // parent's LAST activity line as if that work were still happening. Once
+    // the in-memory job parks at `waiting`, the detail cell must describe the
+    // children it is waiting on — never its own stopped activity.
+
+    #[test]
+    fn waiting_text_names_the_sub_workers_it_is_waiting_on() {
+        assert_eq!(
+            waiting_status_text(1),
+            "waiting · 1 sub-worker live",
+            "singular reads naturally"
+        );
+        assert_eq!(
+            waiting_status_text(3),
+            "waiting · 3 sub-workers live",
+            "plural for 2+"
+        );
+    }
+
+    #[test]
+    fn waiting_text_claims_nothing_when_no_descendant_is_attributed_yet() {
+        // The fan-out walk is throttled (2s) while the status pass runs on every
+        // repaint, so a freshly parked row can paint once before a count lands.
+        // Better a bare state word than a confident "0 sub-workers live".
+        assert_eq!(waiting_status_text(0), "waiting");
+    }
+
+    #[test]
+    fn waiting_text_always_starts_with_the_state_word() {
+        // `split_status` peels the leading lifecycle word into STATE_COL, and
+        // "waiting" is 7 chars — so the state renders in its own frozen-safe
+        // column and the detail cell is not clipped.
+        for n in [0usize, 1, 2, 42] {
+            let text = waiting_status_text(n);
+            assert!(text.starts_with("waiting"), "{text:?}");
+            let (state, _) = crate::escalation::split_status(&text);
+            assert_eq!(state, "waiting", "state column must be exactly the word");
+        }
+    }
+
+    #[test]
+    fn live_descendant_count_is_zero_for_an_unknown_root() {
+        // An id the walk has never attributed must read 0, not panic or inherit
+        // another row's count.
+        assert_eq!(live_descendant_count("w_never_seen_by_the_walk"), 0);
     }
 
     // ---- tray sub-workers resolve a resumed parent's thread ids -----------
