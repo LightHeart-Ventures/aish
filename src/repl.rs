@@ -9678,16 +9678,48 @@ fn answer_question(id: Option<&str>, answer: &str, session: &mut Session) {
 fn deliver_question_answer(id: &str, answer: &str, session: &mut Session) {
     match crate::question::answer(id, answer) {
         Ok(q) => {
-            println!(
-                "\x1b[32m✓\x1b[0m answered {} \x1b[2m→\x1b[0m {answer}",
-                q.id
-            );
-            let out = tell_coordinator_ctx(Some(&q.worker), answer, true, &ops_ctx(session));
-            if !out.is_empty() {
-                println!("{out}");
+            // Collected BEFORE any twin is resolved, while they are all still
+            // pending. A fan-out parks one row per sub-coordinator for the same
+            // fork (`park` only dedupes per worker), and the operator deciding
+            // once has decided it for all of them — leaving the twins pending
+            // re-asks a question they already answered.
+            let twins = crate::question::twins_of(&q);
+            route_question_answer(&q, answer, None, session);
+            for t in twins {
+                if crate::question::answer(&t.id, answer).is_ok() {
+                    route_question_answer(&t, answer, Some(&q.id), session);
+                }
             }
         }
         Err(e) => println!("\x1b[33maish:\x1b[0m {e}"),
+    }
+}
+
+/// Echo one resolved question and hand its answer to the worker that asked it.
+///
+/// `same_as` names the row this one was resolved ALONGSIDE (a twin), so the
+/// operator can see why a question they did not name just closed. Every
+/// delivery — explicit `:answer`, idle popup, twin fan-out — funnels through
+/// here, keeping "write the store, then `:tell` the asker" in one place.
+fn route_question_answer(
+    q: &crate::question::PendingQuestion,
+    answer: &str,
+    same_as: Option<&str>,
+    session: &mut Session,
+) {
+    match same_as {
+        Some(src) => println!(
+            "\x1b[32m✓\x1b[0m answered {} \x1b[2m→ {answer} (same question as {src}, asked by {})\x1b[0m",
+            q.id, q.worker
+        ),
+        None => println!(
+            "\x1b[32m✓\x1b[0m answered {} \x1b[2m→\x1b[0m {answer}",
+            q.id
+        ),
+    }
+    let out = tell_coordinator_ctx(Some(&q.worker), answer, true, &ops_ctx(session));
+    if !out.is_empty() {
+        println!("{out}");
     }
 }
 
@@ -9843,6 +9875,18 @@ pub(crate) fn tell_coordinator_ctx(
                 Ok(_) => {
                     let pending = store.pending_message_count(&run_id).unwrap_or(0);
                     out.push(tell_banner(short, pending));
+                    // An operator who steers a worker with the NAME of an option
+                    // it is parked on has answered the question — the worker is
+                    // about to read the steer and act on it. Close the row so
+                    // the tray stops re-asking a decision already made and
+                    // delivered. Strict match only (see `option_named_by`): a
+                    // steer that names no option leaves the question pending.
+                    for (q, picked) in crate::question::answer_via_message(&run_id, message) {
+                        out.push(format!(
+                            "\x1b[32m✓\x1b[0m closed question {} \x1b[2m→\x1b[0m {picked}",
+                            q.id
+                        ));
+                    }
                 }
                 Err(e) => out.push(format!("couldn't queue message: {e}")),
             }
