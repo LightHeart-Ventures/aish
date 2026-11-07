@@ -1456,7 +1456,11 @@ final status plus your best partial result. After this turn you are terminated."
         // that re-asks the same thing every round yields ONE row with ONE id
         // instead of a tray full of near-identical ids for one decision.
         if let Some(spec) = crate::choice::first_choice(&answer)
-            && let Some(q) = crate::question::park(run_id, &spec)
+            // Stamp the LAUNCHING session (adopted into `session.session_id`
+            // at spawn — see the ownership note above the store insert) so the
+            // ask auto-surfaces only in the pane whose operator asked for this
+            // work, instead of nagging every aish sharing this `$HOME`.
+            && let Some(q) = crate::question::park(run_id, &session.session_id, &spec)
         {
             let note = q.console_note();
             // Same channel discipline as the sub-work ledger above: `📣` when a

@@ -1907,7 +1907,8 @@ pub async fn run(
                         // what keeps inline choice blocks behaving as before.
                         if let Some(worker) =
                             std::env::var("AISH_RUN_ID").ok().filter(|s| !s.is_empty())
-                            && let Some(q) = crate::question::park(&worker, &spec)
+                            && let Some(q) =
+                                crate::question::park(&worker, &session.session_id, &spec)
                         {
                             eprintln!("{}", q.console_note());
                         }
@@ -9604,19 +9605,33 @@ fn tell_coordinator(id: Option<&str>, message: &str, any: bool, session: &mut Se
     }
 }
 
-/// `:questions` — the durable decision tray. Lists every choice block a
+/// `:questions` — the durable decision tray. Lists the choice blocks a
 /// background worker parked that nobody has answered or dismissed yet. The rows
 /// outlive the asking turn, the attach, and the whole session (see `question.rs`).
-fn print_pending_questions() {
-    let pending = crate::question::pending();
+///
+/// Scoped to THIS session's questions by default: the store is one directory
+/// under `$HOME`, so an unscoped listing shows every other open aish's asks and
+/// invites an operator to answer a decision that was never theirs. `--all`
+/// opts back into the global view for when that is exactly what you want
+/// (which pane is holding the ask?).
+fn print_pending_questions(all: bool, session_id: &str) {
+    let pending = if all {
+        crate::question::pending()
+    } else {
+        crate::question::pending_for_session(session_id)
+    };
     if pending.is_empty() {
-        println!("\x1b[2mno pending questions\x1b[0m");
+        println!(
+            "\x1b[2mno pending questions{}\x1b[0m",
+            if all { "" } else { " in this session" }
+        );
         return;
     }
     println!(
-        "\x1b[36m?\x1b[0m {} pending question{}",
+        "\x1b[36m?\x1b[0m {} pending question{}{}",
         pending.len(),
-        if pending.len() == 1 { "" } else { "s" }
+        if pending.len() == 1 { "" } else { "s" },
+        if all { " (all sessions)" } else { "" }
     );
     for q in &pending {
         println!("{}", q.row());
@@ -9743,9 +9758,15 @@ fn route_question_answer(
 ///   and `:dismiss` stays the only way to drop a question unanswered. The row
 ///   is re-offered on a later idle pass; that is the nagging, and it is the
 ///   point.
-/// * **Attach-independent.** Reads [`crate::question::pending`], NOT
-///   `pending_for(attached_run)`: the tray is the session's, not the attached
-///   worker's, and every popup names its asker (see `PendingQuestion::spec`).
+/// * **Attach-independent, but session-SCOPED.** Reads
+///   [`crate::question::pending_for_session`], NOT `pending_for(attached_run)`:
+///   the tray is the session's, not the attached worker's, and every popup
+///   names its asker (see `PendingQuestion::spec`). The session filter is what
+///   keeps one worker's ask from popping up in every other aish sharing this
+///   `$HOME` — before it, whichever pane the operator happened to be sitting in
+///   got the popup and every OTHER pane got it too, so the same decision was
+///   offered several times and answering it in one left the rest to re-nag.
+///   `:questions --all` is the deliberate escape hatch for seeing the rest.
 ///
 /// Non-interactive sessions are skipped: piped stdin has nobody to pick, and a
 /// blocking raw-mode read there would hang a script.
@@ -9753,7 +9774,10 @@ fn surface_pending_question(session: &mut Session) -> bool {
     if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
         return false;
     }
-    let Some(q) = crate::question::pending().into_iter().next() else {
+    let Some(q) = crate::question::pending_for_session(&session.session_id)
+        .into_iter()
+        .next()
+    else {
         return false;
     };
     match crate::choice::prompt_choice(q.spec(), crate::escalation::ROWS_PER_BANNER) {
@@ -11754,7 +11778,7 @@ async fn handle_colon(
                  :detach                             stop watching the attached coordinator (it keeps running)\n\
                  :forget <id>|--all-exited           remove an exited worker's container + state dir + run record (refuses a running one)\n\
                  :close [id]                         remove the attached (or named) coordinator from :workers + the Shift-Tab rotation\n\
-                 :questions                          pending worker questions parked in the tray (survive detach/restart; alias :asks)\n\
+                 :questions [--all]                  pending worker questions parked in the tray — this session's by default, --all for every session (alias :asks)\n\
                  :answer <id> [reply]                answer a parked worker question — bare id re-opens the popup, else send <reply> as the choice\n\
                  :dismiss <id>                       drop a parked worker question without answering it\n\
                  :skill <add|search|list|remove>     install, search, list, or remove skill.fish skills\n\
@@ -12312,7 +12336,12 @@ async fn handle_colon(
         }
         Some("close") => close_worker(parts.next(), session),
         // The durable question tray (worker-parked `choice` blocks).
-        Some("questions" | "asks") => print_pending_questions(),
+        Some("questions" | "asks") => {
+            let all = parts
+                .next()
+                .is_some_and(|a| matches!(a, "--all" | "-a" | "all"));
+            print_pending_questions(all, &session.session_id);
+        }
         Some("answer") => {
             let toks: Vec<&str> = parts.collect();
             let message = toks.iter().skip(1).copied().collect::<Vec<_>>().join(" ");

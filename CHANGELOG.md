@@ -4,6 +4,9 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+### Fixed
+- **Parked questions are session-bound instead of popping up in every open aish.** The durable question tray is one directory under `$HOME`, and both re-surfacing paths read it unfiltered — so a choice block parked by one session's coordinator auto-popped in *every* interactive aish on the box, including panes working an unrelated repo, and whichever operator hit Esc first left the row pending for all the others to be nagged by again. `PendingQuestion` now carries the OWNING `session` id (stamped at park time from the launching session a coordinator adopts), and auto-surfacing goes through `question::pending_for_session` — the idle-pass popup and the startup notice only raise rows this session owns. Explicit operator intent stays global on purpose: `:answer <id>`, `:dismiss <id>`, and the new `:questions --all` still reach any row, because typing an id is a decision and should never be refused on a technicality. Rows written before session binding (empty owner) are UNOWNED and still surface everywhere, which is the pre-change behaviour and the only place they would ever be seen; a caller with no session of its own gets only those, never somebody else's decision. Owner comparison is prefix-tolerant in both directions, matching the existing worker-id matching.
+
 ## [0.77.1] - 2026-11-07
 
 ### Fixed
