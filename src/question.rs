@@ -627,6 +627,107 @@ pub fn dismiss(id: &str) -> Result<PendingQuestion, String> {
     Ok(q)
 }
 
+/// Option ids of `q`, lowercased and sorted — the identity of an ask's CHOICE
+/// SET, used to decide whether two rows are really the same question.
+fn option_ids(q: &PendingQuestion) -> Vec<String> {
+    let mut ids: Vec<String> = q
+        .options
+        .iter()
+        .map(|(id, _)| id.to_ascii_lowercase())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Does `message` NAME one of `q`'s options?
+///
+/// The whole point of this matcher is to recognise an answer the operator
+/// already gave in prose — `:tell w_x option-b` — WITHOUT ever guessing. So it
+/// is deliberately strict, in two tiers:
+///
+/// 1. the trimmed message IS an option id or label (`option-b`, `Ship now`);
+/// 2. the message CONTAINS exactly one option id as a whole token (`go with
+///    option-b, then ship`).
+///
+/// Anything else — no option named, or two DIFFERENT options named — returns
+/// `None` and leaves the question pending. A steer that merely mentions the
+/// subject must not be mistaken for a decision; an unanswered question costs a
+/// re-ask, a wrongly-answered one costs the operator's actual intent.
+fn option_named_by(q: &PendingQuestion, message: &str) -> Option<String> {
+    let msg = message.trim().to_ascii_lowercase();
+    if msg.is_empty() {
+        return None;
+    }
+    for (oid, label) in &q.options {
+        let label = label.trim();
+        if msg == oid.to_ascii_lowercase()
+            || (!label.is_empty() && msg == label.to_ascii_lowercase())
+        {
+            return Some(oid.clone());
+        }
+    }
+    // Whole-token scan. `-`/`_` stay inside a token so `option-b` is one word
+    // and cannot be half-matched by an option called `b`.
+    let tokens: Vec<&str> = msg
+        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut hit: Option<String> = None;
+    for (oid, _) in &q.options {
+        let lo = oid.to_ascii_lowercase();
+        if tokens.contains(&lo.as_str()) {
+            match &hit {
+                // Two different options named: the operator's intent is not
+                // legible, so decide nothing.
+                Some(prev) if !prev.eq_ignore_ascii_case(oid) => return None,
+                _ => hit = Some(oid.clone()),
+            }
+        }
+    }
+    hit
+}
+
+/// Other pending rows asking the IDENTICAL thing — same question text and same
+/// option set — parked by a different worker.
+///
+/// Why this exists: [`park`] dedupes per worker, so a fan-out where three
+/// sub-coordinators independently hit the same fork parks THREE rows. The
+/// operator answers one, considers the matter settled, and the twins keep
+/// nagging — a question they have already decided. Answering one answers them
+/// all (see the twin loop in `repl::deliver_question_answer`), with each
+/// twin's own asker told separately so no worker is left waiting.
+pub fn twins_of(q: &PendingQuestion) -> Vec<PendingQuestion> {
+    let ids = option_ids(q);
+    pending()
+        .into_iter()
+        .filter(|o| o.id != q.id && o.question == q.question && option_ids(o) == ids)
+        .collect()
+}
+
+/// Close out `worker`'s parked questions that the operator answered OUT OF
+/// BAND, by steering the worker instead of using `:answer`.
+///
+/// `:tell w_x option-b` is, in practice, the operator answering: the worker
+/// gets the steer and acts on it. Before this, the tray did not notice — the
+/// row stayed pending and re-surfaced at every startup/attach/idle pass,
+/// asking for a decision that had already been made and acted on. Here the
+/// matching row is answered with the named option id (the canonical form a
+/// worker's own `pending_for` reader expects) and leaves the tray.
+///
+/// Returns `(row, chosen option id)` per question closed — empty when the
+/// message named nothing, which is the common case and must stay silent.
+pub fn answer_via_message(worker: &str, message: &str) -> Vec<(PendingQuestion, String)> {
+    let mut closed = Vec::new();
+    for q in pending_for(worker) {
+        if let Some(oid) = option_named_by(&q, message)
+            && answer(&q.id, &oid).is_ok()
+        {
+            closed.push((q, oid));
+        }
+    }
+    closed
+}
+
 /// Drop questions whose worker is long gone. Best-effort and silent: a sweep
 /// failure must never block a live question.
 fn sweep_stale(dir: &Path) {
@@ -1174,5 +1275,115 @@ options:
         // never somebody else's decision.
         let unowned: Vec<String> = pending_for_session("").into_iter().map(|q| q.id).collect();
         assert_eq!(unowned, vec!["qlegacy1"]);
+    }
+
+    /// Build a row directly — the matcher tests care about options, not the store.
+    fn row(question: &str, opts: &[(&str, &str)]) -> PendingQuestion {
+        PendingQuestion {
+            id: "qtest01".into(),
+            worker: "w_1".into(),
+            session: String::new(),
+            question: question.into(),
+            summary: String::new(),
+            mode: "one".into(),
+            options: opts
+                .iter()
+                .map(|(i, l)| ((*i).to_string(), (*l).to_string()))
+                .collect(),
+            created: 1,
+        }
+    }
+
+    #[test]
+    fn option_named_by_matches_bare_id_label_and_single_token() {
+        let q = row(
+            "stash or delete?",
+            &[("stash", "Stash it"), ("delete", "Delete it")],
+        );
+        assert_eq!(option_named_by(&q, "stash").as_deref(), Some("stash"));
+        assert_eq!(option_named_by(&q, "  Stash  ").as_deref(), Some("stash"));
+        // Tier 1: the whole message IS a label.
+        assert_eq!(option_named_by(&q, "Delete it").as_deref(), Some("delete"));
+        // Tier 2: exactly one id appears as a whole token in prose.
+        assert_eq!(
+            option_named_by(&q, "go with stash, then keep moving").as_deref(),
+            Some("stash")
+        );
+    }
+
+    #[test]
+    fn option_named_by_refuses_to_guess() {
+        let q = row(
+            "stash or delete?",
+            &[("stash", "Stash it"), ("delete", "Delete it")],
+        );
+        // Names nothing.
+        assert_eq!(option_named_by(&q, "keep going"), None);
+        // Names BOTH — intent is not legible, so decide nothing.
+        assert_eq!(option_named_by(&q, "stash then delete"), None);
+        // Substring of a larger word is not a whole-token name.
+        assert_eq!(option_named_by(&q, "unstashed changes remain"), None);
+    }
+
+    #[test]
+    fn steering_a_worker_with_an_option_name_closes_its_question() {
+        let _g = HOME_LOCK.lock().unwrap();
+        let _home = TempHome::new("via-msg");
+
+        let s = spec(
+            "stash or delete?",
+            ChoiceMode::One,
+            &[("stash", "Stash it"), ("delete", "Delete it")],
+        );
+        let parked = park("w_AAAA1111", "s_main", &s).expect("parks");
+
+        // A steer that names nothing leaves the row pending.
+        assert!(answer_via_message("w_AAAA1111", "keep going").is_empty());
+        assert_eq!(pending().len(), 1, "vague steer must not resolve");
+
+        let closed = answer_via_message("w_AAAA1111", "stash");
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].0.id, parked.id);
+        assert_eq!(closed[0].1, "stash");
+        assert!(pending().is_empty(), "answered row must leave the tray");
+    }
+
+    #[test]
+    fn twins_are_the_same_ask_parked_by_another_worker() {
+        let _g = HOME_LOCK.lock().unwrap();
+        let _home = TempHome::new("twins");
+
+        let s = spec(
+            "stash or delete?",
+            ChoiceMode::One,
+            &[("stash", "Stash it"), ("delete", "Delete it")],
+        );
+        let a = park("w_AAAA1111", "s_main", &s).expect("parks");
+        let b = park("w_BBBB2222", "s_main", &s).expect("parks");
+        // Same options, DIFFERENT question text — not a twin.
+        let other = spec(
+            "push or hold?",
+            ChoiceMode::One,
+            &[("stash", "Stash it"), ("delete", "Delete it")],
+        );
+        park("w_CCCC3333", "s_main", &other).expect("parks");
+        // Same question text, DIFFERENT option set — not a twin.
+        let narrowed = spec(
+            "stash or delete?",
+            ChoiceMode::One,
+            &[("stash", "Stash it")],
+        );
+        park("w_DDDD4444", "s_main", &narrowed).expect("parks");
+
+        let twins = twins_of(&a);
+        assert_eq!(
+            twins.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec![b.id.as_str()],
+            "only the identical ask from another worker is a twin"
+        );
+        assert!(
+            twins_of(&a).iter().all(|t| t.id != a.id),
+            "a row is never its own twin"
+        );
     }
 }
