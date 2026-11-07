@@ -85,6 +85,13 @@ pub struct PendingQuestion {
     pub worker: String,
     /// The question text from the block's `question:` key.
     pub question: String,
+    /// The block's `summary:` context, if the asking agent wrote one. Carried
+    /// because the tray surfaces this row long after the turn that raised it —
+    /// possibly in a different session — and a terse question with no context
+    /// is a decision the operator cannot safely make. Older records on disk
+    /// predate the field and decode to empty; [`Self::spec`] synthesises a
+    /// line for those rather than showing a bare question.
+    pub summary: String,
     /// Selection semantics, serialised as `one` / `many` / `compare`.
     pub mode: String,
     /// `(id, label)` per option, in the order the agent listed them.
@@ -167,11 +174,12 @@ impl PendingQuestion {
     /// that does not know about options simply ignores them.
     fn encode(&self) -> String {
         let mut out = format!(
-            "id\t{}\nworker\t{}\nmode\t{}\nquestion\t{}\ncreated\t{}\n",
+            "id\t{}\nworker\t{}\nmode\t{}\nquestion\t{}\nsummary\t{}\ncreated\t{}\n",
             esc(&self.id),
             esc(&self.worker),
             esc(&self.mode),
             esc(&self.question),
+            esc(&self.summary),
             self.created
         );
         for (oid, label) in &self.options {
@@ -188,6 +196,7 @@ impl PendingQuestion {
             id: String::new(),
             worker: String::new(),
             question: String::new(),
+            summary: String::new(),
             mode: "one".to_string(),
             options: Vec::new(),
             created: 0,
@@ -200,6 +209,9 @@ impl PendingQuestion {
                 "id" => q.id = unesc(v),
                 "worker" => q.worker = unesc(v),
                 "question" => q.question = unesc(v),
+                // Absent in records written before the tray carried context;
+                // an empty summary is handled by `spec`, not rejected here.
+                "summary" => q.summary = unesc(v),
                 "mode" => q.mode = unesc(v),
                 "created" => q.created = v.trim().parse().unwrap_or(0),
                 "option" => {
@@ -224,9 +236,27 @@ impl PendingQuestion {
     /// the ordinary `choice.rs` popup. `span` is `(0, 0)`: there is no source
     /// text to strip here, the record IS the question.
     pub fn spec(&self) -> ChoiceSpec {
+        // A parked ask reaches the operator out of context — different turn,
+        // maybe a different session, maybe days later — so the tray ALWAYS
+        // gets a summary block. The worker's own context when it wrote one;
+        // otherwise a synthesised line that at least says what this row is and
+        // how to get rid of it, which is strictly better than a bare question
+        // floating over a menu.
+        let summary = if self.summary.trim().is_empty() {
+            format!(
+                "parked question {} from {} — esc leaves it pending (:answer {} / :dismiss {})",
+                self.id, self.worker, self.id, self.id
+            )
+        } else {
+            self.summary.clone()
+        };
         ChoiceSpec {
             mode: mode_of(&self.mode),
             question: self.question.clone(),
+            summary,
+            // Attribution: the tray pops regardless of which worker the
+            // operator is attached to, so every row names its asker.
+            worker: self.worker.clone(),
             options: self
                 .options
                 .iter()
@@ -334,6 +364,7 @@ pub fn park(worker: &str, spec: &ChoiceSpec) -> Option<PendingQuestion> {
             worker.to_string()
         },
         question: spec.question.trim().to_string(),
+        summary: spec.summary.trim().to_string(),
         mode: mode_str(spec.mode).to_string(),
         options: spec
             .options
@@ -594,6 +625,8 @@ mod tests {
         ChoiceSpec {
             mode,
             question: question.to_string(),
+            summary: String::new(),
+            worker: String::new(),
             options: opts
                 .iter()
                 .map(|(id, label)| ChoiceOption {
@@ -618,6 +651,7 @@ mod tests {
                 ("yes".into(), "Ship now".into()),
                 ("no".into(), "Hold".into()),
             ],
+            summary: String::new(),
             created: 1234,
         };
         let back = PendingQuestion::decode(&q.encode()).expect("decodes");
@@ -634,6 +668,7 @@ mod tests {
             question: "line1\nline2\twith tab \\ and backslash".into(),
             mode: "one".into(),
             options: vec![("a\\b".into(), "C:\\n\tot a newline".into())],
+            summary: String::new(),
             created: 7,
         };
         let back = PendingQuestion::decode(&q.encode()).expect("decodes");
@@ -657,6 +692,7 @@ mod tests {
             question: "pick".into(),
             mode: "compare".into(),
             options: vec![("a".into(), "Alpha".into()), ("b".into(), String::new())],
+            summary: String::new(),
             created: 0,
         };
         let s = q.spec();
@@ -839,6 +875,7 @@ mod tests {
             question: "two?".into(),
             mode: "one".into(),
             options: vec![("y".into(), "Yes".into())],
+            summary: String::new(),
             created: 1,
         };
         std::fs::write(question_path(&dir, &twin.id), twin.encode()).expect("write twin");
@@ -944,6 +981,7 @@ options:
                 id: id.into(),
                 worker: "w_1".into(),
                 question: format!("q{created}"),
+                summary: String::new(),
                 mode: "one".into(),
                 options: vec![("y".into(), "Yes".into())],
                 created,
