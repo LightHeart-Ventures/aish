@@ -115,9 +115,45 @@ pub struct ChoiceSpec {
     pub mode: ChoiceMode,
     pub question: String,
     pub options: Vec<ChoiceOption>,
+    /// Free-form context painted ABOVE the terse question: the "why am I being
+    /// asked this" an operator needs when the ask surfaces minutes later in the
+    /// tray, detached from the turn that raised it. Re-flowed to at most
+    /// [`SUMMARY_ROWS`] rows so a chatty agent cannot blow the popup's height
+    /// contract. Optional — a spec that omits it renders exactly as before.
+    pub summary: String,
+    /// Which worker is asking. The tray is session-wide (it pops regardless of
+    /// which coordinator the operator is attached to, and parked rows outlive
+    /// the asking turn entirely), so without attribution the operator cannot
+    /// tell WHOSE decision they are about to make. Empty = no header row.
+    pub worker: String,
     /// Byte range of the whole fenced block in the source text, so the caller
     /// can strip it from what it prints.
     pub span: (usize, usize),
+}
+
+impl ChoiceSpec {
+    /// Stamp the asking worker onto a spec on its way to the popup.
+    ///
+    /// Attribution is the CALLER's knowledge, not the block's: the agent that
+    /// wrote the `choice` fence has no idea which run id the operator will see
+    /// it under. Threading it here keeps the live popup and the parked tray
+    /// rendering the same header from the same field.
+    pub fn with_worker(mut self, worker: &str) -> Self {
+        self.worker = worker.trim().to_string();
+        self
+    }
+}
+
+/// Who the popup should attribute an in-turn ask to.
+///
+/// `AISH_RUN_ID` is set for a coordinator turn and unset in an interactive one,
+/// which is exactly the distinction the operator cares about: "worker w_abc1234
+/// is asking" vs "this session is asking".
+pub fn asking_worker() -> String {
+    std::env::var("AISH_RUN_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "interactive".to_string())
 }
 
 /// Why a block was rejected. A rejected block is NEVER fatal: the caller prints
@@ -244,6 +280,12 @@ pub fn parse_choice_body(body: &str) -> Result<ChoiceSpec, ChoiceError> {
                     }
                 }
                 "question" | "prompt" | "title" => spec.question = unquote(value).to_string(),
+                // The context block. Three spellings because agents reach for
+                // all three, and a dropped summary is a silently worse ask.
+                "summary" | "context" | "details" => spec.summary = unquote(value).to_string(),
+                // Attribution, normally stamped by the caller rather than the
+                // block; accepted here so a parked record can round-trip it.
+                "worker" | "run" | "run_id" => spec.worker = unquote(value).to_string(),
                 "options" | "choices" => in_options = true,
                 _ => {}
             }
@@ -559,7 +601,7 @@ impl ChoiceState {
     /// The popup as styled rows, newest layout first. ASCII only — no emoji,
     /// and no reliance on colour to convey the selection.
     pub fn render(&self, cols: u16, color: bool) -> Vec<String> {
-        let width = (cols as usize).clamp(20, 200);
+        let width = render_width(cols);
         let dim = |s: &str| {
             if color {
                 format!("\x1b[2m{s}\x1b[0m")
@@ -575,6 +617,12 @@ impl ChoiceState {
             }
         };
         let mut rows = Vec::new();
+        // Attribution + context first, dimmed, so the eye lands on the BOLD
+        // question line below them. Both are counted by `chrome_rows`, which is
+        // what the window sizing is derived from — change one, change both.
+        for row in self.header_rows(width) {
+            rows.push(dim(&row));
+        }
         rows.push(hi(&clip(&format!("? {}", self.spec.question), width)));
         let end = (self.top + self.window).min(self.spec.options.len());
         if self.top > 0 {
@@ -645,23 +693,127 @@ impl ChoiceState {
     /// Rows this popup wants, given its current window.
     #[allow(dead_code)] // reserved-row accounting for callers that pre-measure
     pub fn height(&self) -> usize {
+        self.height_for(80)
+    }
+
+    /// Rows this popup wants at a known width. Width matters because the
+    /// summary block re-flows: the same context is two rows wide-open and three
+    /// on a narrow terminal, and guessing low is how a popup paints over the
+    /// footer it was sized to stay above.
+    #[allow(dead_code)] // measured by callers that pre-reserve rows; exercised by tests
+    pub fn height_for(&self, cols: u16) -> usize {
         let visible = self.window.min(self.spec.options.len());
-        // question + options + hint + reply, plus the scroll affordances when
-        // clipped.
-        CHROME_ROWS
+        // header + question + options + hint + reply, plus the scroll
+        // affordances when clipped.
+        self.chrome_rows(cols)
             + visible
             + usize::from(self.top > 0)
             + usize::from(self.top + visible < self.spec.options.len())
     }
+
+    /// Non-option rows this popup paints at `cols`: the fixed chrome plus this
+    /// spec's attribution/summary header. Size the option window against THIS
+    /// rather than the bare [`CHROME_ROWS`] — a spec carrying a summary block
+    /// needs more chrome than one without, and the difference is exactly the
+    /// number of rows that would otherwise overflow the body budget.
+    pub fn chrome_rows(&self, cols: u16) -> usize {
+        CHROME_ROWS + self.header_rows(render_width(cols)).len()
+    }
+
+    /// The header rows, in paint order: `worker <id>` then the re-flowed
+    /// summary.
+    ///
+    /// Returned UNSTYLED and derived from one place so the paint and the height
+    /// math can never disagree — `render` dims these, `chrome_rows` only counts
+    /// them. An empty worker and an empty summary both contribute nothing, so
+    /// an ordinary inline `choice` block keeps its old row-for-row layout.
+    fn header_rows(&self, width: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let worker = self.spec.worker.trim();
+        if !worker.is_empty() {
+            out.push(clip(
+                &format!("worker {}", crate::batch::short_id(worker)),
+                width,
+            ));
+        }
+        // Indented two columns so the block reads as context hanging under the
+        // attribution rather than as another question.
+        for line in wrap(
+            self.spec.summary.trim(),
+            width.saturating_sub(2),
+            SUMMARY_ROWS,
+        ) {
+            out.push(clip(&format!("  {line}"), width));
+        }
+        out
+    }
+}
+
+/// The width every popup row is measured and clipped against. Clamped low so a
+/// 10-column terminal still gets readable (if brutally clipped) rows instead of
+/// a panic, and high so a 400-column window does not stretch the tray.
+fn render_width(cols: u16) -> usize {
+    (cols as usize).clamp(20, 200)
+}
+
+/// How many rows the summary block may occupy. Three is the most context that
+/// fits without crowding the options out of a half-height popup on a 24-row
+/// terminal; anything past it is clipped with a `~`, never dropped silently.
+pub const SUMMARY_ROWS: usize = 3;
+
+/// Re-flow `text` into at most `max_rows` rows of `width` columns.
+///
+/// Whitespace-wrapping with mid-word truncation for a single over-long token
+/// (a pasted URL must not push the options off-screen). When text is dropped
+/// the final row is marked with the same `~` [`clip`] uses: the operator should
+/// always be able to SEE that there is more than the tray is showing.
+fn wrap(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut rows: Vec<String> = Vec::new();
+    if max_rows == 0 || text.is_empty() {
+        return rows;
+    }
+    let mut line = String::new();
+    let mut dropped = false;
+    for word in text.split_whitespace() {
+        let word: String = word.chars().take(width).collect();
+        if line.is_empty() {
+            line = word;
+        } else if line.chars().count() + 1 + word.chars().count() <= width {
+            line.push(' ');
+            line.push_str(&word);
+        } else if rows.len() + 1 < max_rows {
+            rows.push(std::mem::take(&mut line));
+            line = word;
+        } else {
+            dropped = true;
+            break;
+        }
+    }
+    if !line.is_empty() {
+        rows.push(line);
+    }
+    if dropped && let Some(last) = rows.last_mut() {
+        let keep = width.saturating_sub(1);
+        if last.chars().count() > keep {
+            *last = last.chars().take(keep).collect();
+        }
+        last.push('~');
+    }
+    rows
 }
 
 /// Non-option rows every popup paints: the question, the hint, and the
 /// always-present reply row.
 pub const CHROME_ROWS: usize = 3;
 
-/// What the empty, unfocused reply row says about itself. Short enough to sit
-/// inside the option column without wrapping on a narrow terminal.
-const REPLY_PLACEHOLDER: &str = "type to reply";
+/// What the empty, unfocused reply row says about itself.
+///
+/// Worded as an OPTION rather than a hint on purpose: it is always the last row
+/// in the ring, so "custom answer" is a choice the operator can see and select
+/// like any other instead of a feature they have to know about. Short enough to
+/// sit inside the option column without wrapping on a narrow terminal.
+const REPLY_PLACEHOLDER: &str = "other - type a custom answer";
 
 /// JSON answer plus the operator's typed reply, when they typed one. The
 /// `choice` key keeps its exact old shape so existing consumers are unaffected;
@@ -721,10 +873,13 @@ pub fn popup_budget(body_rows: u16) -> usize {
     (body / 2).max(4).min(body.saturating_sub(1))
 }
 
-/// Option rows the popup can show for a `body_rows`-tall body: the budget less
-/// the chrome (question row, hint row, and the always-present reply line).
-pub fn option_window(body_rows: u16) -> usize {
-    popup_budget(body_rows).saturating_sub(CHROME_ROWS)
+/// Option rows a popup can show for a `body_rows`-tall body: the budget less
+/// the chrome it actually paints. Bare chrome is [`CHROME_ROWS`]; a popup
+/// carrying a worker attribution and/or a summary block reports a TALLER figure
+/// (see [`ChoiceState::chrome_rows`]). Same budget, more of it spent on chrome,
+/// so a context-rich ask shows fewer options rather than overflowing the body.
+pub fn option_window_with_chrome(body_rows: u16, chrome: usize) -> usize {
+    popup_budget(body_rows).saturating_sub(chrome)
 }
 
 /// Body rows available above the footer for the CURRENT terminal height, via
@@ -847,7 +1002,9 @@ pub fn prompt_choice(spec: ChoiceSpec, want_banner_rows: u16) -> Option<String> 
     // banner stack UP rather than painting over the footer. Falls through to
     // the inline paint below when there is no footer region to hang it on.
     if let Some(cap) = crate::terminal::tray_capacity_full() {
-        state.set_window(cap.saturating_sub(CHROME_ROWS).max(1));
+        // Chrome is spec-dependent now (attribution + summary block), so ask
+        // the state what it will paint rather than assuming the minimum.
+        state.set_window(cap.saturating_sub(state.chrome_rows(cols)).max(1));
         if crate::terminal::set_hint_tray(state.render(cols, true)) {
             let answer = loop {
                 let Some(key) = read_choice_key() else {
@@ -868,7 +1025,7 @@ pub fn prompt_choice(spec: ChoiceSpec, want_banner_rows: u16) -> Option<String> 
     }
 
     let body = body_rows_for(rows, want_banner_rows);
-    let window = option_window(body);
+    let window = option_window_with_chrome(body, state.chrome_rows(cols));
     if window == 0 {
         // Degraded window: print the list once, inline, and take no keys —
         // a popup that cannot be redrawn safely is worse than plain text.
@@ -1048,7 +1205,7 @@ trailing text
         );
         assert_eq!(
             reply_row(&rows).trim_end(),
-            "  { } type to reply",
+            "  { } other - type a custom answer",
             "got {rows:?}"
         );
 
@@ -1218,7 +1375,10 @@ trailing text
             rows.last().unwrap().contains("space/tab toggles"),
             "{rows:?}"
         );
-        assert_eq!(reply_row(&rows).trim_end(), "  { } type to reply");
+        assert_eq!(
+            reply_row(&rows).trim_end(),
+            format!("  {{ }} {REPLY_PLACEHOLDER}")
+        );
         for row in &rows {
             assert!(row.is_ascii(), "no non-ascii in {row:?}");
         }
@@ -1266,7 +1426,10 @@ trailing text
                 b == 0 || b < body as usize,
                 "budget {b} must leave body rows at {body}"
             );
-            assert_eq!(option_window(body), b.saturating_sub(CHROME_ROWS));
+            assert_eq!(
+                option_window_with_chrome(body, CHROME_ROWS),
+                b.saturating_sub(CHROME_ROWS)
+            );
         }
         let st = state("one", 3);
         assert!(st.fits_inline_only(2));
@@ -1303,5 +1466,110 @@ trailing text
             "{\"choice\":[\"a\",\"b\"]}"
         );
         assert_eq!(answer_json(ChoiceMode::Many, &[]), "{\"choice\":[]}");
+    }
+
+    /// Build a tray-shaped spec: attribution header + context block, which is
+    /// what a PARKED question re-renders as (an inline block carries neither).
+    fn tray_state(summary: &str, worker: &str, n: usize) -> ChoiceState {
+        let mut st = state("one", n);
+        st.spec.summary = summary.to_string();
+        st.spec = std::mem::take(&mut st.spec).with_worker(worker);
+        st
+    }
+
+    #[test]
+    fn header_rows_are_chrome_and_never_outgrow_the_summary_budget() {
+        // Long enough that the re-flow WANTS more than SUMMARY_ROWS rows: the
+        // clip has to happen in the height math, not on screen.
+        let chatty = "the deploy pipeline wants to roll the api service forward \
+             to the new task definition but staging has not been smoke tested \
+             since friday and the rollback plan is still unwritten so this is \
+             your call to make before anything irreversible happens";
+        let st = tray_state(chatty, "w_QLe7sEWJ0001", 2);
+
+        // worker row + exactly SUMMARY_ROWS summary rows, on top of the fixed
+        // chrome. If these two disagree the popup paints over the footer.
+        assert_eq!(st.chrome_rows(80), CHROME_ROWS + 1 + SUMMARY_ROWS);
+        assert_eq!(st.height_for(80), st.chrome_rows(80) + 2);
+
+        let rows = st.render(80, false);
+        assert_eq!(rows.len(), st.height_for(80), "paint must match the math");
+        assert!(
+            rows[0].contains("worker w_"),
+            "the tray must say whose ask this is: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("deploy pipeline")),
+            "summary context must be visible: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains('~')),
+            "a clipped summary must SAY it was clipped: {rows:?}"
+        );
+
+        // A bare inline block keeps its old row-for-row layout.
+        let plain = state("one", 2);
+        assert_eq!(plain.chrome_rows(80), CHROME_ROWS);
+    }
+
+    #[test]
+    fn tray_header_degrades_on_a_narrow_terminal() {
+        // 10 columns is below the clamp floor: every row must still be finite,
+        // clipped, and panic-free — the tray degrades, it does not explode.
+        let st = tray_state("context that cannot possibly fit here", "w_abc1234567", 2);
+        for cols in [0u16, 1, 10, 20, 200, u16::MAX] {
+            let rows = st.render(cols, false);
+            assert_eq!(rows.len(), st.height_for(cols), "height drift at {cols}");
+            for r in &rows {
+                assert!(
+                    r.chars().count() <= render_width(cols),
+                    "row overflows {cols}: {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_last_option_row_is_always_the_custom_text_seat() {
+        // Every mode, every option count: the ring's last seat is the free-text
+        // row, so "custom answer" is never a hidden feature.
+        for mode in ["one", "many", "compare"] {
+            for n in 1..4 {
+                let mut st = state(mode, n);
+                assert_eq!(
+                    reply_row(&st.render(80, false)).trim_end(),
+                    format!("  {{ }} {REPLY_PLACEHOLDER}"),
+                    "{mode}/{n} lost its custom-text row"
+                );
+                // Up from the first option wraps ONTO it, which is what makes
+                // it reachable without knowing it exists.
+                st.apply(Key::Up);
+                assert_eq!(st.cursor(), n, "{mode}/{n}: reply row is seat {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_custom_reply_rides_along_with_the_choice() {
+        // Additive only: the `choice` key keeps its exact old shape so a
+        // consumer that never learned about `reply` still parses the answer.
+        assert_eq!(
+            answer_json_with_reply(ChoiceMode::One, &["o0".to_string()], ""),
+            "{\"choice\":\"o0\"}"
+        );
+        assert_eq!(
+            answer_json_with_reply(ChoiceMode::One, &["o0".to_string()], "do it friday"),
+            "{\"choice\":\"o0\",\"reply\":\"do it friday\"}"
+        );
+        // A custom answer with NO option selected is the pure free-text case.
+        assert_eq!(
+            answer_json_with_reply(ChoiceMode::Many, &[], "neither - roll back"),
+            "{\"choice\":[],\"reply\":\"neither - roll back\"}"
+        );
+        // Hostile text cannot break out of the JSON string.
+        assert_eq!(
+            answer_json_with_reply(ChoiceMode::One, &["a".to_string()], "say \"no\""),
+            "{\"choice\":\"a\",\"reply\":\"say \\\"no\\\"\"}"
+        );
     }
 }

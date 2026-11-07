@@ -1204,6 +1204,18 @@ pub async fn run(
                         continue;
                     }
                     crate::session::LoopTick::Idle => {
+                        // Question tray (auto, serial): a worker that parked a
+                        // choice block gets the operator's attention HERE —
+                        // idle, after the turn landed, before the prompt is
+                        // read — instead of waiting for someone to notice a
+                        // console note and type `:answer`. One question per
+                        // pass; answering loops straight back into this arm and
+                        // pops the next (serial drain), Esc falls through to the
+                        // prompt with the row left pending. Independent of which
+                        // worker is attached — the popup names its asker.
+                        if surface_pending_question(&mut session) {
+                            continue;
+                        }
                         // Refresh the live statusline (updated date/time + model).
                         // Interactive terminals only.
                         //
@@ -1874,6 +1886,10 @@ pub async fn run(
                     // Esc answers nothing: we fall through and the raw text is
                     // printed, which is also what a malformed block does.
                     if let Some(spec) = reply.as_deref().and_then(crate::choice::first_choice) {
+                        // Stamp WHO is asking before the popup paints: the block
+                        // itself cannot know, and the operator may be attached to
+                        // a different worker entirely when this lands.
+                        let spec = spec.with_worker(&crate::choice::asking_worker());
                         if let Some(answer) = crate::choice::prompt_choice(
                             spec.clone(),
                             crate::escalation::ROWS_PER_BANNER,
@@ -9576,18 +9592,78 @@ fn answer_question(id: Option<&str>, answer: &str, session: &mut Session) {
             }
         }
     }
-    match crate::question::answer(id, &answer) {
+    deliver_question_answer(id, &answer, session);
+}
+
+/// Record a parked question's answer and hand it to the asking worker.
+///
+/// Factored out of [`answer_question`] because the tray now resolves questions
+/// from TWO places — the explicit `:answer <id>` command and the automatic
+/// idle-pass popup (see [`surface_pending_question`]) — and an operator's
+/// decision must reach the agent by exactly one code path. Two copies of
+/// "write the store, then `:tell` the worker" is how one of them silently
+/// stops delivering.
+fn deliver_question_answer(id: &str, answer: &str, session: &mut Session) {
+    match crate::question::answer(id, answer) {
         Ok(q) => {
             println!(
                 "\x1b[32m✓\x1b[0m answered {} \x1b[2m→\x1b[0m {answer}",
                 q.id
             );
-            let out = tell_coordinator_ctx(Some(&q.worker), &answer, true, &ops_ctx(session));
+            let out = tell_coordinator_ctx(Some(&q.worker), answer, true, &ops_ctx(session));
             if !out.is_empty() {
                 println!("{out}");
             }
         }
         Err(e) => println!("\x1b[33maish:\x1b[0m {e}"),
+    }
+}
+
+/// Pop the OLDEST parked question in the tray, if there is one. Returns whether
+/// it was answered.
+///
+/// This is the auto-surfacing half of the question tray: a worker's ask should
+/// not wait for the operator to notice a console note and remember `:answer`.
+/// Called at the idle point of the REPL loop — after a turn has fully landed,
+/// before the prompt is read — which is the only moment the screen is ours and
+/// blocking for a keypress steals nothing.
+///
+/// Three properties are load-bearing:
+///
+/// * **Oldest first, one per pass.** Answering returns `true`; the caller
+///   re-enters the idle pass, which pops the next one — that is the serial
+///   drain. Popping at most one per pass guarantees the operator can always get
+///   a prompt back, because Esc short-circuits the chain immediately.
+/// * **Esc leaves it pending.** Esc decides nothing, here and everywhere else
+///   (`:answer <id>` with no answer behaves identically), so the row survives
+///   and `:dismiss` stays the only way to drop a question unanswered. The row
+///   is re-offered on a later idle pass; that is the nagging, and it is the
+///   point.
+/// * **Attach-independent.** Reads [`crate::question::pending`], NOT
+///   `pending_for(attached_run)`: the tray is the session's, not the attached
+///   worker's, and every popup names its asker (see `PendingQuestion::spec`).
+///
+/// Non-interactive sessions are skipped: piped stdin has nobody to pick, and a
+/// blocking raw-mode read there would hang a script.
+fn surface_pending_question(session: &mut Session) -> bool {
+    if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
+        return false;
+    }
+    let Some(q) = crate::question::pending().into_iter().next() else {
+        return false;
+    };
+    match crate::choice::prompt_choice(q.spec(), crate::escalation::ROWS_PER_BANNER) {
+        Some(answer) => {
+            deliver_question_answer(&q.id, &answer, session);
+            true
+        }
+        None => {
+            println!(
+                "\x1b[2m… {} still pending — :answer {} <option-id>, or :dismiss {}\x1b[0m",
+                q.id, q.id, q.id
+            );
+            false
+        }
     }
 }
 
