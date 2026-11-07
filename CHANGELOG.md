@@ -4,6 +4,11 @@ All notable changes to aish are documented here. Dates are the GitHub release pu
 
 ## [Unreleased]
 
+## [0.77.1] - 2026-11-07
+
+### Fixed
+- **A question the operator already answered is closed out instead of nagging forever.** A parked question only ever left the tray via `:answer`, so two paths left rows pending indefinitely *after* the decision had been made and acted on: an **out-of-band answer**, where the operator steers the worker directly (`:tell w_x option-b`) — the worker receives the steer and acts, but the tray never notices and re-surfaces the row at every startup / attach / idle pass — and **fan-out twins**, where `park` dedupes per *worker*, so three sub-coordinators independently hitting the same fork park three identical rows and answering one leaves the other two nagging. `question::answer_via_message(worker, message)` now lets a `:tell` that names an option answer that worker's matching parked row with the canonical option id (the form the worker's own `pending_for` reader expects), wired into the `:tell` path in `repl.rs`; `question::twins_of(row)` finds other pending rows asking the identical thing (same question text **and** same option set) parked by a different worker, and answering any row answers its twins with **each twin's own asker told separately**, so no worker is left waiting on a decision that's been made. The matcher refuses to guess: `option_named_by` matches only when the trimmed message **is** an option id or label, or **contains exactly one** option id as a whole token — anything else returns `None` and leaves the row pending, with `-`/`_` kept inside a token so `option-b` can't be half-matched by an option called `b` and `unstashed` doesn't match `stash`. The asymmetry is deliberate: an unanswered question costs a re-ask, a wrongly-answered one costs the operator's actual intent (#1150).
+
 ## [0.77.0] - 2026-11-07
 
 ### Added
