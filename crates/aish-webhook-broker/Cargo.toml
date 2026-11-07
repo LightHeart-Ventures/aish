@@ -21,7 +21,7 @@ tokio = { version = "1.36", features = ["full"] }
 
 # Web framework (built-in WebSocket upgrade via the `ws` feature — no separate
 # tokio-tungstenite needed for the server side)
-axum = { version = "0.7", features = ["ws", "macros"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 # Serialization
