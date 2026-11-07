@@ -108,6 +108,19 @@ substantial task, aish recommends an installable one instead (`:skill add`).
   catalog and print each surfaced skill's score + the reasons that moved it.
 - `AISH_SKILL_MATCH_DEBUG=1` — log a `[skill-match] <name> score=NN :: reasons`
   line for every candidate on every turn (stderr).
+- `AISH_SKILL_LLM_DEBUG=1` — log the LLM router's prompt and raw reply (stderr).
+
+### LLM router (primary path)
+
+The scoring above is the **fallback**. By default a lightweight model decides
+first: one tool-less call per substantial turn, shown the catalog
+(`name: description`) and the operator input, answering a single line — `NONE`
+or `SKILL: <name>`. It judges intent instead of token overlap, so it neither
+over-fires on incidental shared words nor misses a request phrased in different
+vocabulary ("CI is red" → `ci-debugger`). The name is validated against the real
+catalog before it can be surfaced; any error or abstention falls through to the
+keyword scorer, so the router can only add hint quality. Disable with
+`AISH_SKILL_LLM=0`.
 
 See [`AISH.md`](../AISH.md) for the agent-facing overview.
 

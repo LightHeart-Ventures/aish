@@ -536,13 +536,37 @@ async fn run_turn_inner(
     // recommendation of an installable registry skill (read from the
     // binary-shipped index — no network on the hot path), so the model surfaces a
     // `:skill add <ref>` suggestion instead of faking or hand-rolling the work.
+    // LLM-gated skill selection: ask a lightweight model whether a skill would
+    // actually help THIS input and which one, instead of trusting token overlap
+    // with the skill's name/description. Keyword scoring both over-fires (a
+    // shared word is not a shared intent) and under-fires ("CI is red" never
+    // tokenizes onto "diagnose failing GitHub Actions runs"). The selector is
+    // best-effort: no credential, disabled via `AISH_SKILL_LLM=0`, a trivial
+    // input, an error, or an abstention all yield `None` and the keyword matcher
+    // below stays in charge — so this can only ADD a hint quality, never remove
+    // the old behaviour. Gated on `is_skill_worthy` so `ls` never pays for a
+    // model call.
+    let llm_hint: Option<String> = if already_hinted
+        || !crate::skill_select::enabled()
+        || session.skills.is_empty()
+        || !crate::skill_match::is_skill_worthy(&match_task)
+    {
+        None
+    } else {
+        match crate::activity_summary::lightweight_backend(session) {
+            Some(backend) => crate::skill_select::select(&backend, &match_task, &session.skills)
+                .await
+                .map(crate::skill_match::hint_for),
+            None => None,
+        }
+    };
     let input = if already_hinted {
         // The brief already carries a skill-awareness block (e.g. an
         // operator-hinted message quoted into a dispatched worker brief) — leave
         // the input alone rather than stacking a second block onto it.
         input
     } else {
-        match crate::skill_match::hint(&match_task, &session.skills) {
+        match llm_hint.or_else(|| crate::skill_match::hint(&match_task, &session.skills)) {
             Some(note) => {
                 // Observe hook: SkillMatched — an INSTALLED skill cleared the
                 // relevance bar for this turn's task and its SKILL.md note was folded
