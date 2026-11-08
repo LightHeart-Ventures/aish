@@ -6892,6 +6892,26 @@ fn attach_worker(id: Option<&str>, session: &mut Session) {
         return;
     }
     let hit = |wid: &str| wid == id || wid.starts_with(id);
+    // AUTHORITATIVE ATTACH: the mode below is chosen from the IN-MEMORY status,
+    // which lags the durable row the tray classifies from (fan-out park +
+    // WAITING_POLL, and the reap race). Reconcile the matching job(s) against
+    // their durable row FIRST — one keyed read each, no polling — so a worker
+    // the tray already shows as `done` opens in review mode with its finished
+    // output instead of an animated "thinking…" backfill. See
+    // `worker::settle_attach_target`.
+    if let Some(store) = &session.coordinator_store {
+        let hits: Vec<String> = session
+            .worker_jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| hit(&w.id))
+            .map(|w| w.id.clone())
+            .collect();
+        for h in &hits {
+            crate::worker::settle_attach_target(&session.worker_jobs, store, h);
+        }
+    }
     // Collect every match in this session's workers, LIVE or terminal — a done/
     // failed coordinator is now attachable too (review + resume): a typed line
     // resumes it from its prior result. `(run_id, terminal)`.
@@ -8497,7 +8517,17 @@ fn cycle_worker(session: &mut Session) -> bool {
         }
         return true;
     }
-    let (run_id, terminal, task) = workers[next_idx - 1].clone();
+    let (run_id, mut terminal, task) = workers[next_idx - 1].clone();
+    // AUTHORITATIVE ATTACH (same reconcile `:attach` does — Shift-Tab is the
+    // OTHER attach path). `terminal` came from the IN-MEMORY status, which lags
+    // the durable row the tray classifies from; one keyed durable read settles
+    // the job so a tray-`done` worker lands in review mode immediately instead
+    // of showing a "thinking…" live pane. Only consulted when the in-memory job
+    // is not already terminal, and a `false` return leaves it live (durable
+    // sub-worker rows are already classified durably by `collect_worker_rows`).
+    if !terminal && let Some(store) = &session.coordinator_store {
+        terminal = crate::worker::settle_attach_target(&session.worker_jobs, store, &run_id);
+    }
     set_attach_slot(&session.attached, Some(run_id.clone()));
     // Same re-surface as `attach_worker` — Shift-Tab is the OTHER attach path,
     // and a question parked by this worker has to reappear on both.
