@@ -2712,12 +2712,21 @@ mod tests {
     /// override in CI can't make this flaky).
     #[test]
     fn call_budget_rejects_junk_and_out_of_range_exports() {
-        let baseline = call_budget(&[]);
+        // HARD must fall back to the compile-time default, never to whatever
+        // the ambient process env holds (an operator may export a real value).
+        // SOFT is untouched by these exports, so compare it against the live
+        // resolution on both sides.
+        let soft_baseline = call_budget(&[]).0;
         for bad in ["0", "-5", "abc", "", "100001"] {
             let env = vec![("AISH_CALL_BUDGET_HARD".to_string(), bad.to_string())];
+            let (soft, hard) = call_budget(&env);
             assert_eq!(
-                call_budget(&env),
-                baseline,
+                soft, soft_baseline,
+                "`{bad}` must not perturb the soft budget"
+            );
+            assert_eq!(
+                hard,
+                crate::loopguard::CALL_BUDGET_HARD,
                 "`{bad}` must not be honoured as a budget"
             );
         }
