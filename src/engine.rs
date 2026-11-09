@@ -1586,11 +1586,33 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
     ) else {
         return;
     };
-    let Some(plan) =
-        crate::context::plan_compaction(&session.history, crate::context::KEEP_RECENT_MSGS)
-    else {
+    // Thrash damper: when the last few compactions each reclaimed almost
+    // nothing, retaining the same tail just re-trips the trigger next turn
+    // (198 compactions / ~111M input tokens in one observed 4-hour window).
+    // Drop a LARGER slice instead — bounded, monotone, floored at
+    // MIN_KEEP_RECENT_MSGS, and disablable with `AISH_COMPACT_DAMPER=0`.
+    let damper_on =
+        crate::context::parse_damper(std::env::var("AISH_COMPACT_DAMPER").ok().as_deref());
+    let streak = if damper_on {
+        session
+            .db
+            .as_ref()
+            .and_then(|db| {
+                db.recent_compactions(&session.session_id, crate::context::DAMPER_STREAK_MAX)
+                    .ok()
+            })
+            .map_or(0, |s| crate::context::thrash_streak(&s, budget.window))
+    } else {
+        0
+    };
+    let keep = crate::context::damped_keep(crate::context::KEEP_RECENT_MSGS, streak);
+    let hist_before = session.history.len();
+    let used_before = session.context_used;
+    let tool_calls_at_trip = tool_calls_in_context;
+    let Some(plan) = crate::context::plan_compaction(&session.history, keep) else {
         return;
     };
+    let offload_bytes = plan.offload.len();
     let dropped = commit_compaction(session, &plan);
     // Surface on the SecondStatusLine flash slot (most-recent wins) instead of
     // printing above the prompt — matching how the `mcp: ready` notice,
@@ -1617,6 +1639,25 @@ fn maybe_compact(backend: &Backend, session: &mut Session) {
             "context",
         );
     }
+    // Structured attribution: one row per compaction so an operator can see
+    // WHICH session compacted, WHICH lever tripped, and how much context the
+    // compaction actually reclaimed (`:telemetry`). Best-effort.
+    if let Some(db) = &session.db {
+        let _ = db.record_compaction(&crate::context::CompactionEvent {
+            session_id: session.session_id.clone(),
+            trigger: trigger.label().to_string(),
+            dropped,
+            hist_before,
+            hist_after: session.history.len(),
+            used_before,
+            used_after: session.context_used,
+            tool_calls_in_context: tool_calls_at_trip,
+            offload_bytes,
+            keep_recent: keep,
+            damped: streak > 0,
+        });
+    }
+
     // No footer to flash onto (piped / headless / non-interactive) — keep the
     // notice visible on stderr so a coordinator log still records the trip.
     if !crate::terminal::footer_active() {

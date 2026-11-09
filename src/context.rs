@@ -1021,3 +1021,293 @@ mod tests {
         assert!(h[1].tool_results.is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Compaction attribution + thrash damper
+// ---------------------------------------------------------------------------
+//
+// A 4-hour window of a real `~/.aish/database/aish.db` held 198 `context
+// compacted` activity rows and ~111M input tokens across 20 coordinator runs
+// (~6M input tokens per run) — the single largest cost lever in the system.
+// The notice was free text, so nothing could answer WHICH session drove those
+// 198 compactions, WHICH lever tripped, or whether a session was *thrashing*
+// (compacting over and over while reclaiming almost nothing). The types below
+// make a compaction attributable (one structured row per event, see
+// `Db::record_compaction`) and damp the thrash case by dropping a larger slice
+// instead of re-tripping the same trigger every turn.
+
+/// Default state of the thrash damper: ON. Disable with `AISH_COMPACT_DAMPER=0`.
+pub const COMPACT_DAMPER_DEFAULT: bool = true;
+
+/// Percentage of the model window a compaction must reclaim to count as
+/// productive. Anything below this is a THRASH sample: the trigger will almost
+/// certainly re-trip on the very next turn, so the slice we dropped was too
+/// small to matter.
+pub const DAMPER_RECLAIM_PCT: usize = 10;
+
+/// Upper bound on the escalation streak the damper will honour. Bounds the
+/// halving in [`damped_keep`] and the lookback in [`thrash_streak`], so the
+/// damper can never loop or walk away unbounded.
+pub const DAMPER_STREAK_MAX: usize = 4;
+
+/// Parse `AISH_COMPACT_DAMPER`: `None`/empty → [`COMPACT_DAMPER_DEFAULT`];
+/// `0`/`off`/`none`/`false`/`no` (case-insensitive) → disabled; `1`/`on`/
+/// `true`/`yes` → enabled; anything else → the default (a typo must not
+/// silently drop the guard, matching [`parse_ceiling`]).
+pub fn parse_damper(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("") => COMPACT_DAMPER_DEFAULT,
+        Some(s)
+            if s.eq_ignore_ascii_case("0")
+                || s.eq_ignore_ascii_case("off")
+                || s.eq_ignore_ascii_case("none")
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("no") =>
+        {
+            false
+        }
+        Some(s)
+            if s.eq_ignore_ascii_case("1")
+                || s.eq_ignore_ascii_case("on")
+                || s.eq_ignore_ascii_case("true")
+                || s.eq_ignore_ascii_case("yes") =>
+        {
+            true
+        }
+        Some(_) => COMPACT_DAMPER_DEFAULT,
+    }
+}
+
+/// One structured compaction record — the attribution row persisted by
+/// `Db::record_compaction` (table `compaction_telemetry`). Everything an
+/// operator needs to answer "which session caused the 198 compactions, and was
+/// any of it productive?" in one query.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionEvent {
+    /// Session that compacted (`Session::session_id`) — the attribution key.
+    pub session_id: String,
+    /// Which lever tripped ([`CompactTrigger::label`]).
+    pub trigger: String,
+    /// Messages spliced out of history.
+    pub dropped: usize,
+    /// `history.len()` before / after the splice.
+    pub hist_before: usize,
+    pub hist_after: usize,
+    /// Running live-token figure before / after (the reclaim is the delta).
+    pub used_before: usize,
+    pub used_after: usize,
+    /// In-context tool calls at trip time (the TASK-321 lever's input).
+    pub tool_calls_in_context: usize,
+    /// Bytes written to the `offloads` table for this compaction.
+    pub offload_bytes: usize,
+    /// Size of the protected recent tail actually used (post-damper).
+    pub keep_recent: usize,
+    /// Whether the thrash damper shrank the tail for this compaction.
+    pub damped: bool,
+}
+
+/// Per-session compaction aggregation for the `:telemetry` surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionCompactions {
+    pub session_id: String,
+    pub compactions: i64,
+    pub dropped_total: i64,
+    /// Sum of `used_before - used_after` across the session's compactions.
+    pub reclaimed_total: i64,
+    /// How many of them the damper escalated.
+    pub damped: i64,
+}
+
+impl SessionCompactions {
+    /// Average messages dropped per compaction (`0.0` when there are none).
+    pub fn avg_dropped(&self) -> f64 {
+        if self.compactions <= 0 {
+            return 0.0;
+        }
+        self.dropped_total as f64 / self.compactions as f64
+    }
+
+    /// Average tokens reclaimed per compaction (`0.0` when there are none).
+    pub fn avg_reclaim(&self) -> f64 {
+        if self.compactions <= 0 {
+            return 0.0;
+        }
+        self.reclaimed_total as f64 / self.compactions as f64
+    }
+}
+
+/// The minimal view of a past compaction the damper reasons over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReclaimSample {
+    pub used_before: usize,
+    pub used_after: usize,
+}
+
+/// True when this compaction reclaimed less than [`DAMPER_RECLAIM_PCT`]% of the
+/// window — i.e. it bought almost no room and the trigger will re-trip. A
+/// `window` of `0` (unknown) is never judged, so the damper stays inert.
+pub fn low_reclaim(s: ReclaimSample, window: usize) -> bool {
+    if window == 0 {
+        return false;
+    }
+    let reclaimed = s.used_before.saturating_sub(s.used_after);
+    reclaimed.saturating_mul(100) < window.saturating_mul(DAMPER_RECLAIM_PCT)
+}
+
+/// Count consecutive low-reclaim compactions from `samples` (NEWEST FIRST),
+/// capped at [`DAMPER_STREAK_MAX`]. A single productive compaction ends the
+/// streak, so the damper relaxes as soon as the session recovers. Pure.
+pub fn thrash_streak(samples: &[ReclaimSample], window: usize) -> usize {
+    let mut n = 0;
+    for s in samples {
+        if !low_reclaim(*s, window) {
+            break;
+        }
+        n += 1;
+        if n >= DAMPER_STREAK_MAX {
+            break;
+        }
+    }
+    n
+}
+
+/// Shrink the protected recent tail in response to a thrash `streak`: halve it
+/// per consecutive low-reclaim compaction, never below
+/// [`MIN_KEEP_RECENT_MSGS`]. Monotone non-increasing in `streak` and bounded on
+/// both ends, so escalation always terminates and the working set is never
+/// gutted. `streak == 0` is an exact no-op. Pure.
+pub fn damped_keep(base_keep: usize, streak: usize) -> usize {
+    if streak == 0 {
+        return base_keep;
+    }
+    let shift = u32::try_from(streak.min(DAMPER_STREAK_MAX)).unwrap_or(1);
+    let keep = base_keep >> shift;
+    keep.max(MIN_KEEP_RECENT_MSGS)
+        .min(base_keep.max(MIN_KEEP_RECENT_MSGS))
+}
+
+#[cfg(test)]
+mod compaction_attribution_tests {
+    use super::*;
+
+    #[test]
+    fn damper_env_parse() {
+        assert!(parse_damper(None));
+        assert!(parse_damper(Some("")));
+        assert!(parse_damper(Some("  ")));
+        for off in ["0", "off", "OFF", "none", "false", "No"] {
+            assert!(!parse_damper(Some(off)), "{off} should disable");
+        }
+        for on in ["1", "on", "TRUE", "yes"] {
+            assert!(parse_damper(Some(on)), "{on} should enable");
+        }
+        // Typos fall back to the default rather than silently dropping it.
+        assert_eq!(parse_damper(Some("offf")), COMPACT_DAMPER_DEFAULT);
+    }
+
+    #[test]
+    fn low_reclaim_judges_against_the_window() {
+        let w = 200_000;
+        // Reclaimed 1k of a 200k window — thrash.
+        assert!(low_reclaim(
+            ReclaimSample {
+                used_before: 160_000,
+                used_after: 159_000
+            },
+            w
+        ));
+        // Reclaimed 60k — productive.
+        assert!(!low_reclaim(
+            ReclaimSample {
+                used_before: 160_000,
+                used_after: 100_000
+            },
+            w
+        ));
+        // Unknown window ⇒ never judged.
+        assert!(!low_reclaim(
+            ReclaimSample {
+                used_before: 10,
+                used_after: 10
+            },
+            0
+        ));
+    }
+
+    #[test]
+    fn thrash_sequence_escalates_the_dropped_slice() {
+        let w = 200_000;
+        let thrash = ReclaimSample {
+            used_before: 160_000,
+            used_after: 159_000,
+        };
+        let good = ReclaimSample {
+            used_before: 160_000,
+            used_after: 40_000,
+        };
+        // A simulated thrash sequence: each extra low-reclaim compaction drops
+        // a strictly larger slice (smaller retained tail) until the floor.
+        let mut prev = usize::MAX;
+        for n in 0..=3 {
+            let samples = vec![thrash; n];
+            let streak = thrash_streak(&samples, w);
+            assert_eq!(streak, n);
+            let keep = damped_keep(KEEP_RECENT_MSGS, streak);
+            assert!(keep <= prev, "keep must not grow: {keep} > {prev}");
+            prev = keep;
+        }
+        assert_eq!(damped_keep(KEEP_RECENT_MSGS, 1), KEEP_RECENT_MSGS / 2);
+        // One productive compaction ends the streak even with thrash behind it.
+        assert_eq!(thrash_streak(&[good, thrash, thrash], w), 0);
+        // Lookback is capped.
+        assert_eq!(thrash_streak(&vec![thrash; 50], w), DAMPER_STREAK_MAX);
+    }
+
+    #[test]
+    fn damper_respects_the_floor_and_is_a_noop_when_disabled() {
+        // Disabled ⇒ streak is never computed, keep stays at the base.
+        assert_eq!(damped_keep(KEEP_RECENT_MSGS, 0), KEEP_RECENT_MSGS);
+        // Floored, no matter how long the streak.
+        for streak in 0..=DAMPER_STREAK_MAX * 4 {
+            let keep = damped_keep(KEEP_RECENT_MSGS, streak);
+            assert!(keep >= MIN_KEEP_RECENT_MSGS, "floor broken at {streak}");
+            assert!(keep <= KEEP_RECENT_MSGS, "keep grew at {streak}");
+        }
+        // Never below the floor even from a tiny base.
+        assert_eq!(damped_keep(1, 3), MIN_KEEP_RECENT_MSGS);
+    }
+
+    #[test]
+    fn aggregation_averages_are_zero_safe() {
+        let empty = SessionCompactions::default();
+        assert_eq!(empty.avg_dropped(), 0.0);
+        assert_eq!(empty.avg_reclaim(), 0.0);
+        let s = SessionCompactions {
+            session_id: "s1".into(),
+            compactions: 4,
+            dropped_total: 40,
+            reclaimed_total: 100,
+            damped: 2,
+        };
+        assert!((s.avg_dropped() - 10.0).abs() < f64::EPSILON);
+        assert!((s.avg_reclaim() - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn every_trigger_label_is_attributable() {
+        // Attribution carries a non-empty label for EVERY lever.
+        for t in [
+            CompactTrigger::WindowPct,
+            CompactTrigger::ToolCalls,
+            CompactTrigger::TokenBudget,
+            CompactTrigger::MsgCount,
+        ] {
+            let ev = CompactionEvent {
+                session_id: "s".into(),
+                trigger: t.label().to_string(),
+                ..Default::default()
+            };
+            assert!(!ev.trigger.is_empty(), "{t:?} has no label");
+        }
+    }
+}

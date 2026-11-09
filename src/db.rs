@@ -102,6 +102,27 @@ impl Db {
              -- `parent_id` gives arbitrary-depth subgoal nesting (indexed so
              -- child lookups are cheap); ON DELETE would orphan children, so the
              -- store deletes subtrees explicitly.
+             -- Context-compaction attribution (crate::context::CompactionEvent).
+             -- One row per compaction so an operator can answer WHICH session
+             -- drove a burst of compactions, WHICH lever tripped, and whether
+             -- any of it actually reclaimed context (the thrash signal the
+             -- damper reads back via `recent_compactions`).
+             CREATE TABLE IF NOT EXISTS compaction_telemetry (
+                 id            INTEGER PRIMARY KEY,
+                 ts            TEXT NOT NULL DEFAULT current_timestamp,
+                 session_id    TEXT NOT NULL DEFAULT '',
+                 trigger_label TEXT NOT NULL DEFAULT '',
+                 dropped       INTEGER NOT NULL DEFAULT 0,
+                 hist_before   INTEGER NOT NULL DEFAULT 0,
+                 hist_after    INTEGER NOT NULL DEFAULT 0,
+                 used_before   INTEGER NOT NULL DEFAULT 0,
+                 used_after    INTEGER NOT NULL DEFAULT 0,
+                 tool_calls    INTEGER NOT NULL DEFAULT 0,
+                 offload_bytes INTEGER NOT NULL DEFAULT 0,
+                 keep_recent   INTEGER NOT NULL DEFAULT 0,
+                 damped        INTEGER NOT NULL DEFAULT 0
+             );
+
              CREATE TABLE IF NOT EXISTS goals (
                  id           TEXT PRIMARY KEY,
                  title        TEXT NOT NULL,
@@ -573,6 +594,91 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // -- Compaction telemetry (crate::context::CompactionEvent) -------------
+
+    /// Append one compaction attribution row. Best-effort at the call site — a
+    /// telemetry write must never sink a real turn.
+    pub fn record_compaction(&self, ev: &crate::context::CompactionEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO compaction_telemetry
+                 (session_id, trigger_label, dropped, hist_before, hist_after,
+                  used_before, used_after, tool_calls, offload_bytes,
+                  keep_recent, damped)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                ev.session_id,
+                ev.trigger,
+                ev.dropped as i64,
+                ev.hist_before as i64,
+                ev.hist_after as i64,
+                ev.used_before as i64,
+                ev.used_after as i64,
+                ev.tool_calls_in_context as i64,
+                ev.offload_bytes as i64,
+                ev.keep_recent as i64,
+                i64::from(ev.damped),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Total number of recorded compactions (all sessions).
+    pub fn compaction_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM compaction_telemetry", [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// Per-session compaction aggregation, busiest session first — the one
+    /// query that answers "which session caused the 198 compactions?".
+    pub fn compaction_totals(&self) -> Result<Vec<crate::context::SessionCompactions>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, count(*), coalesce(sum(dropped), 0),
+                    coalesce(sum(max(used_before - used_after, 0)), 0),
+                    coalesce(sum(damped), 0)
+                 FROM compaction_telemetry
+                 GROUP BY session_id
+                 ORDER BY count(*) DESC, session_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::context::SessionCompactions {
+                session_id: r.get(0)?,
+                compactions: r.get(1)?,
+                dropped_total: r.get(2)?,
+                reclaimed_total: r.get(3)?,
+                damped: r.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// The most recent compactions for one session, NEWEST FIRST — the thrash
+    /// damper's input (`crate::context::thrash_streak`).
+    pub fn recent_compactions(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::context::ReclaimSample>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT used_before, used_after FROM compaction_telemetry
+                 WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id, limit as i64], |r| {
+            Ok(crate::context::ReclaimSample {
+                used_before: r.get::<_, i64>(0)?.max(0) as usize,
+                used_after: r.get::<_, i64>(1)?.max(0) as usize,
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Drop every compaction attribution row (`:telemetry clear`).
+    pub fn clear_compaction_telemetry(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM compaction_telemetry", [])?)
     }
 
     /// Total number of recorded tool-call events.
@@ -1627,6 +1733,82 @@ mod tests {
     }
 
     #[test]
+    fn compaction_telemetry_round_trips_and_aggregates() {
+        use crate::context::{CompactionEvent, ReclaimSample};
+        let db = temp_db("compaction_telemetry");
+        assert_eq!(db.compaction_count().unwrap(), 0);
+
+        let mut ev = CompactionEvent {
+            session_id: "s1".into(),
+            trigger: "window%".into(),
+            dropped: 10,
+            hist_before: 40,
+            hist_after: 30,
+            used_before: 160_000,
+            used_after: 100_000,
+            tool_calls_in_context: 7,
+            offload_bytes: 2048,
+            keep_recent: 12,
+            damped: false,
+        };
+        db.record_compaction(&ev).unwrap();
+        // A second, barely-productive compaction for the same session.
+        ev.dropped = 20;
+        ev.used_after = 159_000;
+        ev.damped = true;
+        db.record_compaction(&ev).unwrap();
+        // ...and one for a different session, so the grouping is exercised.
+        ev.session_id = "s2".into();
+        ev.dropped = 6;
+        ev.used_before = 90_000;
+        ev.used_after = 30_000;
+        ev.damped = false;
+        db.record_compaction(&ev).unwrap();
+        assert_eq!(db.compaction_count().unwrap(), 3);
+
+        // Aggregation: busiest session first, with the right per-session counts.
+        let totals = db.compaction_totals().unwrap();
+        assert_eq!(totals.len(), 2);
+        let s1 = &totals[0];
+        assert_eq!(s1.session_id, "s1");
+        assert_eq!(s1.compactions, 2);
+        assert_eq!(s1.dropped_total, 30);
+        assert_eq!(s1.reclaimed_total, 61_000);
+        assert_eq!(s1.damped, 1);
+        assert!((s1.avg_dropped() - 15.0).abs() < f64::EPSILON);
+        assert!((s1.avg_reclaim() - 30_500.0).abs() < f64::EPSILON);
+        assert_eq!(totals[1].session_id, "s2");
+        assert_eq!(totals[1].compactions, 1);
+
+        // Newest-first slice is what the thrash damper reads back.
+        let recent = db.recent_compactions("s1", 2).unwrap();
+        assert_eq!(
+            recent,
+            vec![
+                ReclaimSample {
+                    used_before: 160_000,
+                    used_after: 159_000
+                },
+                ReclaimSample {
+                    used_before: 160_000,
+                    used_after: 100_000
+                },
+            ]
+        );
+        assert!(db.recent_compactions("nobody", 4).unwrap().is_empty());
+        let streak = crate::context::thrash_streak(&recent, 200_000);
+        assert_eq!(streak, 1, "head sample reclaimed <10% of the window");
+        assert!(
+            crate::context::damped_keep(crate::context::KEEP_RECENT_MSGS, streak)
+                < crate::context::KEEP_RECENT_MSGS
+        );
+
+        assert_eq!(db.clear_compaction_telemetry().unwrap(), 3);
+        assert_eq!(db.compaction_count().unwrap(), 0);
+    }
+
+    #[test]
+
     fn vector_extension_is_loaded() {
         let db = temp_db("vec");
         let v = db.vec_version().unwrap();

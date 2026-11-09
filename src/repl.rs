@@ -10997,8 +10997,19 @@ fn handle_telemetry(args: Vec<&str>, session: &mut Session) {
                 Ok(n) => println!("telemetry cleared — {n} row(s) removed"),
                 Err(e) => println!("clear failed: {e:#}"),
             }
+            match db.clear_compaction_telemetry() {
+                Ok(n) if n > 0 => println!("compaction telemetry cleared — {n} row(s) removed"),
+                Ok(_) => {}
+                Err(e) => println!("compaction clear failed: {e:#}"),
+            }
             // Wiping the table invalidates any pre-aggregated snapshot (TASK-252).
             session.tool_telemetry_cache = None;
+        }
+        // `:telemetry compactions` — context-compaction attribution. One row
+        // per compaction is persisted by the engine, so this answers "which
+        // session drove the compactions, and did they reclaim anything?".
+        Some("compactions" | "compaction" | "compact") => {
+            render_compaction_report(session.db.as_ref().unwrap());
         }
         _ => {
             // Pre-aggregated read: served from the 60s Session cache on a hit,
@@ -11779,6 +11790,7 @@ async fn handle_colon(
                  :memories [organize]                list stored memories, or dedup them\n\
                  :remember <note>                    capture a rich, context-enriched memory — folds your short note together with recent session context into ONE durable memory\n\
                  :telemetry [clear]                  tool-call failure/retry-recovery stats (or wipe them)\n\
+                 :telemetry compactions              per-session context-compaction attribution (count, avg drop, avg reclaim)\n\
                  :telemetry skill-match <task>       show why the semantic matcher ranks skills for a task\n\
                  :tokens                             per-run/aggregate token spend, in:out ratio, top spenders\n\
                  :version                            version, channel, build tag, binary path (also `aish --version`)\n\
@@ -17994,6 +18006,47 @@ mod liftoff_label_tests {
         assert!(
             !liftoff_should_suspend_echo(libc::ICANON),
             "echo already off: another owner holds stdin, don't nest"
+        );
+    }
+}
+
+/// Render the per-session context-compaction attribution table
+/// (`:telemetry compactions`).
+///
+/// A real 4-hour window held 198 `context compacted` events and ~111M input
+/// tokens across 20 coordinator runs; the notice was free text, so nothing
+/// could say WHICH session drove them. Each compaction now persists a
+/// structured row (`crate::context::CompactionEvent`), and this is the
+/// one-command read of it: busiest session first, with the average messages
+/// dropped, the average context reclaimed, and how many compactions the thrash
+/// damper had to escalate.
+fn render_compaction_report(db: &crate::db::Db) {
+    let total = db.compaction_count().unwrap_or(0);
+    if total == 0 {
+        println!("no compactions recorded yet");
+        return;
+    }
+    let rows = match db.compaction_totals() {
+        Ok(r) => r,
+        Err(e) => {
+            println!("compaction telemetry unavailable: {e:#}");
+            return;
+        }
+    };
+    println!("compactions: {total} across {} session(s)", rows.len());
+    println!(
+        "{:<26} {:>6} {:>9} {:>12} {:>7}",
+        "session", "count", "avg drop", "avg reclaim", "damped"
+    );
+    for r in rows.iter().take(20) {
+        let sid: String = r.session_id.chars().take(26).collect();
+        println!(
+            "{:<26} {:>6} {:>9.1} {:>12.0} {:>7}",
+            sid,
+            r.compactions,
+            r.avg_dropped(),
+            r.avg_reclaim(),
+            r.damped
         );
     }
 }
