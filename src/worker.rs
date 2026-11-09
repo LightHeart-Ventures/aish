@@ -3604,7 +3604,90 @@ async fn await_waiting_settle(
     }
 }
 
+/// Does a DURABLE phase PROVE this run already finished? `Some(failed)` →
+/// settle the in-memory job with that verdict; `None` → hold (still live, or we
+/// have no proof either way).
+///
+/// Deliberately stricter than [`waiting_verdict`]: a MISSING row returns `None`
+/// here. `waiting_verdict` runs inside the worker's own task, where "no row
+/// will ever settle me" means settle-or-strand; this one runs on the OPERATOR's
+/// attach keystroke, where guessing `done` for a row that simply hasn't been
+/// written yet would print "(empty result)" over a live worker. Holding is
+/// always safe — the attach just shows the live view.
+fn durable_terminal_verdict(phase: Option<&str>) -> Option<bool> {
+    match phase {
+        Some("done") => Some(false),
+        Some("failed") => Some(true),
+        _ => None,
+    }
+}
+
+/// AUTHORITATIVE ATTACH: reconcile ONE job against its durable row before the
+/// `:attach` / Shift-Tab path branches on [`WorkerJob::is_terminal`]. Returns
+/// whether the job is terminal AFTER the reconcile.
+///
+/// There are two sources of truth for "this worker is done" and they settle at
+/// different times. The escalation tray classifies a row from the child's
+/// DURABLE `coordinator_runs` phase (`escalation::phase`), so it says `done` the
+/// instant the child stamps its terminal row. `:attach`/Shift-Tab branch on the
+/// parent's IN-MEMORY `status`, which only flips when the parent's post-exit
+/// work runs — and that lags in two ways:
+///
+/// * a fan-out parent parks at `waiting` ([`WorkerJob::set_waiting`]) and
+///   catches up only through [`await_waiting_settle`]'s [`WAITING_POLL`] (5s);
+/// * the reap race, where the child's durable terminal write lands before the
+///   parent's `set_done`.
+///
+/// Either way the operator attached to a row the tray already showed as `done`
+/// and got an animated "thinking…" backfill spinner until the in-memory status
+/// caught up. One keyed durable read closes the gap, with NO new polling: the
+/// read happens on the keystroke, and only when the in-memory job is not
+/// already terminal.
+pub fn settle_attach_target(
+    jobs: &WorkerJobs,
+    store: &crate::db::CoordinatorStore,
+    id: &str,
+) -> bool {
+    // Clone the handle out: the settle touches the job's own mutex and the
+    // escalation banners, so we must not still hold the jobs list lock.
+    let job = jobs.lock().unwrap().iter().find(|j| j.id == id).cloned();
+    job.is_some_and(|j| j.settle_if_durably_terminal(store))
+}
+
 impl WorkerJob {
+    /// One keyed durable read; settle the in-memory job iff the row proves it
+    /// finished. Returns whether the job is terminal afterwards. See
+    /// [`settle_attach_target`] for why the attach path needs this.
+    fn settle_if_durably_terminal(&self, store: &crate::db::CoordinatorStore) -> bool {
+        if self.is_terminal() {
+            return true;
+        }
+        let Some(row) = store.result_for_run(&self.run_id()).ok().flatten() else {
+            return false;
+        };
+        let Some(failed) = durable_terminal_verdict(Some(&row.phase)) else {
+            return false;
+        };
+        // Reap race: the durable row can carry the final payload while the
+        // in-memory job's `result` is still empty (the parent never reached
+        // `set_done`). Adopt the durable text so the pane prints the real
+        // answer instead of "(empty result)". A parked job already stored its
+        // result at park time — don't clobber it.
+        {
+            let mut i = self.inner.lock().unwrap();
+            if i.result.is_none() {
+                i.result = row.result.clone();
+            }
+            if failed && i.error.is_none() {
+                i.error = row.error.clone();
+            }
+        }
+        // Same stamping `set_done` does — `finished` + the frozen tray glyph —
+        // which is also what re-arms exactly-once result delivery.
+        self.settle_from_waiting(failed);
+        true
+    }
+
     fn set_done(&self, result: String) {
         let mut i = self.inner.lock().unwrap();
         i.status = "done".into();
@@ -5795,6 +5878,156 @@ for operator after 4 auto-recovery attempt(s)";
         let after = store.result_for_run("w_stale").unwrap().unwrap();
         assert_eq!(after.phase, "done");
         assert!(!phase_needs_reconcile(&after.phase));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── AUTHORITATIVE ATTACH: the tray says `done`, so the attach must too ──
+    //
+    // The tray classifies from the child's DURABLE `coordinator_runs` phase;
+    // `:attach`/Shift-Tab branch on the parent's IN-MEMORY status, which lags
+    // (a fan-out parent parks at `waiting` and catches up only on the 5s
+    // WAITING_POLL; and the reap race lands the durable terminal write before
+    // the parent's `set_done`). One keyed durable read on the keystroke closes
+    // the gap — these tests pin that read's verdict table and its effects.
+
+    /// A scratch `CoordinatorStore` in its own directory (tests run in
+    /// parallel, so the dir must be unique per test, not per process).
+    fn attach_test_store(tag: &str) -> (std::path::PathBuf, crate::db::CoordinatorStore) {
+        let dir = std::env::temp_dir().join(format!("aish-attach-{}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = crate::db::CoordinatorStore::open(&dir.join("aish.db")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn durable_verdict_settles_only_on_proof() {
+        // The child's own terminal verdicts — the only two that settle.
+        assert_eq!(durable_terminal_verdict(Some("done")), Some(false));
+        assert_eq!(durable_terminal_verdict(Some("failed")), Some(true));
+        // Live or mid-flight phases: hold, so the attach shows the live view.
+        assert_eq!(durable_terminal_verdict(Some("running")), None);
+        assert_eq!(durable_terminal_verdict(Some("coordinating")), None);
+        assert_eq!(durable_terminal_verdict(Some("waiting")), None);
+        // STRICTER than `waiting_verdict`: a missing row is NOT proof of done.
+        // Guessing here would print "(empty result)" over a live worker.
+        assert_eq!(durable_terminal_verdict(None), None);
+    }
+
+    #[test]
+    fn attach_settles_a_parked_job_whose_durable_row_is_done() {
+        let (dir, store) = attach_test_store("parked-done");
+        let job = barrier_test_job("w_parked_done", Some(11));
+        // Fan-out parent: own turns over, result stored, parked at `waiting`.
+        job.set_waiting("the final answer".into());
+        assert!(
+            !job.is_terminal(),
+            "a parked job is deliberately not terminal"
+        );
+
+        store
+            .insert("w_parked_done", "fan out three things", "sess", None)
+            .unwrap();
+        store.set_done("w_parked_done", "the final answer").unwrap();
+
+        let jobs: WorkerJobs = Arc::new(Mutex::new(vec![job.clone()]));
+        let t0 = std::time::Instant::now();
+        assert!(
+            settle_attach_target(&jobs, &store, "w_parked_done"),
+            "a durably-done row must settle the in-memory job on the attach path"
+        );
+        // NO polling was reintroduced: the settle is one keyed read, so it
+        // cannot have waited on WAITING_POLL (5s).
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "the attach settle must not sleep (took {:?})",
+            t0.elapsed()
+        );
+        assert!(job.is_terminal());
+        assert_eq!(job.status(), "done");
+        assert_eq!(
+            job.fetch(),
+            "the final answer",
+            "the finished output must be available immediately"
+        );
+
+        // Delivery is still EXACTLY once: settling re-arms it, and the second
+        // drain finds nothing.
+        assert_eq!(drain_pending(&jobs).len(), 1, "result delivered once");
+        assert!(
+            drain_pending(&jobs).is_empty(),
+            "no duplicate delivery after settle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_leaves_a_still_running_job_alone() {
+        let (dir, store) = attach_test_store("still-running");
+        let job = barrier_test_job("w_live", Some(12));
+        // Row exists but the child has not finished: inserts land as
+        // `coordinating`.
+        store.insert("w_live", "long job", "sess", None).unwrap();
+
+        let jobs: WorkerJobs = Arc::new(Mutex::new(vec![job.clone()]));
+        assert!(
+            !settle_attach_target(&jobs, &store, "w_live"),
+            "a non-terminal durable row must not settle the job"
+        );
+        assert!(!job.is_terminal(), "attach shows the LIVE view");
+        assert_eq!(job.status(), "running");
+        assert!(
+            drain_pending(&jobs).is_empty(),
+            "a live worker delivers nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_settles_a_failed_durable_row() {
+        let (dir, store) = attach_test_store("failed");
+        let job = barrier_test_job("w_failed", Some(13));
+        job.set_waiting("partial".into());
+        store.insert("w_failed", "risky job", "sess", None).unwrap();
+        store.set_failed("w_failed", "exit status 1").unwrap();
+
+        let jobs: WorkerJobs = Arc::new(Mutex::new(vec![job.clone()]));
+        assert!(settle_attach_target(&jobs, &store, "w_failed"));
+        assert_eq!(job.status(), "failed");
+        assert!(job.is_terminal());
+        assert!(
+            job.fetch().contains("exit status 1"),
+            "the durable error must surface: {}",
+            job.fetch()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_adopts_the_durable_payload_on_the_reap_race() {
+        let (dir, store) = attach_test_store("reap-race");
+        // Reap race: the child stamped its terminal row WITH the payload, but
+        // the parent never reached `set_done`, so the in-memory result is
+        // empty. Settling without adopting the row would print
+        // "(empty result)".
+        let job = barrier_test_job("w_reap", Some(14));
+        store.insert("w_reap", "ship it", "sess", None).unwrap();
+        store.set_done("w_reap", "shipped PR #7").unwrap();
+
+        let jobs: WorkerJobs = Arc::new(Mutex::new(vec![job.clone()]));
+        assert!(settle_attach_target(&jobs, &store, "w_reap"));
+        assert_eq!(job.status(), "done");
+        assert_eq!(job.fetch(), "shipped PR #7");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_settle_is_a_noop_for_an_unknown_id() {
+        let (dir, store) = attach_test_store("unknown");
+        let jobs: WorkerJobs = Arc::new(Mutex::new(vec![barrier_test_job("w_known", Some(15))]));
+        assert!(
+            !settle_attach_target(&jobs, &store, "w_nope"),
+            "an id with no job must report non-terminal, not panic"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
