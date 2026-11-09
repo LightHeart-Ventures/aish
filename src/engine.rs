@@ -1118,6 +1118,17 @@ calls and no work."
                     w.record_tool_result(&call.id, &call.name, &result.content, result.is_error);
                 }
                 session.record_turn_tool(desc.clone(), result.clone());
+                // Tally the refusal. This `continue` never reaches the
+                // `tool_telemetry::record` call below, so without this the
+                // retry ledger loses exactly the calls that are failing hardest
+                // (a loop-blocked tool is by definition one being hammered) AND
+                // the model's next attempt at the same tool isn't seen as a
+                // retry at all, because nothing armed `tool_failures`.
+                crate::tool_telemetry::record_blocked(
+                    session,
+                    &call.name,
+                    crate::tool_telemetry::CLASS_LOOP_BLOCKED,
+                );
                 results.push(result);
                 if matches!(repeat, crate::loopguard::RepeatAction::Break) {
                     loop_break = Some((desc.clone(), repeat_count));
@@ -1204,6 +1215,15 @@ calls and no work."
                             .fire_observe(crate::hooks::HookEvent::PermissionDenied, dp);
                     }
                     session.record_turn_tool(desc.clone(), result.clone());
+                    // Tally the veto — same reason as the loop-blocked path
+                    // above: this `continue` skips `tool_telemetry::record`, so
+                    // a hook-denied call would neither count as a failure nor
+                    // arm retry detection for the model's next attempt.
+                    crate::tool_telemetry::record_blocked(
+                        session,
+                        &call.name,
+                        crate::tool_telemetry::CLASS_HOOK_DENY,
+                    );
                     results.push(result);
                     continue;
                 }

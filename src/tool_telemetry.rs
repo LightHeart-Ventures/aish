@@ -316,7 +316,11 @@ pub fn aggregate_cached(session: &mut Session) -> Option<TelemetryCache> {
     Some(snap)
 }
 
-/// Record one completed tool call. Best-effort: updates the session's
+/// `error_class` for a call the repeat-call guard refused before it ran.
+pub const CLASS_LOOP_BLOCKED: &str = "loop-blocked";
+/// `error_class` for a call a permission hook vetoed before it ran.
+pub const CLASS_HOOK_DENY: &str = "hook-deny";
+
 /// Record one completed tool call. Best-effort: updates the session's
 /// last-unresolved-failure map (for retry detection) and appends the event to
 /// the session ring buffer, flushing to SQLite as one transaction when the
@@ -324,15 +328,42 @@ pub fn aggregate_cached(session: &mut Session) -> Option<TelemetryCache> {
 /// telemetry must never break a real turn. No-op when no persistent store is
 /// attached. Set `AISH_TELEMETRY_UNBUFFERED=1` to restore per-call inserts.
 pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
-    let prev = session.tool_failures.get(tool).cloned();
-    let is_retry = prev.is_some();
-
     let error_class = if result.is_error {
         Some(classify(&result.content).as_str().to_string())
     } else {
         None
     };
-    let recovered = is_retry && !result.is_error;
+    record_outcome(session, tool, result.is_error, error_class);
+}
+
+/// Record one tool call that was BLOCKED before it ever executed: the
+/// repeat-call guard refused it ([`CLASS_LOOP_BLOCKED`]) or a permission hook
+/// vetoed it ([`CLASS_HOOK_DENY`]).
+///
+/// These two paths `continue` out of the executor loop in `engine.rs` WITHOUT
+/// reaching [`record`], and both synthesise an `is_error` result the model then
+/// retries. Left untallied they punch two holes in the retry ledger: the
+/// blocked call never arms `tool_failures`, so the model's next attempt at the
+/// same tool is not seen as a retry at all; and the table under-counts failures
+/// precisely for the tools that are failing hardest (a loop-blocked tool is by
+/// definition one being called over and over). Routing them through the same
+/// core keeps "every executed-or-refused call is tallied exactly once" true.
+pub fn record_blocked(session: &mut Session, tool: &str, class: &str) {
+    record_outcome(session, tool, true, Some(class.to_string()));
+}
+
+/// Shared core behind [`record`] and [`record_blocked`]: maintain the
+/// session-local pending-failure map, derive `is_retry` / `recovered` from it,
+/// invalidate the `:telemetry` aggregate cache, and hand the row to [`persist`].
+///
+/// `recovered` is deliberately stamped on the SUCCESS row that follows a failure
+/// of the same tool — never on an error row. Any query that filters to
+/// `is_error = 1` therefore reads `recovered = 0` by construction; recovery has
+/// to be aggregated over `is_retry = 1` (see `Db::tool_telemetry_retry_stats`).
+fn record_outcome(session: &mut Session, tool: &str, is_error: bool, error_class: Option<String>) {
+    let prev = session.tool_failures.get(tool).cloned();
+    let is_retry = prev.is_some();
+    let recovered = is_retry && !is_error;
 
     // Update the pending-failure map: a failure (re)arms it, a success clears it.
     // This is session-local retry state and must update whether or not a store
@@ -355,7 +386,7 @@ pub fn record(session: &mut Session, tool: &str, result: &ToolResult) {
 
     let ev = ToolEvent {
         tool: tool.to_string(),
-        is_error: result.is_error,
+        is_error,
         error_class,
         is_retry,
         recovered,
@@ -739,7 +770,22 @@ pub fn render_report(
 
     // Retry / fallback recovery table.
     if !retries.is_empty() {
+        let retries_total: i64 = retries.iter().map(|r| r.retries).sum();
+        let recovered_total: i64 = retries.iter().map(|r| r.recovered).sum();
         out.push_str("\nretry / fallback recovery (did the one smart fix work?)\n");
+        // Headline the aggregate BEFORE the per-tool rows. A reader who saw only
+        // the table could read an all-zero RECOVERED column as a broken flag;
+        // stating "0 of N retries recovered" makes the claim explicit and
+        // falsifiable, so the number can't be mistaken for missing telemetry.
+        out.push_str(&format!(
+            "{recovered_total} of {retries_total} retries recovered ({:.0}% recovery rate)\n",
+            fail_rate(recovered_total, retries_total) * 100.0
+        ));
+        if recovered_total == 0 {
+            out.push_str(
+                "⚠ 0 recovered: the \"one smart fix\" is not working on these — escalate instead\n",
+            );
+        }
         out.push_str(&format!(
             "{:<24} {:<14} {:>7} {:>9} {:>6}\n",
             "TOOL", "ERROR CLASS", "RETRIES", "RECOVERED", "RATE"
@@ -758,6 +804,9 @@ pub fn render_report(
         }
         out.push_str(
             "\ntip: high recovery% ⇒ worth an auto-retry; low ⇒ escalate/refresh creds instead\n",
+        );
+        out.push_str(
+            "note: `recovered` is stamped on the SUCCESS row AFTER a failure, so any query\n      filtered to `is_error = 1` always reads 0 — aggregate over `is_retry = 1`.\n",
         );
     }
     out
@@ -1316,6 +1365,63 @@ mod tests {
         );
     }
 
+    // -- retry / recovery ledger (the `recovered = 0` investigation) --------
+    //
+    // These drive the REAL code path (`record` → `persist` → SQLite) and assert
+    // against the persisted table via `tool_telemetry_retry_stats`, not against
+    // the in-memory struct: the question "did the one smart fix work?" is only
+    // answerable if `recovered` survives the write path.
+
+    fn err(msg: &str) -> ToolResult {
+        ToolResult::text("t", msg, true)
+    }
+    fn ok() -> ToolResult {
+        ToolResult::text("t", "done", false)
+    }
+
+    #[test]
+    fn fail_then_retry_success_persists_recovered() {
+        let dir = tele_tmp("rec_ok");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_batch_size = 100; // force the buffered path
+        record(&mut s, "run_program", &err("Error: request timed out"));
+        record(&mut s, "run_program", &ok());
+        flush(&mut s);
+
+        let stats = s.db.as_ref().unwrap().tool_telemetry_retry_stats().unwrap();
+        assert_eq!(stats.len(), 1, "exactly one retry row: {stats:?}");
+        let r = &stats[0];
+        assert_eq!(r.tool, "run_program");
+        assert_eq!(
+            r.prev_class, "timeout",
+            "retry remembers what it recovered from"
+        );
+        assert_eq!(r.retries, 1, "the success is the is_retry = 1 row");
+        assert_eq!(r.recovered, 1, "recovered must survive the write path");
+    }
+
+    #[test]
+    fn fail_then_retry_failure_stays_unrecovered() {
+        let dir = tele_tmp("rec_fail");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_batch_size = 100;
+        record(&mut s, "run_program", &err("Error: request timed out"));
+        record(
+            &mut s,
+            "run_program",
+            &err("Error: request timed out again"),
+        );
+        flush(&mut s);
+
+        let stats = s.db.as_ref().unwrap().tool_telemetry_retry_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].retries, 1);
+        assert_eq!(
+            stats[0].recovered, 0,
+            "a failed retry never counts as recovery"
+        );
+    }
+
     #[test]
     fn different_target_is_not_blocked() {
         let dir = tele_tmp("nf_other");
@@ -1406,6 +1512,127 @@ mod tests {
         assert!(
             notfound_guard_check(&mut s, "read_file", &args).is_none(),
             "disabled guard never blocks"
+        );
+    }
+
+    #[test]
+    fn success_clears_pending_failure() {
+        let dir = tele_tmp("rec_clear");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_batch_size = 100;
+        record(&mut s, "run_program", &err("ENOENT: no such file"));
+        assert!(s.tool_failures.contains_key("run_program"));
+        record(&mut s, "run_program", &ok());
+        assert!(
+            !s.tool_failures.contains_key("run_program"),
+            "a success must disarm retry detection"
+        );
+        // A second, unrelated success is NOT a retry — otherwise every call after
+        // one failure would be counted forever.
+        record(&mut s, "run_program", &ok());
+        flush(&mut s);
+        let stats = s.db.as_ref().unwrap().tool_telemetry_retry_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].retries, 1, "only the first success is a retry");
+        assert_eq!(stats[0].recovered, 1);
+    }
+
+    #[test]
+    fn unbuffered_path_also_persists_recovered() {
+        let dir = tele_tmp("rec_unbuf");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_unbuffered = true; // AISH_TELEMETRY_UNBUFFERED=1
+        record(&mut s, "read_file", &err("permission denied"));
+        record(&mut s, "read_file", &ok());
+        // No flush: the unbuffered path must have written both rows already.
+        assert!(s.tool_telemetry_buf.is_empty());
+        assert_eq!(s.db.as_ref().unwrap().tool_telemetry_count().unwrap(), 2);
+        let stats = s.db.as_ref().unwrap().tool_telemetry_retry_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].prev_class, "permission");
+        assert_eq!(stats[0].retries, 1);
+        assert_eq!(stats[0].recovered, 1);
+    }
+
+    #[test]
+    fn recovery_aggregates_across_tools() {
+        let dir = tele_tmp("rec_agg");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_batch_size = 100;
+        // run_program: fail → success (recovered)
+        record(&mut s, "run_program", &err("Error: timed out"));
+        record(&mut s, "run_program", &ok());
+        // read_file: fail → fail (not recovered)
+        record(&mut s, "read_file", &err("ENOENT"));
+        record(&mut s, "read_file", &err("ENOENT"));
+        flush(&mut s);
+
+        let stats = s.db.as_ref().unwrap().tool_telemetry_retry_stats().unwrap();
+        let retries: i64 = stats.iter().map(|r| r.retries).sum();
+        let recovered: i64 = stats.iter().map(|r| r.recovered).sum();
+        assert_eq!(retries, 2);
+        assert_eq!(recovered, 1, "1 of 2 retries recovered");
+    }
+
+    #[test]
+    fn blocked_calls_are_tallied_and_arm_retry_detection() {
+        // A loop-blocked / hook-denied call never executes, but the model sees an
+        // error and tries again. Before the fix these paths `continue`d past
+        // `record`, so the next attempt wasn't seen as a retry at all.
+        let dir = tele_tmp("rec_blocked");
+        let mut s = tele_session(&dir);
+        s.tool_telemetry_batch_size = 100;
+        record_blocked(&mut s, "run_program", CLASS_LOOP_BLOCKED);
+        assert_eq!(
+            s.tool_failures.get("run_program").map(String::as_str),
+            Some(CLASS_LOOP_BLOCKED),
+            "a refused call must arm retry detection"
+        );
+        record(&mut s, "run_program", &ok());
+        flush(&mut s);
+
+        let db = s.db.as_ref().unwrap();
+        assert_eq!(
+            db.tool_telemetry_count().unwrap(),
+            2,
+            "refusal is tallied once"
+        );
+        let totals = db.tool_telemetry_totals().unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].calls, 2);
+        assert_eq!(totals[0].failures, 1, "the refusal counts as a failure");
+        let stats = db.tool_telemetry_retry_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].prev_class, CLASS_LOOP_BLOCKED);
+        assert_eq!(stats[0].retries, 1);
+        assert_eq!(stats[0].recovered, 1);
+    }
+
+    #[test]
+    fn render_report_states_zero_recovery_explicitly() {
+        // The observed production shape: 35 retries, none recovered. The report
+        // must SAY that, so it can't be mistaken for a broken flag.
+        let totals = vec![ToolTotals {
+            tool: "run_program".into(),
+            calls: 116,
+            failures: 116,
+        }];
+        let retries = vec![RetryStat {
+            tool: "run_program".into(),
+            prev_class: "timeout".into(),
+            retries: 35,
+            recovered: 0,
+        }];
+        let s = render_report(116, &totals, &[], &retries);
+        assert!(s.contains("0 of 35 retries recovered"), "{s}");
+        assert!(s.contains("0% recovery rate"), "{s}");
+        assert!(
+            s.contains("not working"),
+            "must call out the failed fix: {s}"
+        );
+        assert!(
+            s.contains("aggregate over `is_retry = 1`"),
+            "must document where recovery lives: {s}"
         );
     }
 }
