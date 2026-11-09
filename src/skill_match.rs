@@ -306,17 +306,137 @@ fn strip_hint_blocks(text: &str) -> String {
 pub const REPOSPEC_FILE: &str = ".repospec.json";
 
 /// A short reminder to fold in ALONGSIDE a skill-awareness hint when a
-/// [`REPOSPEC_FILE`] exists in the working directory. A matched skill's SKILL.md
-/// steps are generic; the repo's `.repospec.json` carries the project-specific
-/// conventions that should shape HOW those steps are applied here. The engine
-/// does the cwd existence check (keeping [`hint`] pure) and appends this note so
-/// the model reads the spec first and keeps it in mind while following the skill.
+/// [`REPOSPEC_FILE`] exists in the working directory AND the task is repo-facing
+/// per [`task_needs_repospec`]. A matched skill's SKILL.md steps are generic;
+/// the repo's `.repospec.json` carries the project-specific conventions that
+/// should shape HOW those steps are applied here. The engine does the cwd
+/// existence check and the intent gate (keeping [`hint`] pure) and appends this
+/// note so the model reads the spec before the code work it's about to do.
 pub fn repospec_reminder() -> String {
     format!(
-        "[aish skill-awareness] This repo has a `{REPOSPEC_FILE}` — read it FIRST and keep its \
-conventions (build/test commands, layout, guardrails) in mind while applying the skill above; \
-let the repo spec win where it conflicts with the skill's generic steps."
+        "[aish skill-awareness] This repo has a `{REPOSPEC_FILE}` — read it first (unless you \
+already did this session) and keep its conventions (build/test commands, layout, guardrails) in \
+mind while applying the skill above; let the repo spec win where it conflicts with the skill's \
+generic steps."
     )
+}
+
+/// Words signalling the task intends to CHANGE the repo — the moment a project's
+/// own conventions (build/test commands, layout, guardrails) actually bind.
+/// Matched with [`token_matches`] prefix semantics, so `build` covers `building`
+/// and `refactor` covers `refactoring`; the few stems under four chars (`fix`,
+/// `add`) get no free prefix expansion and so list their inflections.
+const REPO_CHANGE_WORDS: &[&str] = &[
+    "add",
+    "adding",
+    "adds",
+    "build",
+    "bump",
+    "change",
+    "commit",
+    "compile",
+    "configure",
+    "create",
+    "delete",
+    "deprecate",
+    "diff",
+    "disable",
+    "drop",
+    "edit",
+    "enable",
+    "extend",
+    "fix",
+    "fixes",
+    "fixing",
+    "harden",
+    "implement",
+    "install",
+    "integrate",
+    "lint",
+    "merge",
+    "migrate",
+    "modify",
+    "optimize",
+    "patch",
+    "publish",
+    "rebase",
+    "refactor",
+    "release",
+    "remove",
+    "rename",
+    "replace",
+    "resolve",
+    "revert",
+    "rewrite",
+    "scaffold",
+    "ship",
+    "test",
+    "tweak",
+    "update",
+    "upgrade",
+    "wire",
+    "write",
+];
+
+/// Words signalling the task intends to SEARCH or NAVIGATE the repo — the other
+/// case where the spec earns its read, since it maps the tree and names the key
+/// files. Same prefix-matching semantics as [`REPO_CHANGE_WORDS`].
+const REPO_SEARCH_WORDS: &[&str] = &[
+    "architecture",
+    "audit",
+    "caller",
+    "class",
+    "code",
+    "defined",
+    "definition",
+    "file",
+    "find",
+    "function",
+    "grep",
+    "implementation",
+    "inspect",
+    "layout",
+    "locate",
+    "map",
+    "module",
+    "repo",
+    "review",
+    "scan",
+    "search",
+    "struct",
+    "symbol",
+    "trace",
+    "usage",
+    "where",
+    "which",
+];
+
+/// Lowercased words of `s` at least three chars long, WITHOUT the [`STOPWORDS`]
+/// filter [`tokens`] applies. Intent detection needs words that are noise for
+/// relevance scoring — `where`, `which`, `write`, `make` are all stopwords yet
+/// are exactly the signal [`task_needs_repospec`] looks for.
+fn intent_words(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w.len() >= 3)
+}
+
+/// Whether `task` is the kind of work for which a repo's [`REPOSPEC_FILE`]
+/// actually earns a read: the task intends to CHANGE the repo, or to SEARCH /
+/// navigate it. A task that merely happens to RUN inside a repo — "sprint
+/// status", "what's running", "cost breakdown" — gets no reminder, which is the
+/// whole point: the spec is a tool for code work, not a toll on every turn.
+///
+/// Deliberately generous (any single intent word qualifies): a false positive
+/// costs one line of prompt, a false negative costs the model the repo's
+/// conventions at the exact moment they bind.
+pub fn task_needs_repospec(task: &str) -> bool {
+    intent_words(task).any(|w| {
+        REPO_CHANGE_WORDS
+            .iter()
+            .chain(REPO_SEARCH_WORDS.iter())
+            .any(|k| token_matches(&w, k))
+    })
 }
 
 /// Minimum number of SIGNIFICANT tokens (after stopword/short-word filtering) a
@@ -955,6 +1075,65 @@ You are running headless as an autonomous aish coordinator. Validate with cargo 
         assert!(r.starts_with("[aish skill-awareness]"), "{r}");
         assert!(r.contains(REPOSPEC_FILE), "{r}");
         assert_eq!(REPOSPEC_FILE, ".repospec.json");
+    }
+
+    #[test]
+    fn task_needs_repospec_fires_when_about_to_change_the_repo() {
+        for task in [
+            "fix the broken test in the parser",
+            "fixing the flaky CI job",
+            "add a --json flag to the status command",
+            "refactoring the engine module",
+            "bump the version and ship it",
+            "update the README",
+            "implement the retry logic",
+            "wire the gate into the engine",
+            "run the test suite",
+            "fix and open pr",
+        ] {
+            assert!(task_needs_repospec(task), "should fire: {task}");
+        }
+    }
+
+    #[test]
+    fn task_needs_repospec_fires_when_searching_the_repo() {
+        for task in [
+            "where is the system prompt defined",
+            "find every caller of hint()",
+            "grep for TODO markers",
+            "review PR 333",
+            "what does this repo do",
+            "map the module layout",
+            "trace the call path from main",
+        ] {
+            assert!(task_needs_repospec(task), "should fire: {task}");
+        }
+    }
+
+    #[test]
+    fn task_needs_repospec_stays_quiet_for_tasks_that_merely_run_in_a_repo() {
+        // The regression this gate exists for: these answer from board/billing/
+        // job state, so a `.repospec.json` read is pure overhead — it cannot
+        // inform the answer.
+        for task in [
+            "sprint status",
+            "what's running",
+            "cost breakdown for last month",
+            "list the agents and their categories",
+            "how is the sprint going",
+            "summarize yesterday's standup",
+        ] {
+            assert!(!task_needs_repospec(task), "should stay quiet: {task}");
+        }
+    }
+
+    #[test]
+    fn task_needs_repospec_ignores_sub_four_char_prefix_noise() {
+        // `add` is a listed stem but gets no prefix expansion (under the
+        // four-char floor), so `address` / `addendum` must not trigger it; the
+        // explicit inflections (`adding`, `adds`) carry that weight instead.
+        assert!(!task_needs_repospec("what is the address of the broker"));
+        assert!(task_needs_repospec("adding a column to the board"));
     }
 
     // ---- registry recommendation (no installed skill matched) -----------
