@@ -1125,6 +1125,35 @@ calls and no work."
                 continue;
             }
 
+            // ── Not-found retry guard. Telemetry (4h window: ~100 tool errors,
+            // ALL `not-found`, 35 of them a `run_program` retry of the SAME
+            // missing path/binary, ZERO recoveries) says a repeat of an
+            // identical miss NEVER recovers — it just burns the turn re-proving
+            // the target is absent. So an exact (tool, target) pair that already
+            // failed `not-found` this session is NOT re-executed; the model gets
+            // a corrective result naming the discovery tools instead. Sits here,
+            // ahead of BOTH execution branches (the live `tools::execute` and the
+            // turn-audit `Replay`), so neither path can slip a known miss
+            // through. Only `not-found` arms it, only the identical target is
+            // blocked, and a later success on that target disarms it — see
+            // crate::tool_telemetry.
+            if let Some(steer) =
+                crate::tool_telemetry::notfound_guard_check(session, &call.name, &call.args)
+            {
+                eprintln!("\x1b[2m  ⛔ {} — not-found retry (blocked)\x1b[0m", desc);
+                let result = ToolResult::text(call.id.clone(), steer, true);
+                if session.raw_tool_output {
+                    print_raw_result(&result);
+                }
+                if let Some(w) = session.worker_transcript.as_mut() {
+                    w.record_tool_call(&call.id, &call.name, &call.args);
+                    w.record_tool_result(&call.id, &call.name, &result.content, result.is_error);
+                }
+                session.record_turn_tool(desc.clone(), result.clone());
+                results.push(result);
+                continue;
+            }
+
             // Phase 2 blocking gate: PreToolUse. Every matching hook runs
             // SEQUENTIALLY (most-restrictive-wins); the first `Deny` VETOES the
             // call BEFORE it executes. The veto is threaded through the SAME
@@ -1243,6 +1272,10 @@ calls and no work."
             // a retry of a previously-failed tool, and record whether the retry
             // recovered. Best-effort — never sinks the turn. See tool_telemetry.
             crate::tool_telemetry::record(session, &call.name, &result);
+            // Arm/disarm the not-found retry guard for THIS call's target: a
+            // `not-found` failure arms it (the next identical call is blocked
+            // above), a success clears it, any other error class is ignored.
+            crate::tool_telemetry::note_notfound_outcome(session, &call.name, &call.args, &result);
             emit_activity_stream(session, &result);
             // Mid-round status-line refresh (background coordinator only —
             // `None` for an interactive session). Note the completed call, then
