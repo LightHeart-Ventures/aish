@@ -591,13 +591,21 @@ async fn run_turn_inner(
                             .fire_observe(crate::hooks::HookEvent::SkillMatched, p);
                     }
                 }
-                // Repo-awareness: when a skill fits AND the working directory has a
-                // `.repospec.json`, remind the model to read that spec first and keep
+                // Repo-awareness: when a skill fits, the task is actually repo-facing
+                // (about to CHANGE code or SEARCH the tree), AND the working directory
+                // has a `.repospec.json`, remind the model to read that spec and keep
                 // its conventions in mind while applying the skill. The skill's steps
-                // are generic; the repo spec is project-specific and should win. The
-                // fs check lives here (not in the pure, unit-tested `hint`) since it
-                // depends on `session.cwd`.
-                let note = if session.cwd.join(crate::skill_match::REPOSPEC_FILE).exists() {
+                // are generic; the repo spec is project-specific and should win.
+                //
+                // The intent gate matters: without it every skill-matched turn inside a
+                // repo carried the reminder — "sprint status", "what's running", a cost
+                // breakdown — paying for a spec read that could not inform the answer.
+                // It runs FIRST since it's pure and cheap, short-circuiting the stat.
+                // The fs check lives here (not in the pure, unit-tested `hint`) since
+                // it depends on `session.cwd`.
+                let note = if crate::skill_match::task_needs_repospec(&match_task)
+                    && session.cwd.join(crate::skill_match::REPOSPEC_FILE).exists()
+                {
                     format!("{note}\n{}", crate::skill_match::repospec_reminder())
                 } else {
                     note

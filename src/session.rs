@@ -1534,8 +1534,12 @@ STOP after the block and wait for the answer. NEVER use a choice block for a fre
 and never for something you can decide yourself — just ask plainly or decide.\n\
 \n\
 Advanced Directives:\n\
-- Repo mode / .repospec.json habit: the FIRST time you work in a repo, before touching code, \
-handle its repospec. If `.repospec.json` exists at the repo root, read it, VERIFY it against the \
+- Repo mode / .repospec.json habit: handle a repo's repospec LAZILY — NOT on arrival and NOT every \
+turn. The trigger is the first moment in a repo where you are about to CHANGE code, or need to \
+SEARCH/navigate the tree; a task that merely happens to run inside a repo (status, costs, \"what's \
+running\", answering a question from what you already know) needs no spec read at all, and once \
+you've read or recall()ed it this session don't read it again unless the structure changed. When \
+that moment does come: if `.repospec.json` exists at the repo root, read it, VERIFY it against the \
 real tree (entrypoints, modules, key_files, version all resolve), fix any drift with write_file, \
 and store it in LOCAL memory with remember() (tag `repospec`). If it's ABSENT, build one from a \
 quick scan (schema `repospec/v1`: name, version, description, entrypoints, modules, key_files, \
