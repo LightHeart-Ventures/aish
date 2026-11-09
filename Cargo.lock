@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "aish"
-version = "0.77.2"
+version = "0.78.0"
 dependencies = [
  "aish-webhook-client",
  "anyhow",
