@@ -695,6 +695,14 @@ pub struct Session {
     /// worked). Session-local, never persisted — only the aggregatable event
     /// rows land in SQLite.
     pub tool_failures: std::collections::HashMap<String, String>,
+    /// Not-found retry guard (`crate::tool_telemetry::NotFoundGuard`). Remembers
+    /// the TARGETS (program+argv, or path) that already failed `not-found` this
+    /// session, so an IDENTICAL repeat is short-circuited with a steer toward
+    /// discovery (`list_dir`/`glob_expand`/`grep_files`) instead of re-running a
+    /// call that cannot succeed. Bounded and FIFO-evicted; cleared per-target on
+    /// a later success. Session-local, never persisted — the blocked retries land
+    /// in `tool_telemetry` as `gate:notfound-retry:<tool>` rows.
+    pub notfound_guard: crate::tool_telemetry::NotFoundGuard,
     /// Ring buffer of tool-telemetry events awaiting a batched write
     /// (`crate::tool_telemetry`). Tool-heavy turns collapse N per-call inserts
     /// into one transaction: `record` appends here and `flush` drains the whole
@@ -866,6 +874,11 @@ impl Session {
             webhook: None,
             resume: Arc::new(Mutex::new(ResumeState::default())),
             tool_failures: std::collections::HashMap::new(),
+            notfound_guard: crate::tool_telemetry::NotFoundGuard::new(
+                crate::tool_telemetry::parse_notfound_guard(
+                    std::env::var("AISH_NOTFOUND_GUARD").ok().as_deref(),
+                ),
+            ),
             tool_telemetry_buf: Vec::new(),
             tool_telemetry_batch_size: crate::tool_telemetry::parse_batch_size(
                 std::env::var("AISH_TELEMETRY_BATCH_SIZE").ok().as_deref(),

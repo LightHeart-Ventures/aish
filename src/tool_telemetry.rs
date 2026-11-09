@@ -465,6 +465,241 @@ pub fn record_gate(session: &mut Session, class: &str, rule: &str, bin_sub: &str
     );
 }
 
+// -- Not-found retry guard (stop re-running calls that cannot succeed) ----
+//
+// Telemetry from a real 4-hour window: ~100 tool errors, ALL classified
+// `not-found`, 35 of them a `run_program` retry of the SAME missing
+// path/binary, and ZERO recoveries. Retrying a miss on an unchanged target is
+// structurally unrecoverable — the turn is spent re-proving the target does not
+// exist. This guard remembers, per SESSION and per TARGET (not per tool — too
+// coarse), which exact calls already failed `not-found` and short-circuits an
+// IDENTICAL repeat with a result that steers the model to discovery
+// (`list_dir` / `glob_expand` / `grep_files`) instead.
+//
+// Properties (deliberate, and each one unit-tested below):
+//   • only `not-found` arms the guard — no other class is ever blocked;
+//   • only the identical (tool, target) pair is blocked; a different path runs;
+//   • a later SUCCESS on that target disarms it (the file appeared / was built);
+//   • bounded: at most `NOTFOUND_TARGETS_CAP` keys, each ≤ `NOTFOUND_KEY_MAX`
+//     bytes, FIFO-evicted — a long session cannot grow it without limit;
+//   • fail-open: an unknown tool shape, or args that yield no key, just runs;
+//   • defeatable with `AISH_NOTFOUND_GUARD=0`.
+//
+// A blocked retry is recorded through the EXISTING gate-refusal telemetry shape
+// (`record_gate` + [`CLASS_GATE_REFUSE`]) so it shows up in `:telemetry` as
+// `gate:notfound-retry:<tool>` rather than being invisible.
+
+/// Guard default: on. `AISH_NOTFOUND_GUARD=0` turns it off.
+pub const DEFAULT_NOTFOUND_GUARD: bool = true;
+/// Max distinct not-found targets remembered per session (FIFO beyond this).
+pub const NOTFOUND_TARGETS_CAP: usize = 64;
+/// Max bytes of a single target key (truncated on a char boundary).
+pub const NOTFOUND_KEY_MAX: usize = 512;
+/// `rule` token for the gate row a blocked retry writes.
+pub const NOTFOUND_GUARD_RULE: &str = "notfound-retry";
+
+/// Parse `AISH_NOTFOUND_GUARD`. Falsy (`0`/`false`/`no`/`off`, case-insensitive)
+/// disables the guard; unset/empty/anything else keeps the default (on), so the
+/// knob can only ever be used to opt OUT — never to silently opt in to a
+/// different behaviour.
+pub fn parse_notfound_guard(v: Option<&str>) -> bool {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "false" | "no" | "off") => false,
+        _ => DEFAULT_NOTFOUND_GUARD,
+    }
+}
+
+/// Derive a stable per-TARGET key for the not-found guard, or `None` when this
+/// tool shape has no meaningful target (⇒ the call is never guarded — fail-open).
+///
+/// Shapes handled:
+///   • `run_program` → program + argv (the whole command identity: a different
+///     flag is a different call and must be allowed to run);
+///   • `read_file` / `list_dir` / `stat_file` → `path`;
+///   • `glob_expand` → `pattern` (plus `path` when the caller scoped it).
+///
+/// `grep_files` is intentionally NOT guarded: it is one of the discovery tools
+/// the steer points AT, so blocking it could dead-end the recovery path.
+pub fn notfound_target_key(tool: &str, args: &serde_json::Value) -> Option<String> {
+    let str_arg = |k: &str| -> Option<String> {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    let target = match tool {
+        "run_program" => {
+            let mut t = str_arg("program")?;
+            if let Some(arr) = args.get("args").and_then(|v| v.as_array()) {
+                for a in arr {
+                    t.push('\u{1f}');
+                    match a.as_str() {
+                        Some(s) => t.push_str(s.trim()),
+                        // Non-string argv entry: stringify rather than bail, so
+                        // a sloppy call still gets a stable key.
+                        None => t.push_str(&a.to_string()),
+                    }
+                }
+            }
+            t
+        }
+        "read_file" | "list_dir" | "stat_file" => str_arg("path")?,
+        "glob_expand" => {
+            let pat = str_arg("pattern")?;
+            match str_arg("path") {
+                Some(base) => format!("{base}\u{1f}{pat}"),
+                None => pat,
+            }
+        }
+        // Unknown/unguarded tool shape ⇒ no key ⇒ always executes.
+        _ => return None,
+    };
+
+    let mut key = format!("{tool}\u{1e}{target}");
+    if key.len() > NOTFOUND_KEY_MAX {
+        let mut cut = NOTFOUND_KEY_MAX;
+        while cut > 0 && !key.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        key.truncate(cut);
+    }
+    Some(key)
+}
+
+/// Session-local set of targets that already failed `not-found`. A bounded FIFO
+/// (insertion-ordered, oldest evicted at [`NOTFOUND_TARGETS_CAP`]) — small
+/// enough that a linear `contains` is cheaper than hashing, and incapable of
+/// unbounded growth. Never persisted.
+#[derive(Debug, Clone)]
+pub struct NotFoundGuard {
+    enabled: bool,
+    seen: std::collections::VecDeque<String>,
+}
+
+impl Default for NotFoundGuard {
+    fn default() -> Self {
+        Self::new(DEFAULT_NOTFOUND_GUARD)
+    }
+}
+
+impl NotFoundGuard {
+    /// Build a guard with the enablement resolved once (at `Session::new`), so
+    /// a live turn does no env lookups.
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            seen: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Whether the guard is active at all (`AISH_NOTFOUND_GUARD`).
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Number of remembered targets (≤ [`NOTFOUND_TARGETS_CAP`]). Test-only:
+    /// the bounded-eviction test is the sole reader, and a `pub fn` with no
+    /// production caller trips CI's `-D dead_code`.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// True when nothing is remembered. Test-only — see [`Self::len`].
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// Has this exact target already failed `not-found` this session?
+    pub fn is_armed(&self, key: &str) -> bool {
+        self.seen.iter().any(|k| k == key)
+    }
+
+    /// Remember a target that failed `not-found`. Idempotent; evicts the oldest
+    /// entry once the cap is reached.
+    pub fn arm(&mut self, key: &str) {
+        if self.is_armed(key) {
+            return;
+        }
+        while self.seen.len() >= NOTFOUND_TARGETS_CAP {
+            self.seen.pop_front();
+        }
+        self.seen.push_back(key.to_string());
+    }
+
+    /// Forget a target (it resolved — the path appeared, the binary installed).
+    pub fn clear(&mut self, key: &str) {
+        self.seen.retain(|k| k != key);
+    }
+}
+
+/// The steering result the model gets INSTEAD of a re-run of a known miss.
+/// Names the three discovery tools explicitly — the whole point is to convert a
+/// wasted retry into a locate step. Pure so it can be asserted on in tests.
+pub fn notfound_block_text(desc: &str) -> String {
+    format!(
+        "aish: this exact call already failed not-found this session \
+         ({desc}) — it was NOT re-run, because an identical call on an unchanged \
+         target cannot succeed. Locate the real path/binary first with list_dir, \
+         glob_expand, or grep_files, then call again with the corrected target \
+         (or say plainly that it does not exist)."
+    )
+}
+
+/// Pre-execution check: should this call be blocked as a known not-found
+/// repeat? Returns `Some(steering_text)` to block (and records the refusal as a
+/// gate row so it is visible in `:telemetry`), `None` to execute normally.
+/// Fail-open on every unknown shape, and a no-op when the guard is disabled.
+pub fn notfound_guard_check(
+    session: &mut Session,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    if !session.notfound_guard.enabled() {
+        return None;
+    }
+    let key = notfound_target_key(tool, args)?;
+    if !session.notfound_guard.is_armed(&key) {
+        return None;
+    }
+    // Observable, bounded, argv-free: `gate:notfound-retry:<tool>`.
+    record_gate(session, CLASS_GATE_REFUSE, NOTFOUND_GUARD_RULE, tool);
+    Some(notfound_block_text(&describe_target(tool, args)))
+}
+
+/// Human-readable target for the steer text — the tool plus its concrete
+/// path/program, with no key separators leaking through.
+fn describe_target(tool: &str, args: &serde_json::Value) -> String {
+    notfound_target_key(tool, args)
+        .map(|k| k.replace('\u{1e}', ": ").replace('\u{1f}', " "))
+        .unwrap_or_else(|| tool.to_string())
+}
+
+/// Post-execution bookkeeping for the guard: a `not-found` failure ARMS this
+/// target, a success CLEARS it, and every other error class is left untouched
+/// (so a timeout or a permission error is still freely retryable). Called from
+/// the engine right after [`record`], which has the args this needs.
+pub fn note_notfound_outcome(
+    session: &mut Session,
+    tool: &str,
+    args: &serde_json::Value,
+    result: &ToolResult,
+) {
+    if !session.notfound_guard.enabled() {
+        return;
+    }
+    let Some(key) = notfound_target_key(tool, args) else {
+        return;
+    };
+    if !result.is_error {
+        session.notfound_guard.clear(&key);
+    } else if classify(&result.content) == ErrorClass::NotFound {
+        session.notfound_guard.arm(&key);
+    }
+}
+
 /// Drain the session's tool-telemetry ring buffer to SQLite as ONE transaction.
 /// Best-effort: a write failure is swallowed (the buffer is still cleared so a
 /// persistent DB error can't wedge an ever-growing buffer). No-op when the
@@ -964,6 +1199,172 @@ mod tests {
         assert_eq!(classify("not found"), ErrorClass::NotFound);
     }
 
+    // ───────────────────────── not-found retry guard ─────────────────────────
+
+    fn nf_args(pairs: serde_json::Value) -> serde_json::Value {
+        pairs
+    }
+
+    #[test]
+    fn notfound_guard_env_knob_parse() {
+        // Unset / empty / junk ⇒ default (on). The knob is opt-OUT only.
+        assert!(parse_notfound_guard(None));
+        assert!(parse_notfound_guard(Some("")));
+        assert!(parse_notfound_guard(Some("1")));
+        assert!(parse_notfound_guard(Some("yes")));
+        assert!(parse_notfound_guard(Some("banana")));
+        // Falsy spellings disable it, case/whitespace insensitive.
+        assert!(!parse_notfound_guard(Some("0")));
+        assert!(!parse_notfound_guard(Some("false")));
+        assert!(!parse_notfound_guard(Some("No")));
+        assert!(!parse_notfound_guard(Some(" OFF ")));
+    }
+
+    #[test]
+    fn notfound_key_derivation_per_tool_shape() {
+        // run_program: program + argv is the command identity.
+        let a = notfound_target_key(
+            "run_program",
+            &nf_args(serde_json::json!({"program": "cargo", "args": ["nextest", "run"]})),
+        )
+        .unwrap();
+        let b = notfound_target_key(
+            "run_program",
+            &nf_args(serde_json::json!({"program": "cargo", "args": ["nextest", "run"]})),
+        )
+        .unwrap();
+        assert_eq!(a, b, "same command ⇒ same key (stable)");
+        let c = notfound_target_key(
+            "run_program",
+            &nf_args(serde_json::json!({"program": "cargo", "args": ["test"]})),
+        )
+        .unwrap();
+        assert_ne!(a, c, "different argv ⇒ different key");
+        assert!(a.starts_with("run_program"), "key is tool-scoped: {a}");
+
+        // Path-shaped tools key off `path`, and the tool name is part of the key
+        // so read_file and list_dir on the same path never collide.
+        let r = notfound_target_key("read_file", &nf_args(serde_json::json!({"path": "/x/y"})))
+            .unwrap();
+        let l =
+            notfound_target_key("list_dir", &nf_args(serde_json::json!({"path": "/x/y"}))).unwrap();
+        let s = notfound_target_key("stat_file", &nf_args(serde_json::json!({"path": "/x/y"})))
+            .unwrap();
+        assert_ne!(r, l);
+        assert_ne!(r, s);
+        // Whitespace is normalized.
+        assert_eq!(
+            r,
+            notfound_target_key(
+                "read_file",
+                &nf_args(serde_json::json!({"path": "  /x/y  "}))
+            )
+            .unwrap()
+        );
+
+        // glob_expand keys off pattern (+ base path when scoped).
+        let g1 = notfound_target_key(
+            "glob_expand",
+            &nf_args(serde_json::json!({"pattern": "**/*.rs"})),
+        )
+        .unwrap();
+        let g2 = notfound_target_key(
+            "glob_expand",
+            &nf_args(serde_json::json!({"pattern": "**/*.rs", "path": "src"})),
+        )
+        .unwrap();
+        assert_ne!(g1, g2, "scoping by path is a different target");
+    }
+
+    #[test]
+    fn notfound_key_fails_open_on_unknown_or_empty_shapes() {
+        // Unguarded tool ⇒ no key ⇒ always executes.
+        assert!(
+            notfound_target_key("write_file", &nf_args(serde_json::json!({"path": "/a"})))
+                .is_none()
+        );
+        // grep_files is a discovery tool the steer points AT — never guarded.
+        assert!(
+            notfound_target_key("grep_files", &nf_args(serde_json::json!({"pattern": "x"})))
+                .is_none()
+        );
+        // Missing / empty / wrong-typed required args ⇒ no key (no panic).
+        assert!(notfound_target_key("read_file", &nf_args(serde_json::json!({}))).is_none());
+        assert!(
+            notfound_target_key("read_file", &nf_args(serde_json::json!({"path": "   "})))
+                .is_none()
+        );
+        assert!(
+            notfound_target_key("read_file", &nf_args(serde_json::json!({"path": 7}))).is_none()
+        );
+        assert!(notfound_target_key("run_program", &nf_args(serde_json::json!({}))).is_none());
+        assert!(notfound_target_key("run_program", &nf_args(serde_json::Value::Null)).is_none());
+        // Non-string argv entries are stringified, not fatal.
+        assert!(
+            notfound_target_key(
+                "run_program",
+                &nf_args(serde_json::json!({"program": "ls", "args": [1, true]}))
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn notfound_key_is_length_capped_on_char_boundary() {
+        let huge = "é".repeat(4096);
+        let k =
+            notfound_target_key("read_file", &nf_args(serde_json::json!({"path": huge}))).unwrap();
+        assert!(k.len() <= NOTFOUND_KEY_MAX, "key capped: {} bytes", k.len());
+        // Truncating mid-codepoint would have panicked above; this asserts the
+        // result is still valid UTF-8 we can round-trip.
+        assert_eq!(k, k.clone());
+    }
+
+    #[test]
+    fn second_identical_notfound_call_is_blocked() {
+        let dir = tele_tmp("nf_block");
+        let mut s = tele_session(&dir);
+        let args = nf_args(serde_json::json!({"program": "kubectl", "args": ["get", "pods"]}));
+        let miss = ToolResult::text("t", "no such file or directory: kubectl", true);
+
+        // First attempt is never blocked (nothing armed yet).
+        assert!(notfound_guard_check(&mut s, "run_program", &args).is_none());
+        note_notfound_outcome(&mut s, "run_program", &args, &miss);
+        assert_eq!(s.notfound_guard.len(), 1, "the miss armed the target");
+
+        // The identical retry is blocked with a steer naming the discovery tools.
+        let steer = notfound_guard_check(&mut s, "run_program", &args)
+            .expect("identical not-found retry must be blocked");
+        assert!(steer.contains("already failed not-found"), "steer: {steer}");
+        assert!(steer.contains("list_dir"), "steer names list_dir: {steer}");
+        assert!(
+            steer.contains("glob_expand"),
+            "steer names glob_expand: {steer}"
+        );
+        assert!(
+            steer.contains("grep_files"),
+            "steer names grep_files: {steer}"
+        );
+        assert!(steer.contains("kubectl"), "steer names the target: {steer}");
+        assert!(
+            !steer.contains('\u{1e}') && !steer.contains('\u{1f}'),
+            "no key separators leak into the steer: {steer}"
+        );
+
+        // The block is observable in telemetry as a gate refusal.
+        assert!(
+            s.tool_telemetry_buf
+                .iter()
+                .any(|e| e.error_class.as_deref() == Some(CLASS_GATE_REFUSE)
+                    && e.tool == format!("gate:{NOTFOUND_GUARD_RULE}:run_program")),
+            "blocked retry must land a gate row: {:?}",
+            s.tool_telemetry_buf
+                .iter()
+                .map(|e| (e.tool.clone(), e.error_class.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // -- retry / recovery ledger (the `recovered = 0` investigation) --------
     //
     // These drive the REAL code path (`record` → `persist` → SQLite) and assert
@@ -1018,6 +1419,99 @@ mod tests {
         assert_eq!(
             stats[0].recovered, 0,
             "a failed retry never counts as recovery"
+        );
+    }
+
+    #[test]
+    fn different_target_is_not_blocked() {
+        let dir = tele_tmp("nf_other");
+        let mut s = tele_session(&dir);
+        let missing = nf_args(serde_json::json!({"path": "/nope/a.txt"}));
+        let other = nf_args(serde_json::json!({"path": "/nope/b.txt"}));
+        let miss = ToolResult::text("t", "No such file or directory", true);
+
+        note_notfound_outcome(&mut s, "read_file", &missing, &miss);
+        assert!(notfound_guard_check(&mut s, "read_file", &missing).is_some());
+        assert!(
+            notfound_guard_check(&mut s, "read_file", &other).is_none(),
+            "a different path must execute normally"
+        );
+        assert!(
+            notfound_guard_check(&mut s, "list_dir", &missing).is_none(),
+            "a different tool on the same path must execute normally"
+        );
+    }
+
+    #[test]
+    fn only_notfound_class_arms_the_guard() {
+        let dir = tele_tmp("nf_class");
+        let mut s = tele_session(&dir);
+        let args = nf_args(serde_json::json!({"path": "/locked/secret"}));
+
+        for msg in [
+            "permission denied",
+            "timed out after 120s",
+            "is a directory",
+        ] {
+            let err = ToolResult::text("t", msg, true);
+            note_notfound_outcome(&mut s, "read_file", &args, &err);
+            assert!(
+                s.notfound_guard.is_empty(),
+                "{msg:?} must NOT arm the not-found guard"
+            );
+            assert!(notfound_guard_check(&mut s, "read_file", &args).is_none());
+        }
+    }
+
+    #[test]
+    fn guard_entry_is_cleared_after_a_success() {
+        let dir = tele_tmp("nf_clear");
+        let mut s = tele_session(&dir);
+        let args = nf_args(serde_json::json!({"path": "/tmp/appears-later"}));
+        let miss = ToolResult::text("t", "ENOENT: no such file", true);
+        let ok = ToolResult::text("t", "contents", false);
+
+        note_notfound_outcome(&mut s, "read_file", &args, &miss);
+        assert!(notfound_guard_check(&mut s, "read_file", &args).is_some());
+        // The file appeared → the target is disarmed and retryable again.
+        note_notfound_outcome(&mut s, "read_file", &args, &ok);
+        assert!(s.notfound_guard.is_empty());
+        assert!(notfound_guard_check(&mut s, "read_file", &args).is_none());
+    }
+
+    #[test]
+    fn guard_map_is_bounded_and_fifo_evicts() {
+        let mut g = NotFoundGuard::new(true);
+        for i in 0..(NOTFOUND_TARGETS_CAP + 10) {
+            g.arm(&format!("read_file\u{1e}/p/{i}"));
+        }
+        assert_eq!(g.len(), NOTFOUND_TARGETS_CAP, "map is capped");
+        // Oldest evicted, newest retained.
+        assert!(!g.is_armed("read_file\u{1e}/p/0"));
+        assert!(g.is_armed(&format!("read_file\u{1e}/p/{}", NOTFOUND_TARGETS_CAP + 9)));
+        // arm() is idempotent — a repeat does not grow or reorder the map.
+        let before = g.len();
+        g.arm("read_file\u{1e}/p/70");
+        g.arm("read_file\u{1e}/p/70");
+        assert_eq!(g.len(), before);
+    }
+
+    #[test]
+    fn disabled_guard_never_blocks_or_arms() {
+        let dir = tele_tmp("nf_off");
+        let mut s = tele_session(&dir);
+        s.notfound_guard = NotFoundGuard::new(false);
+        let args = nf_args(serde_json::json!({"path": "/nope"}));
+        let miss = ToolResult::text("t", "no such file", true);
+
+        note_notfound_outcome(&mut s, "read_file", &args, &miss);
+        assert!(
+            s.notfound_guard.is_empty(),
+            "disabled guard records nothing"
+        );
+        assert!(
+            notfound_guard_check(&mut s, "read_file", &args).is_none(),
+            "disabled guard never blocks"
         );
     }
 
