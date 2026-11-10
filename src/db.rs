@@ -1672,6 +1672,42 @@ impl AlertStore {
         Ok(n)
     }
 
+    /// Grace window a SEMANTIC monitor gets to acquire its watcher before the
+    /// sweep treats it as born-orphaned. Arming binds `watcher_run_id`
+    /// synchronously right after the spawn, so this only needs to be long enough
+    /// to be obviously-not-a-race: 30 minutes.
+    pub const UNWATCHED_ALERT_GRACE_SECS: i64 = 30 * 60;
+
+    /// Sweep SEMANTIC monitors that never got a watcher at all: `armed`,
+    /// `kind='semantic'`, `watcher_run_id IS NULL`, and older than `grace_secs`.
+    /// Returns how many were swept.
+    ///
+    /// The third and last reaper, covering the gap between the other two. A
+    /// semantic alert fires exclusively by PULL — a delegated coordinator calling
+    /// `set_alert` — so one with no watcher recorded can never fire. Yet
+    /// [`Self::expire_orphaned_alerts`] deliberately SKIPS a NULL watcher (it
+    /// can't distinguish "never had one" from "spawned a moment ago, row not
+    /// written yet"), which left only the 7-day [`Self::STALE_ALERT_SECS`]
+    /// horizon — and a global ⏰ badge lit for a week. The grace window resolves
+    /// that ambiguity by age instead: past it, NULL means never.
+    ///
+    /// NATIVE kinds are untouched — they have no watcher by design (the presenter
+    /// polls them token-free) and a NULL `watcher_run_id` there is correct, not
+    /// orphaned.
+    pub fn expire_unwatched_semantic_alerts(&self, grace_secs: i64) -> Result<usize> {
+        let cutoff = Self::now().saturating_sub(grace_secs.max(0));
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE alerts SET state='cancelled'
+                 WHERE state='armed' AND kind='semantic'
+                   AND watcher_run_id IS NULL AND created_at < ?1",
+                [cutoff],
+            )
+            .context("expire unwatched alerts failed")?;
+        Ok(n)
+    }
+
     /// Display rows for `:alert list` — `(id, state, kind_tag, condition,
     /// fired_short, created_at)`, newest first, excluding cancelled/done unless
     /// `include_all`. `created_at` lets the caller show each monitor's age, which
@@ -2490,6 +2526,92 @@ mod tests {
         }
         assert_eq!(store.expire_orphaned_alerts().unwrap(), 1);
         assert_eq!(store.armed_alerts().unwrap().len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The born-orphaned sweep: a SEMANTIC monitor that never got a watcher at
+    /// all can never fire, because semantic alerts resolve only by a delegated
+    /// coordinator calling `set_alert`. The liveness sweep above skips a NULL
+    /// watcher on purpose (it can't tell "never had one" from "spawned a
+    /// moment ago"), so this pass disambiguates by AGE instead — past the
+    /// grace window, NULL means never. Before this existed, such a row sat
+    /// armed for the full 7-day horizon and pinned the global ⏰ badge on in
+    /// every session: the reported bug.
+    #[test]
+    fn semantic_alerts_that_never_got_a_watcher_are_swept_after_the_grace_window() {
+        use crate::alert::{AlertKind, FileWatchMode};
+        let path = std::env::temp_dir().join(format!(
+            "aish_test_alert_unwatched_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = AlertStore::open(&path).unwrap();
+
+        let semantic = AlertKind::Semantic {
+            description: "when the checks on PR 238 go green".into(),
+        };
+        let native = AlertKind::FileChange {
+            path: "/tmp/aish-does-not-exist".into(),
+            baseline_mtime: None,
+            baseline_exists: false,
+            mode: FileWatchMode::Any,
+        };
+
+        let orphan = store
+            .insert_alert("semantic, no watcher, old", &semantic, true, None)
+            .unwrap();
+        let fresh = store
+            .insert_alert("semantic, no watcher, just armed", &semantic, true, None)
+            .unwrap();
+        let watched = store
+            .insert_alert("semantic, has a watcher", &semantic, true, None)
+            .unwrap();
+        let native_old = store
+            .insert_alert("native, no watcher by design", &native, true, None)
+            .unwrap();
+        store.set_watcher_run_id(watched, "w_live").unwrap();
+
+        // Backdate everything except `fresh` past the grace window.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let old = AlertStore::now() - AlertStore::UNWATCHED_ALERT_GRACE_SECS - 60;
+            for id in [orphan, watched, native_old] {
+                conn.execute("UPDATE alerts SET created_at=?1 WHERE id=?2", [old, id])
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.armed_alerts().unwrap().len(), 4);
+
+        let swept = store
+            .expire_unwatched_semantic_alerts(AlertStore::UNWATCHED_ALERT_GRACE_SECS)
+            .unwrap();
+        assert_eq!(
+            swept, 1,
+            "only the born-orphaned semantic row is unfireable"
+        );
+
+        let ids: Vec<i64> = store.armed_alerts().unwrap().iter().map(|a| a.id).collect();
+        assert!(!ids.contains(&orphan));
+        assert!(
+            ids.contains(&fresh),
+            "inside the grace window a NULL watcher means 'still starting', not orphaned"
+        );
+        assert!(
+            ids.contains(&watched),
+            "a semantic monitor with a watcher is the liveness sweep's business, not this one"
+        );
+        assert!(
+            ids.contains(&native_old),
+            "native kinds are polled by the presenter and legitimately have no watcher"
+        );
+
+        // Idempotent.
+        assert_eq!(
+            store
+                .expire_unwatched_semantic_alerts(AlertStore::UNWATCHED_ALERT_GRACE_SECS)
+                .unwrap(),
+            0
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

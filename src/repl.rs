@@ -828,6 +828,14 @@ pub async fn run(
                     if last_orphan_reap.elapsed() >= Duration::from_secs(60) {
                         last_orphan_reap = std::time::Instant::now();
                         let _ = store.expire_orphaned_alerts();
+                        // Same cadence, second failure mode: a SEMANTIC row that
+                        // never acquired a watcher at all (legacy rows, or a
+                        // binding that failed). `expire_orphaned_alerts` skips
+                        // those by design — NULL watcher means "starting" to it —
+                        // so without this they held ⏰ on for the full 7 days.
+                        let _ = store.expire_unwatched_semantic_alerts(
+                            crate::db::AlertStore::UNWATCHED_ALERT_GRACE_SECS,
+                        );
                     }
                     if let Ok(armed) = store.armed_alerts() {
                         for a in armed {
@@ -9972,7 +9980,7 @@ pub(crate) fn tell_coordinator_ctx(
 /// console exactly like a native probe. Returns false when no coordinator could
 /// be launched (missing credential / can't locate the aish binary), leaving the
 /// alert armed for a human/agent to fire manually.
-fn spawn_alert_coordinator(session: &mut Session, id: i64, description: &str) -> bool {
+pub(crate) fn spawn_alert_coordinator(session: &Session, id: i64, description: &str) -> bool {
     // A coordinator needs a credential for the active backend and our own exe.
     let no_credential = match session.backend_kind.as_str() {
         "grok" => !crate::backend::grok::credential_available(&session.env),

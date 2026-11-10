@@ -7293,19 +7293,48 @@ fn set_alert(call: &ToolCall, session: &Session) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("provide `alert_id` to fire, or `condition` to arm"))?;
     let silent = call.args["silent"].as_bool().unwrap_or(false);
     let kind = crate::alert::parse_condition(condition);
-    let native = kind.is_native();
     let id = store.insert_alert(condition, &kind, !silent, Some(&session.session_id))?;
-    Ok(if native {
-        format!(
+    if kind.is_native() {
+        return Ok(format!(
             "armed alert #{id} ({}) — aish polls it token-free and surfaces it when met",
             kind.tag()
-        )
+        ));
+    }
+    // SEMANTIC: no local probe exists, so the row can ONLY be fired by a process
+    // that is actually watching. Delegate a watcher coordinator, exactly as the
+    // `:alert` COMMAND path does.
+    //
+    // This is the orphaned-⏰ bug: this path used to just tell the CALLING agent
+    // to "resolve it yourself". But the caller's turn ends the moment it replies,
+    // and a background coordinator exits when its run finishes — so nothing was
+    // left watching. `watcher_run_id` stayed NULL, which makes the liveness
+    // sweep skip the row by design (NULL reads as "watcher still starting"), and
+    // the only remaining reaper is the 7-DAY age horizon. Since the ⏰ badge is
+    // driven by a GLOBAL `armed_alerts()`, one such row pinned the alarm icon on
+    // in every session for a week.
+    let description = match &kind {
+        crate::alert::AlertKind::Semantic { description } => description.clone(),
+        _ => condition.to_string(),
+    };
+    if crate::repl::spawn_alert_coordinator(session, id, &description) {
+        Ok(format!(
+            "armed alert #{id} (semantic) — dispatched a background watcher coordinator that will \
+fire it the moment the condition is met. Nothing further is needed from you; do NOT also poll it \
+yourself. Tell the operator it's armed and move on."
+        ))
     } else {
-        format!(
-            "armed alert #{id} (semantic) — resolve it yourself by monitoring the condition and \
-calling set_alert with alert_id={id} when it is met (semantic alerts have no local probe)"
-        )
-    })
+        // No watcher could be launched (missing backend credential, can't locate
+        // our own exe, or the coordinator spawn budget is exhausted) → the row is
+        // unfireable. Retire it NOW rather than light the global alarm badge for
+        // a condition nothing can resolve, and hand the job back to the caller.
+        let _ = store.cancel_alert(id);
+        Ok(format!(
+            "could not dispatch a watcher for this semantic condition (no backend credential, or \
+the coordinator spawn budget is exhausted), so alert #{id} was retired instead of left armed with \
+nothing watching it — an unwatchable monitor would pin the ⏰ badge on until the 7-day sweep. \
+Monitor the condition inline in this session instead, or re-arm when a coordinator slot frees up."
+        ))
+    }
 }
 
 fn recall(call: &ToolCall, session: &Session) -> Result<String> {
