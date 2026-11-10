@@ -760,6 +760,20 @@ async fn main() -> Result<()> {
                 Err(e) => startup_notices
                     .push(format!("\x1b[33maish:\x1b[0m alert liveness sweep failed: {e:#}")),
             }
+            // Born-orphaned pass. The liveness sweep above can only judge rows
+            // that HAVE a watcher; a semantic monitor armed with none at all
+            // (legacy rows from before arming delegated a coordinator) is just
+            // as unfireable and would otherwise hold ⏰ for the full 7 days.
+            match store.expire_unwatched_semantic_alerts(
+                db::AlertStore::UNWATCHED_ALERT_GRACE_SECS,
+            ) {
+                Ok(0) => {}
+                Ok(n) => startup_notices.push(format!(
+                    "\x1b[2maish: retired {n} semantic alert monitor(s) that had no watcher (`:alert list all`)\x1b[0m"
+                )),
+                Err(e) => startup_notices
+                    .push(format!("\x1b[33maish:\x1b[0m alert orphan sweep failed: {e:#}")),
+            }
             session.alert_store = Some(store);
         }
         Err(e) => startup_notices.push(format!(
